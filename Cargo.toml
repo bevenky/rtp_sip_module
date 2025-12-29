@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/libfs-sys",
+    "crates/rtp_sip",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Venky"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+crossbeam-channel = "0.5"
+
+# PyO3
+pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Sync primitives
+once_cell = "1"
+parking_lot = "0.12"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# FFI
+libc = "0.2"
+
+# Internal crates
+libfs-sys = { path = "crates/libfs-sys" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

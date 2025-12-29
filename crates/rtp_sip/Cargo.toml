@@ -1,0 +1,51 @@
+[package]
+name = "rtp_sip"
+version.workspace = true
+edition.workspace = true
+description = "Python bindings for RTP/SIP telephony with embedded libfs"
+
+[lib]
+name = "rtp_sip"
+crate-type = ["cdylib"]
+
+[dependencies]
+# FFI bindings
+libfs-sys.workspace = true
+
+# Async runtime
+tokio.workspace = true
+crossbeam-channel.workspace = true
+
+# PyO3
+pyo3.workspace = true
+pyo3-async-runtimes.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Sync primitives
+once_cell.workspace = true
+parking_lot.workspace = true
+
+# Serialization
+serde.workspace = true
+toml.workspace = true
+
+# FFI
+libc.workspace = true
+
+# Random
+rand = "0.8"
+
+# Async trait
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = []

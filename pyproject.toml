@@ -1,0 +1,66 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rtp_sip"
+version = "0.1.0"
+description = "Python bindings for libfs telephony - SIP/RTP for voice AI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Venky" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Communications :: Telephony",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Typing :: Typed",
+]
+keywords = ["telephony", "sip", "rtp", "voip", "freeswitch", "pipecat"]
+
+[project.urls]
+Repository = "https://github.com/plivo/rtp_sip"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "maturin>=1.4",
+]
+
+[tool.maturin]
+# Build the cdylib from crates/rtp_sip
+manifest-path = "crates/rtp_sip/Cargo.toml"
+# Include Python source files
+python-source = "python"
+# Module name
+module-name = "rtp_sip"
+# Features to enable
+features = []
+# Bindings type
+bindings = "pyo3"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["python/tests"]
+# Register custom markers
+markers = [
+    "sip_mode: tests that require SIP mode (cannot run with RTP-only tests)",
+]
+# Exclude SIP tests by default (they conflict with RTP tests due to mode locking)
+# To run SIP tests: pytest -m sip_mode tests/test_sip_loopback.py
+# To run RTP tests: pytest -m "not sip_mode"
+# To run all tests: pytest tests/test_sip_loopback.py (in separate process first), then pytest -m "not sip_mode"
+addopts = "-m 'not sip_mode'"
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
