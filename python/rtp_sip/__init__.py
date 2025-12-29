@@ -67,6 +67,17 @@ except ImportError as e:
         f"Original error: {e}"
     ) from e
 
+# Pipecat transport integration (optional)
+from .pipecat_transport import (
+    RtpParams,
+    RtpTransport,
+    SipTrunkParams,
+    SipTransport,
+    audio_frame_to_pipecat,
+    pipecat_to_audio_frame,
+    PipecatRtpTransport,
+)
+
 __all__ = [
     # Config
     "Config",
@@ -87,6 +98,14 @@ __all__ = [
     # Functions
     "shutdown",
     "is_running",
+    # Pipecat integration
+    "RtpParams",
+    "RtpTransport",
+    "SipTrunkParams",
+    "SipTransport",
+    "audio_frame_to_pipecat",
+    "pipecat_to_audio_frame",
+    "PipecatRtpTransport",
     # Version
     "__version__",
 ]
