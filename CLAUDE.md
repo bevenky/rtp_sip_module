@@ -321,7 +321,7 @@ Loading mod_sofia in embedded mode doesn't work:
 
 ```bash
 # Build and test
-docker build -t pyswitch-builder -f docker-build/Dockerfile.builder .
+docker build -t pyswitch-builder -f docker-build/Dockerfile .
 docker run --rm -v "$(pwd)":/workspace -w /workspace pyswitch-builder bash -c '
     maturin build --release
     pip install --force-reinstall target/wheels/*.whl

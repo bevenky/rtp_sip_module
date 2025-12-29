@@ -24,7 +24,7 @@ rtp_sip provides async Python bindings to libfs (FreeSWITCH 1.10.12) for SIP sig
 
 ```bash
 # Build the builder image (includes libfs)
-docker build -t pyswitch-builder -f docker-build/Dockerfile.builder .
+docker build -t pyswitch-builder -f docker-build/Dockerfile .
 
 # Build the wheel
 docker run --rm -v "$(pwd)":/workspace -w /workspace pyswitch-builder \
