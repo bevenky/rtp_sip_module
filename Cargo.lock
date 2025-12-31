@@ -1735,6 +1735,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtpsip"
+version = "0.1.0"
+dependencies = [
+ "audio-codec-algorithms",
+ "bytes",
+ "criterion",
+ "dashmap",
+ "hex",
+ "md-5 0.10.6",
+ "neteq",
+ "parking_lot 0.12.5",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "rand 0.8.5",
+ "rsip",
+ "rsipstack",
+ "rtp",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-test",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.19.0",
+ "webrtc-util",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1916,37 +1947,6 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
-]
-
-[[package]]
-name = "siprunner"
-version = "0.1.0"
-dependencies = [
- "audio-codec-algorithms",
- "bytes",
- "criterion",
- "dashmap",
- "hex",
- "md-5 0.10.6",
- "neteq",
- "parking_lot 0.12.5",
- "pyo3",
- "pyo3-async-runtimes",
- "rand 0.8.5",
- "rsip",
- "rsipstack",
- "rtp",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.17",
- "tokio",
- "tokio-test",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid 1.19.0",
- "webrtc-util",
 ]
 
 [[package]]

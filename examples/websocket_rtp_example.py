@@ -2,7 +2,7 @@
 """
 WebSocket + RTP Integration Example (Mode B)
 
-This example demonstrates using siprunner's RTP-only mode with external
+This example demonstrates using rtpsip's RTP-only mode with external
 WebSocket signaling for Voice AI applications.
 
 Architecture:
@@ -24,7 +24,7 @@ import signal
 import sys
 from dataclasses import dataclass
 from typing import Optional, Callable
-from siprunner import RtpSession, JitterStats
+from rtpsip import RtpSession, JitterStats
 
 # For real usage, install: pip install websockets
 try:

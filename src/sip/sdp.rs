@@ -620,7 +620,7 @@ impl SdpBuilder {
 
         Self {
             origin,
-            session_name: "siprunner".to_string(),
+            session_name: "rtpsip".to_string(),
             connection: local_addr.ip(),
             audio_port: local_addr.port(),
             codecs: vec![CodecType::Pcmu, CodecType::Pcma],

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-## Project: siprunner
+## Project: rtpsip
 
 A high-performance Rust library for SIP signaling and RTP media handling, exposed to Python via PyO3. Designed for Voice AI applications requiring low-latency telephony integration.
 
@@ -218,19 +218,19 @@ port_end = 20000
 
 # Multiple providers - uses longest prefix match for routing
 [[providers]]
-name = "plivo"
+name = "plivo_us"
 server = "sip.plivo.com"
 port = 5060
-username = "AUTH_ID"
-password = "AUTH_TOKEN"
-prefixes = ["+1", "+1415"]  # +1415 matches before +1
+auth_username = "AUTH_ID"
+auth_password = "AUTH_TOKEN"
+prefixes = ["+1", "+1415", "+1650"]  # +1415 matches before +1
 
 [[providers]]
-name = "telnyx"
-server = "sip.telnyx.com"
+name = "plivo_eu"
+server = "sip.plivo.com"
 port = 5060
-username = "USER"
-password = "PASS"
+auth_username = "AUTH_ID_EU"
+auth_password = "AUTH_TOKEN_EU"
 prefixes = ["+44", "+49"]
 default = true  # Fallback for unmatched prefixes
 
@@ -238,14 +238,81 @@ default = true  # Fallback for unmatched prefixes
 blocked_prefixes = ["+1900", "+1976"]  # Calls fail immediately
 ```
 
+### Environment Variables
+
+Config is auto-detected from environment variables if no config file is provided:
+
+```bash
+RTPSIP_PROVIDER=plivo
+RTPSIP_SERVER=sip.plivo.com
+RTPSIP_AUTH_USERNAME=your_auth_id
+RTPSIP_AUTH_PASSWORD=your_auth_token
+```
+
 ---
 
 ## Python API
 
-### Mode A: Full SIP + RTP
+### Decorator-Based Interface (Recommended)
+
+The recommended way to use rtpsip is with the decorator-based Client interface:
 
 ```python
-from siprunner import SipRunner
+from rtpsip import Client, Call
+
+# Create client with mode as first argument
+# Config is auto-detected from config.toml or environment variables
+client = Client("sip", config="config.toml")
+
+# Or auto-detect config (checks env vars, then config.toml in current dir)
+# client = Client("sip")
+
+@client.on_incoming
+def handle_incoming(call: Call):
+    """Handle incoming calls"""
+    print(f"Incoming call from {call.from_uri}")
+    call.answer()
+
+@client.on_answered
+def handle_answered(call: Call):
+    """Called when call is answered"""
+    print(f"Call {call.id} answered!")
+    call.send_dtmf("1#")
+
+@client.on_audio
+def handle_audio(call: Call, samples: list[int]):
+    """Handle incoming audio - 160 samples = 20ms at 8kHz"""
+    # Process audio (e.g., send to STT)
+    response = ai.process(samples)
+    call.send_audio(response)
+
+@client.on_dtmf
+def handle_dtmf(call: Call, digit: str):
+    """Handle DTMF digits"""
+    print(f"DTMF received: {digit}")
+
+@client.on_hangup
+def handle_hangup(call: Call, reason: str):
+    """Handle call hangup"""
+    print(f"Call ended: {reason}")
+
+# Make outbound call
+call = client.dial(to="+14155551234", from_="+14155550000")
+
+# Run the client (blocking)
+client.run()
+```
+
+Two modes available:
+- `"sip"`: Full SIP + RTP (signaling + media)
+- `"rtp"`: RTP-only (media only, external signaling via WebSocket)
+
+### Low-Level API (Advanced Usage)
+
+For more control, use the SipRunner directly:
+
+```python
+from rtpsip import SipRunner
 
 # From config file (recommended for multi-provider)
 runner = SipRunner.from_config("config.toml")
@@ -298,7 +365,7 @@ mode = runner.get_dtmf_mode(call_id)  # DtmfMode.Rfc2833 or DtmfMode.Info
 dtmf = runner.recv_dtmf(call_id)  # Returns (digit, duration_ms) or None
 
 # Override DTMF mode if needed
-from siprunner import DtmfMode
+from rtpsip import DtmfMode
 runner.set_dtmf_mode(call_id, DtmfMode.Info)  # Force SIP INFO
 
 # Hold/Resume (re-INVITE)
@@ -315,7 +382,7 @@ runner.stop()
 ### Inbound Call Handling
 
 ```python
-from siprunner import SipRunner
+from rtpsip import SipRunner
 
 runner = SipRunner.from_config("config.toml")
 runner.start()  # Starts listening for incoming calls
@@ -351,7 +418,7 @@ Pure audio transport for use with external signaling (WebSocket, custom SIP).
 **NOT included:** SIP signaling, DTMF, authentication, providers - handle these externally.
 
 ```python
-from siprunner import RtpSession
+from rtpsip import RtpSession
 
 session = RtpSession(
     local_addr="0.0.0.0:0",
@@ -380,7 +447,7 @@ Two transport types for Pipecat pipelines:
 
 **SipRtpTransport** - Any SIP trunking provider (Twilio, Telnyx, Plivo SIP, etc.):
 ```python
-from siprunner.pipecat import SipRtpTransport
+from rtpsip.pipecat import SipRtpTransport
 
 transport = SipRtpTransport(
     provider_name="twilio",
@@ -404,7 +471,7 @@ pipeline = Pipeline([
 
 **PlivoRtpTransport** - Plivo WebSocket with optional RTP mode:
 ```python
-from siprunner.pipecat import PlivoRtpTransport
+from rtpsip.pipecat import PlivoRtpTransport
 
 # RTP mode - lower latency, direct UDP audio
 transport = PlivoRtpTransport(
@@ -552,10 +619,10 @@ rtp_sip_module/
 │       ├── events.rs        # PyCallEvent, PyCallState
 │       └── client.rs        # PySipRunner (Mode A)
 └── python/
-    ├── siprunner/
+    ├── rtpsip/
     │   ├── __init__.py      # Main exports
     │   ├── config.py        # Python config classes
-    │   └── _siprunner.pyi   # Type stubs
+    │   └── _rtpsip.pyi   # Type stubs
     ├── pipecat/             # Pipecat integration
     │   ├── __init__.py
     │   ├── sip_rtp_serializer.py   # SIP trunking transport (any provider)

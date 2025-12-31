@@ -1,4 +1,4 @@
-//! siprunner - High-performance SIP/RTP library for Voice AI
+//! rtpsip - High-performance SIP/RTP library for Voice AI
 //!
 //! A Rust library for SIP signaling and RTP media handling,
 //! exposed to Python via PyO3. Designed for Voice AI applications
@@ -15,7 +15,7 @@
 //! ## Example (RTP-Only Mode)
 //!
 //! ```python
-//! from siprunner import RtpSession
+//! from rtpsip import RtpSession
 //!
 //! session = RtpSession(
 //!     local_addr="0.0.0.0:0",
@@ -49,12 +49,12 @@ pub use rtp::{CodecType, G711Codec, JitterBuffer, JitterStats, RtpEngine, RtpPac
 
 /// Python module definition
 #[pymodule]
-fn _siprunner(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rtpsip(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tracing for logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("siprunner=info".parse().unwrap()),
+                .add_directive("rtpsip=info".parse().unwrap()),
         )
         .try_init()
         .ok();

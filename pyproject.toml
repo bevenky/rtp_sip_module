@@ -3,7 +3,7 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "siprunner"
+name = "rtpsip"
 version = "0.1.0"
 description = "High-performance SIP/RTP library for Voice AI"
 readme = "README.md"
@@ -28,4 +28,4 @@ dev = ["pytest", "pytest-asyncio", "numpy"]
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
-module-name = "siprunner._siprunner"
+module-name = "rtpsip._rtpsip"

@@ -381,7 +381,7 @@ impl RtpBugFlags {
     /// # Example
     ///
     /// ```
-    /// use siprunner::rtp::dtmf::RtpBugFlags;
+    /// use rtpsip::rtp::dtmf::RtpBugFlags;
     ///
     /// // Sonus device detected
     /// let bugs = RtpBugFlags::detect_from_user_agent("Sonus-SBC/5.1.0");

@@ -409,7 +409,7 @@ impl Default for SipEngineConfig {
     fn default() -> Self {
         Self {
             local_addr: "0.0.0.0:5060".parse().unwrap(),
-            user_agent: "siprunner/0.1".to_string(),
+            user_agent: "rtpsip/0.1".to_string(),
             rtp_port_start: 10000,
             rtp_port_end: 20000,
         }
@@ -655,7 +655,7 @@ impl SipEngine {
             remote_uri: Some(from_uri.clone()), // Remote is the "From"
             remote_addr: None, // Will be set from response
             cseq: 1,
-            local_contact: Some(format!("sip:siprunner@{}", self.config.local_addr)),
+            local_contact: Some(format!("sip:rtpsip@{}", self.config.local_addr)),
             dtmf_mode: DtmfMode::Auto,
             remote_telephone_event_pt,
             early_media_state: EarlyMediaState::None,

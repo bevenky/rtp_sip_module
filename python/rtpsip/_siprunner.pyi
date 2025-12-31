@@ -1,4 +1,4 @@
-"""Type stubs for siprunner._siprunner"""
+"""Type stubs for rtpsip._rtpsip"""
 
 from typing import Optional, List
 from enum import IntEnum
@@ -210,7 +210,7 @@ class SipRunner:
     with integrated RTP audio handling.
 
     Example:
-        from siprunner import SipRunner, ProviderConfig
+        from rtpsip import SipRunner, ProviderConfig
 
         runner = SipRunner()
         runner.add_provider(ProviderConfig(

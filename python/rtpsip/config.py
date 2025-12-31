@@ -1,29 +1,29 @@
 """
-Configuration module for siprunner.
+Configuration module for rtpsip.
 
 Provides Python-native configuration classes for both SIP+RTP (Mode A)
 and RTP-only (Mode B) modes.
 
 Example - Mode A (SIP+RTP):
-    from siprunner.config import Config, SipConfig, RtpConfig, ProviderConfig
+    from rtpsip.config import Config, SipConfig, RtpConfig, ProviderConfig
 
     config = Config(
         sip=SipConfig(local_port=5060),
         rtp=RtpConfig(port_start=10000, port_end=20000),
         providers=[
             ProviderConfig(
-                name="twilio",
-                server="sip.twilio.com",
-                username="ACCOUNT_SID",
-                password="AUTH_TOKEN",
-                prefixes=["+1"],
+                name="plivo_us",
+                server="sip.plivo.com",
+                auth_username="AUTH_ID",
+                auth_password="AUTH_TOKEN",
+                prefixes=["+1", "+1415"],
             ),
             ProviderConfig(
-                name="telnyx",
-                server="sip.telnyx.com",
-                username="USER",
-                password="PASS",
-                prefixes=["+44"],
+                name="plivo_eu",
+                server="sip.plivo.com",
+                auth_username="AUTH_ID_EU",
+                auth_password="AUTH_TOKEN_EU",
+                prefixes=["+44", "+49"],
                 default=True,
             ),
         ],
@@ -34,11 +34,11 @@ Example - Mode A (SIP+RTP):
     config.to_toml("config.toml")
 
     # Or use directly
-    from siprunner import SipRunner
+    from rtpsip import SipRunner
     runner = SipRunner.from_config(config)
 
 Example - Mode B (RTP-only):
-    from siprunner.config import RtpSessionConfig
+    from rtpsip.config import RtpSessionConfig
 
     config = RtpSessionConfig(
         local_ip="0.0.0.0",
@@ -49,7 +49,7 @@ Example - Mode B (RTP-only):
         jitter_target_ms=60,
     )
 
-    from siprunner import RtpSession
+    from rtpsip import RtpSession
     session = RtpSession(**config.to_dict())
 """
 
@@ -142,10 +142,10 @@ class ProviderConfig:
 
     Attributes:
         name: Provider name for identification and logging
-        server: SIP server hostname (e.g., "sip.twilio.com")
+        server: SIP server hostname (e.g., "sip.plivo.com")
         port: SIP server port (default: 5060)
-        username: Authentication username
-        password: Authentication password
+        auth_username: Authentication username (e.g., Plivo AUTH_ID)
+        auth_password: Authentication password (e.g., Plivo AUTH_TOKEN)
         realm: Authentication realm (optional, defaults to server)
         prefixes: List of phone number prefixes this provider handles
                   (longest prefix match wins)
@@ -154,8 +154,8 @@ class ProviderConfig:
     name: str
     server: str
     port: int = 5060
-    username: str = ""
-    password: str = ""
+    auth_username: str = ""
+    auth_password: str = ""
     realm: Optional[str] = None
     prefixes: List[str] = field(default_factory=list)
     default: bool = False
@@ -174,10 +174,10 @@ class ProviderConfig:
             "server": self.server,
             "port": self.port,
         }
-        if self.username:
-            d["username"] = self.username
-        if self.password:
-            d["password"] = self.password
+        if self.auth_username:
+            d["auth_username"] = self.auth_username
+        if self.auth_password:
+            d["auth_password"] = self.auth_password
         if self.realm:
             d["realm"] = self.realm
         if self.prefixes:
@@ -316,10 +316,10 @@ class Config:
             lines.append(f'name = "{provider.name}"')
             lines.append(f'server = "{provider.server}"')
             lines.append(f"port = {provider.port}")
-            if provider.username:
-                lines.append(f'username = "{provider.username}"')
-            if provider.password:
-                lines.append(f'password = "{provider.password}"')
+            if provider.auth_username:
+                lines.append(f'auth_username = "{provider.auth_username}"')
+            if provider.auth_password:
+                lines.append(f'auth_password = "{provider.auth_password}"')
             if provider.realm:
                 lines.append(f'realm = "{provider.realm}"')
             if provider.prefixes:
@@ -477,8 +477,8 @@ class RtpSessionConfig:
 def create_single_provider_config(
     provider_name: str,
     server: str,
-    username: str,
-    password: str,
+    auth_username: str,
+    auth_password: str,
     *,
     local_sip_port: int = 5060,
     rtp_port_start: int = 10000,
@@ -490,8 +490,8 @@ def create_single_provider_config(
     Args:
         provider_name: Provider name
         server: SIP server hostname
-        username: Authentication username
-        password: Authentication password
+        auth_username: Authentication username
+        auth_password: Authentication password
         local_sip_port: Local SIP port (default: 5060)
         rtp_port_start: RTP port range start (default: 10000)
         rtp_port_end: RTP port range end (default: 20000)
@@ -501,9 +501,9 @@ def create_single_provider_config(
 
     Example:
         config = create_single_provider_config(
-            "twilio",
-            "sip.twilio.com",
-            "ACCOUNT_SID",
+            "plivo",
+            "sip.plivo.com",
+            "AUTH_ID",
             "AUTH_TOKEN",
         )
     """
@@ -514,8 +514,8 @@ def create_single_provider_config(
             ProviderConfig(
                 name=provider_name,
                 server=server,
-                username=username,
-                password=password,
+                auth_username=auth_username,
+                auth_password=auth_password,
                 default=True,
             )
         ],
@@ -534,8 +534,8 @@ def create_multi_provider_config(
         providers: List of provider dictionaries with keys:
             - name: Provider name
             - server: SIP server hostname
-            - username: Authentication username
-            - password: Authentication password
+            - auth_username: Authentication username
+            - auth_password: Authentication password
             - prefixes: List of phone prefixes (optional)
             - default: Is default provider (optional)
         blocked_prefixes: List of phone prefixes to block
@@ -548,17 +548,17 @@ def create_multi_provider_config(
         config = create_multi_provider_config(
             providers=[
                 {
-                    "name": "twilio",
-                    "server": "sip.twilio.com",
-                    "username": "SID",
-                    "password": "TOKEN",
+                    "name": "plivo_us",
+                    "server": "sip.plivo.com",
+                    "auth_username": "AUTH_ID",
+                    "auth_password": "AUTH_TOKEN",
                     "prefixes": ["+1"],
                 },
                 {
-                    "name": "telnyx",
-                    "server": "sip.telnyx.com",
-                    "username": "USER",
-                    "password": "PASS",
+                    "name": "plivo_eu",
+                    "server": "sip.plivo.com",
+                    "auth_username": "AUTH_ID_EU",
+                    "auth_password": "AUTH_TOKEN_EU",
                     "prefixes": ["+44"],
                     "default": True,
                 },

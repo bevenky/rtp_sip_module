@@ -1,4 +1,4 @@
-# siprunner configuration example
+# rtpsip configuration example
 
 [sip]
 # Local IP to bind SIP socket
@@ -23,22 +23,22 @@ port_end = 20000
 # Routing uses longest prefix match
 
 [[providers]]
-name = "plivo"
+name = "plivo_us"
 server = "sip.plivo.com"
 port = 5060
-username = "AUTH_ID"
-password = "AUTH_TOKEN"
-# Prefixes this provider handles
-prefixes = ["+1", "+1415"]
+auth_username = "AUTH_ID"
+auth_password = "AUTH_TOKEN"
+# Prefixes this provider handles (longest prefix match)
+prefixes = ["+1", "+1415", "+1650"]
 # Set default = true for fallback provider
 default = false
 
 [[providers]]
-name = "telnyx"
-server = "sip.telnyx.com"
+name = "plivo_eu"
+server = "sip.plivo.com"
 port = 5060
-username = "USER"
-password = "PASS"
+auth_username = "AUTH_ID_EU"
+auth_password = "AUTH_TOKEN_EU"
 prefixes = ["+44", "+49"]
 # This is the default/fallback provider
 default = true

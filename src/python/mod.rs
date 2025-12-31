@@ -1,6 +1,6 @@
 //! Python bindings module
 //!
-//! Provides PyO3 bindings for siprunner functionality.
+//! Provides PyO3 bindings for rtpsip functionality.
 
 pub mod client;
 pub mod events;

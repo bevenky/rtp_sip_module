@@ -2,7 +2,7 @@
 """
 SIP + RTP Integration Example (Mode A)
 
-This example demonstrates using siprunner's full SIP stack for telephony
+This example demonstrates using rtpsip's full SIP stack for telephony
 applications with complete DTMF support.
 
 Features:
@@ -24,7 +24,7 @@ import sys
 import time
 import threading
 from typing import Optional
-from siprunner import SipRunner, CallState, DtmfMode
+from rtpsip import SipRunner, CallState, DtmfMode
 
 
 class TelephonyApp:
@@ -417,23 +417,23 @@ local_ip = "0.0.0.0"
 port_start = 10000
 port_end = 20000
 
-# US provider (Twilio)
+# US provider (Plivo)
 [[providers]]
-name = "twilio"
-server = "sip.twilio.com"
+name = "plivo_us"
+server = "sip.plivo.com"
 port = 5060
-username = "ACCOUNT_SID"
-password = "AUTH_TOKEN"
-prefixes = ["+1"]
+auth_username = "AUTH_ID"
+auth_password = "AUTH_TOKEN"
+prefixes = ["+1", "+1415", "+1650"]
 
-# UK provider (Telnyx)
+# EU provider (Plivo)
 [[providers]]
-name = "telnyx"
-server = "sip.telnyx.com"
+name = "plivo_eu"
+server = "sip.plivo.com"
 port = 5060
-username = "USER"
-password = "PASS"
-prefixes = ["+44"]
+auth_username = "AUTH_ID_EU"
+auth_password = "AUTH_TOKEN_EU"
+prefixes = ["+44", "+49"]
 default = true  # Fallback for unmatched prefixes
 
 [routing]
@@ -606,3 +606,91 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# New Decorator-Based Interface (Recommended)
+# =============================================================================
+
+def demo_decorator_interface():
+    """
+    Demo: New decorator-based interface (like Flask/FastAPI)
+
+    This is the recommended way to use rtpsip for new projects.
+    The interface hides async complexity and provides a clean, Pythonic API.
+    """
+    from rtpsip import Client, Call
+
+    # Create client with mode as first argument
+    # Config is auto-detected from config.toml or environment variables
+    client = Client("sip", config="config.toml")
+
+    # Or using environment variables (RTPSIP_PROVIDER, RTPSIP_AUTH_USERNAME, etc.)
+    # client = Client("sip")
+
+    @client.on_incoming
+    def handle_incoming(call: Call):
+        """Handle incoming calls"""
+        print(f"Incoming call from {call.from_uri}")
+        call.answer()  # Auto-answer for demo
+
+    @client.on_answered
+    def handle_answered(call: Call):
+        """Called when call is answered (inbound or outbound)"""
+        print(f"Call {call.id} answered!")
+        # Send a greeting DTMF
+        call.send_dtmf("1#")
+
+    @client.on_audio
+    def handle_audio(call: Call, samples: list[int]):
+        """Handle incoming audio - 160 samples = 20ms at 8kHz"""
+        # Process audio (e.g., send to STT)
+        # response = ai.process(samples)
+        # call.send_audio(response)
+        pass
+
+    @client.on_dtmf
+    def handle_dtmf(call: Call, digit: str):
+        """Handle DTMF digits"""
+        print(f"DTMF received: {digit}")
+        if digit == "1":
+            print("User selected option 1")
+        elif digit == "#":
+            print("User confirmed")
+
+    @client.on_hangup
+    def handle_hangup(call: Call, reason: str):
+        """Handle call hangup"""
+        print(f"Call ended: {reason}")
+
+    # Run the client (blocking)
+    print("Starting client, press Ctrl+C to exit...")
+
+    try:
+        # For inbound calls, just run:
+        # client.run()
+
+        # For outbound call:
+        # Note: dial() requires run() to be running in a thread
+        import threading
+
+        def run_client():
+            client.run()
+
+        # Start client in background thread
+        thread = threading.Thread(target=run_client, daemon=True)
+        thread.start()
+
+        # Wait for client to initialize
+        import time
+        time.sleep(1)
+
+        # Make outbound call
+        call = client.dial(to="+14155551234", from_="+14155550000")
+        print(f"Dialing {call.to_uri}...")
+
+        # Keep running
+        thread.join()
+
+    except KeyboardInterrupt:
+        print("\nShutting down...")

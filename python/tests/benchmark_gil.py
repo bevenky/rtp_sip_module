@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GIL Release Benchmark for siprunner
+GIL Release Benchmark for rtpsip
 
 Tests that blocking operations properly release the GIL by running
 concurrent Python threads during Rust blocking calls.
@@ -18,11 +18,11 @@ Without GIL release:
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from siprunner import RtpSession
+from rtpsip import RtpSession
 
 
 class GILBenchmark:
-    """Benchmark GIL release in siprunner operations"""
+    """Benchmark GIL release in rtpsip operations"""
 
     def __init__(self):
         self.counter = 0
@@ -259,7 +259,7 @@ def benchmark_event_loop_responsiveness():
 def run_all_benchmarks():
     """Run all GIL benchmarks and summarize results"""
     print("=" * 60)
-    print("siprunner GIL Release Benchmarks")
+    print("rtpsip GIL Release Benchmarks")
     print("=" * 60)
 
     results = {}

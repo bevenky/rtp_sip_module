@@ -84,7 +84,7 @@ impl From<PyDtmfMode> for DtmfMode {
 ///
 /// Example:
 /// ```python
-/// from siprunner import SipRunner
+/// from rtpsip import SipRunner
 ///
 /// # Load from config file
 /// runner = SipRunner.from_config("config.toml")

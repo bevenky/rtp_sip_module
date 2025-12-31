@@ -1,4 +1,4 @@
-"""Tests for siprunner configuration module"""
+"""Tests for rtpsip configuration module"""
 
 import pytest
 import tempfile
@@ -10,37 +10,37 @@ class TestProviderConfig:
 
     def test_create_provider(self):
         """Test creating a provider configuration"""
-        from siprunner.config import ProviderConfig
+        from rtpsip.config import ProviderConfig
 
         provider = ProviderConfig(
-            name="twilio",
-            server="sip.twilio.com",
-            username="ACCOUNT_SID",
-            password="AUTH_TOKEN",
+            name="plivo",
+            server="sip.plivo.com",
+            auth_username="AUTH_ID",
+            auth_password="AUTH_TOKEN",
             prefixes=["+1"],
         )
 
-        assert provider.name == "twilio"
-        assert provider.server == "sip.twilio.com"
+        assert provider.name == "plivo"
+        assert provider.server == "sip.plivo.com"
         assert provider.port == 5060  # Default
         assert provider.prefixes == ["+1"]
         assert provider.default is False
 
     def test_provider_defaults(self):
         """Test provider default values"""
-        from siprunner.config import ProviderConfig
+        from rtpsip.config import ProviderConfig
 
         provider = ProviderConfig(name="test", server="sip.test.com")
 
         assert provider.port == 5060
-        assert provider.username == ""
-        assert provider.password == ""
+        assert provider.auth_username == ""
+        assert provider.auth_password == ""
         assert provider.prefixes == []
         assert provider.default is False
 
     def test_provider_validation_empty_name(self):
         """Test provider validation with empty name"""
-        from siprunner.config import ProviderConfig
+        from rtpsip.config import ProviderConfig
 
         provider = ProviderConfig(name="", server="sip.test.com")
         with pytest.raises(ValueError, match="name is required"):
@@ -48,7 +48,7 @@ class TestProviderConfig:
 
     def test_provider_validation_empty_server(self):
         """Test provider validation with empty server"""
-        from siprunner.config import ProviderConfig
+        from rtpsip.config import ProviderConfig
 
         provider = ProviderConfig(name="test", server="")
         with pytest.raises(ValueError, match="empty server"):
@@ -60,7 +60,7 @@ class TestSipConfig:
 
     def test_sip_config_defaults(self):
         """Test SIP config default values"""
-        from siprunner.config import SipConfig
+        from rtpsip.config import SipConfig
 
         config = SipConfig()
 
@@ -71,7 +71,7 @@ class TestSipConfig:
 
     def test_sip_config_validation_invalid_transport(self):
         """Test SIP config validation with invalid transport"""
-        from siprunner.config import SipConfig
+        from rtpsip.config import SipConfig
 
         config = SipConfig(transport="http")
         with pytest.raises(ValueError, match="Invalid transport"):
@@ -79,7 +79,7 @@ class TestSipConfig:
 
     def test_sip_config_validation_tls_requires_certs(self):
         """Test SIP config validation - TLS requires certs"""
-        from siprunner.config import SipConfig
+        from rtpsip.config import SipConfig
 
         config = SipConfig(transport="tls")
         with pytest.raises(ValueError, match="requires tls_cert"):
@@ -87,7 +87,7 @@ class TestSipConfig:
 
     def test_sip_config_validation_tls_with_certs(self):
         """Test SIP config validation - TLS with certs"""
-        from siprunner.config import SipConfig
+        from rtpsip.config import SipConfig
 
         config = SipConfig(
             transport="tls",
@@ -102,7 +102,7 @@ class TestRtpConfig:
 
     def test_rtp_config_defaults(self):
         """Test RTP config default values"""
-        from siprunner.config import RtpConfig
+        from rtpsip.config import RtpConfig
 
         config = RtpConfig()
 
@@ -112,7 +112,7 @@ class TestRtpConfig:
 
     def test_rtp_config_validation_invalid_range(self):
         """Test RTP config validation with invalid port range"""
-        from siprunner.config import RtpConfig
+        from rtpsip.config import RtpConfig
 
         config = RtpConfig(port_start=20000, port_end=10000)
         with pytest.raises(ValueError, match="port_start must be less than port_end"):
@@ -124,17 +124,17 @@ class TestConfig:
 
     def test_create_config(self):
         """Test creating a full configuration"""
-        from siprunner.config import Config, SipConfig, RtpConfig, ProviderConfig
+        from rtpsip.config import Config, SipConfig, RtpConfig, ProviderConfig
 
         config = Config(
             sip=SipConfig(local_port=5080),
             rtp=RtpConfig(port_start=20000, port_end=30000),
             providers=[
                 ProviderConfig(
-                    name="twilio",
-                    server="sip.twilio.com",
-                    username="SID",
-                    password="TOKEN",
+                    name="plivo",
+                    server="sip.plivo.com",
+                    auth_username="AUTH_ID",
+                    auth_password="AUTH_TOKEN",
                     prefixes=["+1"],
                 )
             ],
@@ -148,7 +148,7 @@ class TestConfig:
 
     def test_config_validation_no_providers(self):
         """Test config validation with no providers"""
-        from siprunner.config import Config
+        from rtpsip.config import Config
 
         config = Config()
         with pytest.raises(ValueError, match="At least one provider is required"):
@@ -156,7 +156,7 @@ class TestConfig:
 
     def test_config_routing_longest_prefix(self):
         """Test config routing with longest prefix match"""
-        from siprunner.config import Config, ProviderConfig
+        from rtpsip.config import Config, ProviderConfig
 
         config = Config(
             providers=[
@@ -177,7 +177,7 @@ class TestConfig:
 
     def test_config_routing_default_provider(self):
         """Test config routing with default provider"""
-        from siprunner.config import Config, ProviderConfig
+        from rtpsip.config import Config, ProviderConfig
 
         config = Config(
             providers=[
@@ -193,7 +193,7 @@ class TestConfig:
 
     def test_config_routing_no_match(self):
         """Test config routing with no match and no default"""
-        from siprunner.config import Config, ProviderConfig
+        from rtpsip.config import Config, ProviderConfig
 
         config = Config(
             providers=[
@@ -207,7 +207,7 @@ class TestConfig:
 
     def test_config_is_blocked(self):
         """Test config blocked prefix check"""
-        from siprunner.config import Config, ProviderConfig
+        from rtpsip.config import Config, ProviderConfig
 
         config = Config(
             providers=[ProviderConfig(name="test", server="sip.test.com")],
@@ -220,15 +220,15 @@ class TestConfig:
 
     def test_config_to_toml(self):
         """Test config TOML generation"""
-        from siprunner.config import Config, ProviderConfig
+        from rtpsip.config import Config, ProviderConfig
 
         config = Config(
             providers=[
                 ProviderConfig(
-                    name="twilio",
-                    server="sip.twilio.com",
-                    username="SID",
-                    password="TOKEN",
+                    name="plivo",
+                    server="sip.plivo.com",
+                    auth_username="AUTH_ID",
+                    auth_password="AUTH_TOKEN",
                     prefixes=["+1"],
                     default=True,
                 )
@@ -241,14 +241,16 @@ class TestConfig:
         assert "[sip]" in toml_str
         assert "[rtp]" in toml_str
         assert "[[providers]]" in toml_str
-        assert 'name = "twilio"' in toml_str
-        assert 'server = "sip.twilio.com"' in toml_str
+        assert 'name = "plivo"' in toml_str
+        assert 'server = "sip.plivo.com"' in toml_str
+        assert 'auth_username = "AUTH_ID"' in toml_str
+        assert 'auth_password = "AUTH_TOKEN"' in toml_str
         assert "[routing]" in toml_str
         assert '"+1900"' in toml_str
 
     def test_config_to_toml_file(self):
         """Test config TOML file writing"""
-        from siprunner.config import Config, ProviderConfig
+        from rtpsip.config import Config, ProviderConfig
 
         config = Config(
             providers=[
@@ -268,7 +270,7 @@ class TestRtpSessionConfig:
 
     def test_rtp_session_config_defaults(self):
         """Test RTP session config default values"""
-        from siprunner.config import RtpSessionConfig
+        from rtpsip.config import RtpSessionConfig
 
         config = RtpSessionConfig()
 
@@ -280,14 +282,14 @@ class TestRtpSessionConfig:
 
     def test_rtp_session_config_local_addr(self):
         """Test RTP session config local_addr property"""
-        from siprunner.config import RtpSessionConfig
+        from rtpsip.config import RtpSessionConfig
 
         config = RtpSessionConfig(local_ip="192.168.1.1", local_port=5004)
         assert config.local_addr == "192.168.1.1:5004"
 
     def test_rtp_session_config_remote_addr(self):
         """Test RTP session config remote_addr property"""
-        from siprunner.config import RtpSessionConfig
+        from rtpsip.config import RtpSessionConfig
 
         config = RtpSessionConfig(remote_ip="10.0.0.1", remote_port=5006)
         assert config.remote_addr == "10.0.0.1:5006"
@@ -297,7 +299,7 @@ class TestRtpSessionConfig:
 
     def test_rtp_session_config_to_dict(self):
         """Test RTP session config to_dict for RtpSession"""
-        from siprunner.config import RtpSessionConfig
+        from rtpsip.config import RtpSessionConfig
 
         config = RtpSessionConfig(
             local_ip="0.0.0.0",
@@ -312,7 +314,7 @@ class TestRtpSessionConfig:
 
     def test_rtp_session_config_validation_invalid_codec(self):
         """Test RTP session config validation with invalid codec"""
-        from siprunner.config import RtpSessionConfig
+        from rtpsip.config import RtpSessionConfig
 
         config = RtpSessionConfig(codec="OPUS")
         with pytest.raises(ValueError, match="Invalid codec"):
@@ -320,7 +322,7 @@ class TestRtpSessionConfig:
 
     def test_rtp_session_config_validation_jitter(self):
         """Test RTP session config jitter validation"""
-        from siprunner.config import RtpSessionConfig
+        from rtpsip.config import RtpSessionConfig
 
         config = RtpSessionConfig(jitter_min_ms=100, jitter_max_ms=50)
         with pytest.raises(ValueError, match="jitter_min_ms must be less than"):
@@ -332,37 +334,38 @@ class TestConvenienceFunctions:
 
     def test_create_single_provider_config(self):
         """Test create_single_provider_config"""
-        from siprunner.config import create_single_provider_config
+        from rtpsip.config import create_single_provider_config
 
         config = create_single_provider_config(
-            provider_name="twilio",
-            server="sip.twilio.com",
-            username="SID",
-            password="TOKEN",
+            provider_name="plivo",
+            server="sip.plivo.com",
+            auth_username="AUTH_ID",
+            auth_password="AUTH_TOKEN",
         )
 
         assert len(config.providers) == 1
-        assert config.providers[0].name == "twilio"
+        assert config.providers[0].name == "plivo"
+        assert config.providers[0].auth_username == "AUTH_ID"
         assert config.providers[0].default is True
 
     def test_create_multi_provider_config(self):
         """Test create_multi_provider_config"""
-        from siprunner.config import create_multi_provider_config
+        from rtpsip.config import create_multi_provider_config
 
         config = create_multi_provider_config(
             providers=[
                 {
-                    "name": "twilio",
-                    "server": "sip.twilio.com",
-                    "username": "SID",
-                    "password": "TOKEN",
+                    "name": "plivo_us",
+                    "server": "sip.plivo.com",
+                    "auth_username": "AUTH_ID",
+                    "auth_password": "AUTH_TOKEN",
                     "prefixes": ["+1"],
                 },
                 {
-                    "name": "telnyx",
-                    "server": "sip.telnyx.com",
-                    "username": "USER",
-                    "password": "PASS",
+                    "name": "plivo_eu",
+                    "server": "sip.plivo.com",
+                    "auth_username": "AUTH_ID_EU",
+                    "auth_password": "AUTH_TOKEN_EU",
                     "prefixes": ["+44"],
                     "default": True,
                 },
@@ -371,7 +374,7 @@ class TestConvenienceFunctions:
         )
 
         assert len(config.providers) == 2
-        assert config.providers[0].name == "twilio"
+        assert config.providers[0].name == "plivo_us"
         assert config.providers[1].default is True
         assert config.blocked_prefixes == ["+1900"]
 
@@ -381,8 +384,8 @@ class TestConfigIntegration:
 
     def test_rtp_session_with_config(self):
         """Test using RtpSessionConfig with RtpSession"""
-        from siprunner import RtpSession
-        from siprunner.config import RtpSessionConfig
+        from rtpsip import RtpSession
+        from rtpsip.config import RtpSessionConfig
 
         config = RtpSessionConfig(
             local_ip="127.0.0.1",

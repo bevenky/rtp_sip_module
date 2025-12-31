@@ -1,12 +1,12 @@
 """
 Plivo Serializer with RTP Mode Support for Pipecat
 
-Extends Plivo's WebSocket-based transport to support siprunner's RtpSession
+Extends Plivo's WebSocket-based transport to support rtpsip's RtpSession
 for media handling (Mode B - RTP only, signaling via WebSocket).
 
 Two audio modes:
 - "websocket" (default): Audio via Plivo's WebSocket (base64 encoded)
-- "rtp": Audio via siprunner's RtpSession (direct RTP/UDP)
+- "rtp": Audio via rtpsip's RtpSession (direct RTP/UDP)
 
 RTP mode advantages:
 - Lower latency (direct UDP vs WebSocket)
@@ -15,7 +15,7 @@ RTP mode advantages:
 
 Example:
     from pipecat.pipeline.pipeline import Pipeline
-    from siprunner.pipecat.plivo_serializer import PlivoRtpTransport
+    from rtpsip.pipecat.plivo_serializer import PlivoRtpTransport
 
     # RTP mode - audio via direct RTP
     transport = PlivoRtpTransport(
@@ -70,8 +70,8 @@ except ImportError:
     BaseTransport = object
     FrameSerializer = object
 
-from siprunner import RtpSession
-from siprunner.config import RtpSessionConfig
+from rtpsip import RtpSession
+from rtpsip.config import RtpSessionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -429,7 +429,7 @@ class PlivoRtpTransport(BaseTransport if PIPECAT_AVAILABLE else object):
     """
     Plivo Transport with RTP mode support for Pipecat.
 
-    Combines Plivo's WebSocket signaling with siprunner's RTP for media.
+    Combines Plivo's WebSocket signaling with rtpsip's RTP for media.
 
     Modes:
     - audio_mode="websocket": Standard Plivo (audio via WebSocket)

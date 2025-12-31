@@ -1,4 +1,4 @@
-"""Basic tests for siprunner RTP functionality"""
+"""Basic tests for rtpsip RTP functionality"""
 
 import pytest
 import time
@@ -9,12 +9,12 @@ class TestRtpSession:
 
     def test_import(self):
         """Test that the module can be imported"""
-        from siprunner import RtpSession, JitterStats, __version__
+        from rtpsip import RtpSession, JitterStats, __version__
         assert __version__ is not None
 
     def test_create_session(self):
         """Test creating an RTP session"""
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         session = RtpSession(
             local_addr="127.0.0.1:0",
@@ -24,7 +24,7 @@ class TestRtpSession:
 
     def test_create_session_pcma(self):
         """Test creating an RTP session with PCMA codec"""
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         session = RtpSession(
             local_addr="127.0.0.1:0",
@@ -34,14 +34,14 @@ class TestRtpSession:
 
     def test_invalid_codec(self):
         """Test that invalid codec raises error"""
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         with pytest.raises(ValueError):
             RtpSession(codec="OPUS")
 
     def test_start_stop(self):
         """Test starting and stopping a session"""
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         session = RtpSession(local_addr="127.0.0.1:0")
         session.start()
@@ -55,7 +55,7 @@ class TestRtpSession:
 
     def test_loopback(self):
         """Test sending and receiving audio in loopback"""
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         # Create two sessions
         session1 = RtpSession(local_addr="127.0.0.1:0")
@@ -89,7 +89,7 @@ class TestRtpSession:
 
     def test_jitter_stats(self):
         """Test getting jitter buffer statistics"""
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         session = RtpSession(local_addr="127.0.0.1:0")
         session.start()
@@ -112,7 +112,7 @@ class TestRtpSession:
         5. Python calls set_remote() with server's RTP endpoint
         6. Audio flows, Python receives L16 frames via recv_audio()
         """
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         # Simulate: Server tells us its RTP endpoint via websocket
         # (In real app, this comes from websocket message)
@@ -188,7 +188,7 @@ class TestRtpSession:
         Test multiple RTP sessions with different dynamically allocated ports.
         Simulates handling multiple concurrent calls.
         """
-        from siprunner import RtpSession
+        from rtpsip import RtpSession
 
         sessions = []
         ports = set()

@@ -9,14 +9,14 @@ A generic SIP trunking serializer that works with any SIP provider:
 - Vonage
 - Any standards-compliant SIP trunk
 
-Uses siprunner's SipRunner (Mode A) for full SIP signaling + RTP media.
+Uses rtpsip's SipRunner (Mode A) for full SIP signaling + RTP media.
 
 Audio format: L16 PCM i16 samples at 8kHz mono (160 samples = 20ms frame)
 
 Example:
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.transports.base_transport import TransportParams
-    from siprunner.pipecat.sip_rtp_serializer import SipRtpTransport
+    from rtpsip.pipecat.sip_rtp_serializer import SipRtpTransport
 
     # Single provider setup
     transport = SipRtpTransport(
@@ -66,7 +66,7 @@ except ImportError:
     BaseOutputTransport = object
     BaseTransport = object
 
-from siprunner import SipRunner, CallEvent, CallState, DtmfMode
+from rtpsip import SipRunner, CallEvent, CallState, DtmfMode
 
 logger = logging.getLogger(__name__)
 

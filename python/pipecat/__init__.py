@@ -1,7 +1,7 @@
 """
-Pipecat integration for siprunner
+Pipecat integration for rtpsip
 
-Provides serializers and transports for using siprunner with Pipecat pipelines.
+Provides serializers and transports for using rtpsip with Pipecat pipelines.
 
 Two transport types:
 
@@ -13,10 +13,10 @@ Two transport types:
 2. PlivoRtpTransport (Mode B - Plivo WebSocket + RTP):
    - Works with Plivo's WebSocket-based streaming
    - Two audio modes: "websocket" (default) or "rtp" (lower latency)
-   - RTP mode uses siprunner's RtpSession for direct UDP audio
+   - RTP mode uses rtpsip's RtpSession for direct UDP audio
 
 Example - SIP Trunking (any provider):
-    from siprunner.pipecat import SipRtpTransport
+    from rtpsip.pipecat import SipRtpTransport
 
     transport = SipRtpTransport(
         provider_name="twilio",
@@ -29,7 +29,7 @@ Example - SIP Trunking (any provider):
     call_id = await transport.call(to="+14155551234", from_="+14155550000")
 
 Example - Plivo with RTP mode:
-    from siprunner.pipecat import PlivoRtpTransport
+    from rtpsip.pipecat import PlivoRtpTransport
 
     transport = PlivoRtpTransport(
         websocket=websocket,
@@ -41,7 +41,7 @@ Example - Plivo with RTP mode:
 """
 
 # SIP RTP Transport (Mode A - any SIP provider)
-from siprunner.pipecat.sip_rtp_serializer import (
+from rtpsip.pipecat.sip_rtp_serializer import (
     SipRtpTransport,
     SipInputTransport,
     SipOutputTransport,
@@ -51,7 +51,7 @@ from siprunner.pipecat.sip_rtp_serializer import (
 )
 
 # Plivo Transport with RTP mode (Mode B)
-from siprunner.pipecat.plivo_serializer import (
+from rtpsip.pipecat.plivo_serializer import (
     PlivoRtpTransport,
     PlivoInputTransport,
     PlivoOutputTransport,

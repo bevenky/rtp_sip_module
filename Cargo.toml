@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "siprunner"
+name = "rtpsip"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance SIP/RTP library for Voice AI"
@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["sip", "rtp", "voip", "telephony", "voice-ai"]
 
 [lib]
-name = "siprunner"
+name = "rtpsip"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

@@ -2,7 +2,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::PyErr;
 use thiserror::Error;
 
-/// Main error type for siprunner
+/// Main error type for rtpsip
 #[derive(Error, Debug)]
 pub enum SipRunnerError {
     #[error("IO error: {0}")]
@@ -65,5 +65,5 @@ impl From<SipRunnerError> for PyErr {
     }
 }
 
-/// Result type alias for siprunner operations
+/// Result type alias for rtpsip operations
 pub type Result<T> = std::result::Result<T, SipRunnerError>;

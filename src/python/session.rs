@@ -51,7 +51,7 @@ impl From<JitterStats> for PyJitterStats {
 ///
 /// Example:
 /// ```python
-/// from siprunner import RtpSession
+/// from rtpsip import RtpSession
 ///
 /// session = RtpSession(
 ///     local_addr="0.0.0.0:0",
