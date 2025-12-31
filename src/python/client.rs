@@ -248,7 +248,7 @@ impl PySipRunner {
     /// Must be called before making or receiving calls.
     fn start(&self) -> PyResult<()> {
         if *self.running.lock() {
-            return Err(PyRuntimeError::new_err("SipRunner is already running"));
+            return Err(PyRuntimeError::new_err("Runner is already running"));
         }
 
         let local_addr = format!(
@@ -364,7 +364,7 @@ impl PySipRunner {
         })?;
 
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started. Call start() first.")
+            PyRuntimeError::new_err("Runner not started. Call start() first.")
         })?;
 
         // Build SIP URIs - clone strings before releasing GIL
@@ -390,7 +390,7 @@ impl PySipRunner {
     ///     call_id: Call ID to hangup
     fn hangup(&self, py: Python<'_>, call_id: &str) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         let call_id = call_id.to_string();
@@ -418,7 +418,7 @@ impl PySipRunner {
     ///         runner.answer(event.call_id)
     fn answer(&self, call_id: &str) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         engine
@@ -447,7 +447,7 @@ impl PySipRunner {
     #[pyo3(signature = (call_id, status_code = 603))]
     fn reject(&self, call_id: &str, status_code: u16) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         engine
@@ -464,7 +464,7 @@ impl PySipRunner {
     ///     samples: List of PCM i16 samples (8kHz mono)
     fn send_audio(&self, py: Python<'_>, call_id: &str, samples: Vec<i16>) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         let session = engine.get_call(call_id).ok_or_else(|| {
@@ -501,7 +501,7 @@ impl PySipRunner {
     ///     List of PCM i16 samples (8kHz mono), or None if timeout
     fn recv_audio(&self, py: Python<'_>, call_id: &str, timeout_ms: u64) -> PyResult<Option<Vec<i16>>> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         let session = engine.get_call(call_id).ok_or_else(|| {
@@ -554,7 +554,7 @@ impl PySipRunner {
         inter_digit_ms: u64,
     ) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         // Validate the digits (allow w/W for pauses)
@@ -595,7 +595,7 @@ impl PySipRunner {
     ///         print(f"Received DTMF: {digit}")
     fn recv_dtmf(&self, call_id: &str) -> PyResult<Option<(char, u32)>> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         engine
@@ -623,7 +623,7 @@ impl PySipRunner {
         timeout_ms: u64,
     ) -> PyResult<Option<(char, u32)>> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         let call_id = call_id.to_string();
@@ -649,7 +649,7 @@ impl PySipRunner {
     ///     DtmfMode enum value
     fn get_dtmf_mode(&self, call_id: &str) -> PyResult<PyDtmfMode> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         engine
@@ -667,7 +667,7 @@ impl PySipRunner {
     ///     mode: DtmfMode.Auto, DtmfMode.Rfc2833, or DtmfMode.Info
     fn set_dtmf_mode(&self, call_id: &str, mode: PyDtmfMode) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         engine
@@ -684,7 +684,7 @@ impl PySipRunner {
     ///     call_id: Call ID to hold
     fn hold(&self, py: Python<'_>, call_id: &str) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         let call_id = call_id.to_string();
@@ -707,7 +707,7 @@ impl PySipRunner {
     ///     call_id: Call ID to resume
     fn unhold(&self, py: Python<'_>, call_id: &str) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         let call_id = call_id.to_string();
@@ -732,7 +732,7 @@ impl PySipRunner {
     #[pyo3(signature = (call_id, sdp = None))]
     fn reinvite(&self, py: Python<'_>, call_id: &str, sdp: Option<&str>) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         let call_id = call_id.to_string();
@@ -763,7 +763,7 @@ impl PySipRunner {
         let mut rx = {
             let mut rx_guard = self.event_rx.lock();
             rx_guard.as_mut().ok_or_else(|| {
-                PyRuntimeError::new_err("SipRunner not started")
+                PyRuntimeError::new_err("Runner not started")
             })?.resubscribe()
         };
 
@@ -792,7 +792,7 @@ impl PySipRunner {
     /// Get all active call IDs
     fn active_calls(&self) -> PyResult<Vec<String>> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         Ok(engine.active_calls())
@@ -801,7 +801,7 @@ impl PySipRunner {
     /// Get the state of a call
     fn get_call_state(&self, call_id: &str) -> PyResult<Option<PyCallState>> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
-            PyRuntimeError::new_err("SipRunner not started")
+            PyRuntimeError::new_err("Runner not started")
         })?;
 
         Ok(engine.get_call(call_id).map(|s| s.lock().state.into()))

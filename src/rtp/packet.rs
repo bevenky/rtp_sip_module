@@ -1,6 +1,6 @@
 //! RTP packet handling using the rtp crate (webrtc-rs)
 
-use crate::error::{Result, SipRunnerError};
+use crate::error::{Result, RtpSipError};
 use bytes::Bytes;
 use rtp::packet::Packet;
 use rtp::header::Header;
@@ -120,13 +120,13 @@ impl RtpPacketBuilder {
 /// Parse an RTP packet from bytes
 pub fn parse_rtp_packet(data: &[u8]) -> Result<Packet> {
     Packet::unmarshal(&mut data.to_vec().as_slice())
-        .map_err(|e| SipRunnerError::Rtp(format!("Failed to parse RTP packet: {}", e)))
+        .map_err(|e| RtpSipError::Rtp(format!("Failed to parse RTP packet: {}", e)))
 }
 
 /// Serialize an RTP packet to bytes
 pub fn serialize_rtp_packet(packet: &Packet) -> Result<Bytes> {
     packet.marshal()
-        .map_err(|e| SipRunnerError::Rtp(format!("Failed to serialize RTP packet: {}", e)))
+        .map_err(|e| RtpSipError::Rtp(format!("Failed to serialize RTP packet: {}", e)))
 }
 
 #[cfg(test)]

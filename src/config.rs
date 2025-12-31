@@ -2,7 +2,7 @@
 //!
 //! Handles loading configuration from TOML files.
 
-use crate::error::{Result, SipRunnerError};
+use crate::error::{Result, RtpSipError};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -115,7 +115,7 @@ impl Config {
     /// Load configuration from a TOML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
-            SipRunnerError::Config(format!("Failed to read config file: {}", e))
+            RtpSipError::Config(format!("Failed to read config file: {}", e))
         })?;
         Self::from_str(&content)
     }
@@ -123,7 +123,7 @@ impl Config {
     /// Parse configuration from a TOML string
     pub fn from_str(content: &str) -> Result<Self> {
         toml::from_str(content).map_err(|e| {
-            SipRunnerError::Config(format!("Failed to parse config: {}", e))
+            RtpSipError::Config(format!("Failed to parse config: {}", e))
         })
     }
 
@@ -131,7 +131,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         // Check transport
         if self.sip.transport != "udp" && self.sip.transport != "tls" {
-            return Err(SipRunnerError::Config(format!(
+            return Err(RtpSipError::Config(format!(
                 "Invalid transport '{}'. Must be 'udp' or 'tls'",
                 self.sip.transport
             )));
@@ -140,7 +140,7 @@ impl Config {
         // Check TLS config
         if self.sip.transport == "tls" {
             if self.sip.tls_cert.is_none() || self.sip.tls_key.is_none() {
-                return Err(SipRunnerError::Config(
+                return Err(RtpSipError::Config(
                     "TLS transport requires tls_cert and tls_key".to_string(),
                 ));
             }
@@ -148,7 +148,7 @@ impl Config {
 
         // Check at least one provider
         if self.providers.is_empty() {
-            return Err(SipRunnerError::Config(
+            return Err(RtpSipError::Config(
                 "At least one provider is required".to_string(),
             ));
         }
@@ -156,13 +156,13 @@ impl Config {
         // Check provider servers
         for provider in &self.providers {
             if provider.server.is_empty() {
-                return Err(SipRunnerError::Config(format!(
+                return Err(RtpSipError::Config(format!(
                     "Provider '{}' has empty server",
                     provider.name
                 )));
             }
             if provider.name.is_empty() {
-                return Err(SipRunnerError::Config(
+                return Err(RtpSipError::Config(
                     "Provider name is required".to_string(),
                 ));
             }
@@ -170,7 +170,7 @@ impl Config {
 
         // Check RTP port range
         if self.rtp.port_start >= self.rtp.port_end {
-            return Err(SipRunnerError::Config(
+            return Err(RtpSipError::Config(
                 "RTP port_start must be less than port_end".to_string(),
             ));
         }

@@ -1,6 +1,6 @@
 //! G.711 codec wrapper using audio-codec-algorithms crate
 
-use crate::error::{Result, SipRunnerError};
+use crate::error::{Result, RtpSipError};
 use audio_codec_algorithms::{decode_alaw, decode_ulaw, encode_alaw, encode_ulaw};
 
 /// Supported codec types
@@ -36,7 +36,7 @@ impl CodecType {
         match s.to_uppercase().as_str() {
             "PCMU" | "ULAW" | "G711U" => Ok(CodecType::Pcmu),
             "PCMA" | "ALAW" | "G711A" => Ok(CodecType::Pcma),
-            _ => Err(SipRunnerError::Codec(format!(
+            _ => Err(RtpSipError::Codec(format!(
                 "Unsupported codec: {}. Use PCMU or PCMA",
                 s
             ))),

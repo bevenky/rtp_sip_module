@@ -1,6 +1,6 @@
 //! RTP Engine for sending and receiving audio
 
-use crate::error::{Result, SipRunnerError};
+use crate::error::{Result, RtpSipError};
 use crate::rtp::codec::{CodecType, G711Codec};
 use crate::rtp::dtmf::{DetectedDtmf, DtmfDetector, DtmfSender, RtpBugFlags, TELEPHONE_EVENT_PT};
 use crate::rtp::jitter::{JitterBuffer, JitterConfig, JitterStats, PacketLossConcealer};
@@ -173,7 +173,7 @@ impl RtpEngine {
     /// Start the receive loop
     pub fn start(self: &Arc<Self>) -> Result<()> {
         if self.running.swap(true, Ordering::SeqCst) {
-            return Err(SipRunnerError::AlreadyStarted);
+            return Err(RtpSipError::AlreadyStarted);
         }
 
         let engine = self.clone();
@@ -261,7 +261,7 @@ impl RtpEngine {
         let remote = self
             .remote_addr
             .lock()
-            .ok_or(SipRunnerError::NotConnected)?;
+            .ok_or(RtpSipError::NotConnected)?;
 
         // Encode samples
         let encoded = self.codec.encode(samples);
@@ -284,7 +284,7 @@ impl RtpEngine {
         let remote = self
             .remote_addr
             .lock()
-            .ok_or(SipRunnerError::NotConnected)?;
+            .ok_or(RtpSipError::NotConnected)?;
 
         let encoded = self.codec.encode(samples);
         let packet = self
@@ -304,7 +304,7 @@ impl RtpEngine {
         match self.recv_rx.lock().try_recv() {
             Ok(samples) => Ok(Some(samples)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => Err(SipRunnerError::ChannelClosed),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(RtpSipError::ChannelClosed),
         }
     }
 
@@ -321,7 +321,7 @@ impl RtpEngine {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(SipRunnerError::ChannelClosed)
+                    return Err(RtpSipError::ChannelClosed)
                 }
             }
         }
@@ -350,7 +350,7 @@ impl RtpEngine {
         let remote = self
             .remote_addr
             .lock()
-            .ok_or(SipRunnerError::NotConnected)?;
+            .ok_or(RtpSipError::NotConnected)?;
 
         // Generate all packets for this digit (20ms intervals)
         let packets = self
@@ -397,7 +397,7 @@ impl RtpEngine {
         match self.dtmf_rx.lock().try_recv() {
             Ok(dtmf) => Ok(Some(dtmf)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => Err(SipRunnerError::ChannelClosed),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(RtpSipError::ChannelClosed),
         }
     }
 
@@ -414,7 +414,7 @@ impl RtpEngine {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(SipRunnerError::ChannelClosed)
+                    return Err(RtpSipError::ChannelClosed)
                 }
             }
         }

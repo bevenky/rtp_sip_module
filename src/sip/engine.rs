@@ -65,7 +65,7 @@
 //! directions. The code checks `client_dialog` then `server_dialog` to find
 //! the appropriate dialog for the operation.
 
-use crate::error::{Result, SipRunnerError};
+use crate::error::{Result, RtpSipError};
 use crate::rtp::{CodecType, RtpEngine, RtpEngineConfig};
 use crate::sip::sdp::{MediaDirection, Sdp, SdpBuilder};
 use parking_lot::Mutex;
@@ -490,7 +490,7 @@ impl SipEngine {
         let mut incoming_rx = self
             .endpoint
             .incoming_transactions()
-            .map_err(|e| SipRunnerError::Sip(format!("Failed to get incoming transactions: {}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Failed to get incoming transactions: {}", e)))?;
 
         let engine = self.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -750,26 +750,26 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let (server_dialog, local_sdp) = {
             let mut sess = session.lock();
 
             if sess.direction != Direction::Inbound {
-                return Err(SipRunnerError::Session(
+                return Err(RtpSipError::Session(
                     "Cannot answer outbound call".to_string(),
                 ));
             }
 
             if sess.state != CallState::Ringing {
-                return Err(SipRunnerError::Session(format!(
+                return Err(RtpSipError::Session(format!(
                     "Cannot answer call in state {:?}",
                     sess.state
                 )));
             }
 
             let dialog = sess.server_dialog.clone().ok_or_else(|| {
-                SipRunnerError::Session("No server dialog for inbound call".to_string())
+                RtpSipError::Session("No server dialog for inbound call".to_string())
             })?;
 
             let sdp = sess.local_sdp.clone();
@@ -793,7 +793,7 @@ impl SipEngine {
         // Send 200 OK (not async)
         server_dialog
             .accept(headers, body)
-            .map_err(|e| SipRunnerError::Sip(format!("Failed to send 200 OK: {}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Failed to send 200 OK: {}", e)))?;
 
         // Send answered event
         let _ = self.event_tx.send(CallEvent::Answered {
@@ -817,13 +817,13 @@ impl SipEngine {
             .calls
             .lock()
             .remove(call_id)
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let server_dialog = {
             let mut sess = session.lock();
 
             if sess.direction != Direction::Inbound {
-                return Err(SipRunnerError::Session(
+                return Err(RtpSipError::Session(
                     "Cannot reject outbound call".to_string(),
                 ));
             }
@@ -836,7 +836,7 @@ impl SipEngine {
             sess.state = CallState::Ended;
 
             sess.server_dialog.clone().ok_or_else(|| {
-                SipRunnerError::Session("No server dialog for inbound call".to_string())
+                RtpSipError::Session("No server dialog for inbound call".to_string())
             })?
         };
 
@@ -846,7 +846,7 @@ impl SipEngine {
         // Send rejection response (not async)
         server_dialog
             .reject(Some(sip_status), None)
-            .map_err(|e| SipRunnerError::Sip(format!("Failed to send rejection: {}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Failed to send rejection: {}", e)))?;
 
         let reason = format!("Rejected with {}", status_code);
         let _ = self.event_tx.send(CallEvent::Hangup {
@@ -865,7 +865,7 @@ impl SipEngine {
             .lock()
             .get(provider_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Provider(format!("Unknown provider: {}", provider_id)))?;
+            .ok_or_else(|| RtpSipError::Provider(format!("Unknown provider: {}", provider_id)))?;
 
         if !provider.register {
             return Ok(());
@@ -875,12 +875,12 @@ impl SipEngine {
         let mut registration = Registration::new(self.endpoint.inner.clone(), Some(credential));
 
         let registrar_uri: Uri = Uri::try_from(format!("sip:{}", provider.sip_server).as_str())
-            .map_err(|e| SipRunnerError::Sip(format!("Invalid registrar URI: {:?}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Invalid registrar URI: {:?}", e)))?;
 
         registration
             .register(registrar_uri, None)
             .await
-            .map_err(|e| SipRunnerError::Sip(format!("Registration failed: {}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Registration failed: {}", e)))?;
 
         self.registrations
             .lock()
@@ -912,7 +912,7 @@ impl SipEngine {
             .lock()
             .get(provider_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Provider(format!("Unknown provider: {}", provider_id)))?;
+            .ok_or_else(|| RtpSipError::Provider(format!("Unknown provider: {}", provider_id)))?;
 
         // Create RTP engine for this call
         let rtp_port = self.allocate_rtp_port();
@@ -925,7 +925,7 @@ impl SipEngine {
 
         let rtp_engine = RtpEngine::new(rtp_addr, rtp_config)
             .await
-            .map_err(|e| SipRunnerError::Rtp(e.to_string()))?;
+            .map_err(|e| RtpSipError::Rtp(e.to_string()))?;
         let rtp_engine = Arc::new(rtp_engine);
 
         // Build SDP offer
@@ -935,12 +935,12 @@ impl SipEngine {
 
         // Parse URIs
         let callee: Uri = Uri::try_from(to)
-            .map_err(|e| SipRunnerError::Sip(format!("Invalid callee URI: {:?}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Invalid callee URI: {:?}", e)))?;
         let caller: Uri = Uri::try_from(from)
-            .map_err(|e| SipRunnerError::Sip(format!("Invalid caller URI: {:?}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Invalid caller URI: {:?}", e)))?;
         let contact: Uri =
             Uri::try_from(format!("sip:{}@{}", provider.username, self.config.local_addr).as_str())
-                .map_err(|e| SipRunnerError::Sip(format!("Invalid contact URI: {:?}", e)))?;
+                .map_err(|e| RtpSipError::Sip(format!("Invalid contact URI: {:?}", e)))?;
 
         let credential = provider.to_credential();
 
@@ -1242,7 +1242,7 @@ impl SipEngine {
             .calls
             .lock()
             .remove(call_id)
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let mut sess = session.lock();
 
@@ -1291,7 +1291,7 @@ impl SipEngine {
 
         // Validate digit (0-9, *, #, A-D)
         if !matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D' | 'a'..='d') {
-            return Err(SipRunnerError::Sip(format!("Invalid DTMF digit: {}", digit)));
+            return Err(RtpSipError::Sip(format!("Invalid DTMF digit: {}", digit)));
         }
 
         let session = self
@@ -1299,13 +1299,13 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let sess = session.lock();
 
         // DTMF only allowed after call is answered (Active state)
         if sess.state != CallState::Active {
-            return Err(SipRunnerError::Session(format!(
+            return Err(RtpSipError::Session(format!(
                 "Cannot send DTMF: call {} is not active (state: {:?})",
                 call_id, sess.state
             )));
@@ -1330,14 +1330,14 @@ impl SipEngine {
             dialog
                 .info(Some(headers), Some(dtmf_body.into_bytes()))
                 .await
-                .map_err(|e| SipRunnerError::Sip(format!("Failed to send DTMF INFO: {}", e)))?;
+                .map_err(|e| RtpSipError::Sip(format!("Failed to send DTMF INFO: {}", e)))?;
         } else if let Some(ref dialog) = sess.server_dialog {
             dialog
                 .info(Some(headers), Some(dtmf_body.into_bytes()))
                 .await
-                .map_err(|e| SipRunnerError::Sip(format!("Failed to send DTMF INFO: {}", e)))?;
+                .map_err(|e| RtpSipError::Sip(format!("Failed to send DTMF INFO: {}", e)))?;
         } else {
-            return Err(SipRunnerError::Session(
+            return Err(RtpSipError::Session(
                 "Dialog not established for this call".to_string(),
             ));
         }
@@ -1376,13 +1376,13 @@ impl SipEngine {
                 .lock()
                 .get(call_id)
                 .cloned()
-                .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+                .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
             let sess = session.lock();
 
             // DTMF only allowed after call is answered (Active state)
             if sess.state != CallState::Active {
-                return Err(SipRunnerError::Session(format!(
+                return Err(RtpSipError::Session(format!(
                     "Cannot send DTMF: call {} is not active (state: {:?})",
                     call_id, sess.state
                 )));
@@ -1404,7 +1404,7 @@ impl SipEngine {
             DtmfMode::Rfc2833 => {
                 // Use RFC 2833 via RTP engine
                 let rtp = rtp_engine.ok_or_else(|| {
-                    SipRunnerError::Session("RTP not established for this call".to_string())
+                    RtpSipError::Session("RTP not established for this call".to_string())
                 })?;
 
                 rtp.send_dtmf_string(digits, duration_ms, inter_digit_ms as u32)
@@ -1430,7 +1430,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let sess = session.lock();
         Ok(sess.effective_dtmf_mode())
@@ -1447,7 +1447,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let mut sess = session.lock();
         sess.dtmf_mode = mode;
@@ -1464,7 +1464,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let sess = session.lock();
 
@@ -1494,7 +1494,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let sess = session.lock();
 
@@ -1545,7 +1545,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         // Determine if we're the Call-ID owner (outbound call)
         let is_call_owner = {
@@ -1592,7 +1592,7 @@ impl SipEngine {
             }
         }
 
-        Err(SipRunnerError::Sip(
+        Err(RtpSipError::Sip(
             "Re-INVITE failed: 491 glare after max retries".to_string(),
         ))
     }
@@ -1604,7 +1604,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let sess = session.lock();
 
@@ -1623,14 +1623,14 @@ impl SipEngine {
             dialog
                 .reinvite(headers, body)
                 .await
-                .map_err(|e| SipRunnerError::Sip(format!("Failed to send re-INVITE: {}", e)))?;
+                .map_err(|e| RtpSipError::Sip(format!("Failed to send re-INVITE: {}", e)))?;
         } else if let Some(ref dialog) = sess.server_dialog {
             dialog
                 .reinvite(headers, body)
                 .await
-                .map_err(|e| SipRunnerError::Sip(format!("Failed to send re-INVITE: {}", e)))?;
+                .map_err(|e| RtpSipError::Sip(format!("Failed to send re-INVITE: {}", e)))?;
         } else {
-            return Err(SipRunnerError::Session(
+            return Err(RtpSipError::Session(
                 "Dialog not established for this call".to_string(),
             ));
         }
@@ -1649,7 +1649,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let hold_sdp = {
             let mut sess = session.lock();
@@ -1660,7 +1660,7 @@ impl SipEngine {
             }
 
             let rtp = sess.rtp_engine.as_ref().ok_or_else(|| {
-                SipRunnerError::Session("RTP not established for this call".to_string())
+                RtpSipError::Session("RTP not established for this call".to_string())
             })?;
 
             // Build hold SDP (sendonly)
@@ -1690,7 +1690,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let resume_sdp = {
             let mut sess = session.lock();
@@ -1701,7 +1701,7 @@ impl SipEngine {
             }
 
             let rtp = sess.rtp_engine.as_ref().ok_or_else(|| {
-                SipRunnerError::Session("RTP not established for this call".to_string())
+                RtpSipError::Session("RTP not established for this call".to_string())
             })?;
 
             // Build resume SDP (sendrecv)
@@ -1732,7 +1732,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let sess = session.lock();
         Ok(sess.is_on_hold())
@@ -1745,7 +1745,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         let sess = session.lock();
         Ok((sess.local_hold, sess.remote_hold))
@@ -1798,7 +1798,7 @@ impl SipEngine {
             .lock()
             .get(call_id)
             .cloned()
-            .ok_or_else(|| SipRunnerError::Session(format!("Call not found: {}", call_id)))?;
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
         // Extract dialog information needed for the REFER request
         let (dialog_id, remote_addr, local_uri, remote_uri, local_contact, cseq) = {
@@ -1810,21 +1810,21 @@ impl SipEngine {
             } else if let Some(ref dialog) = sess.server_dialog {
                 dialog.id()
             } else {
-                return Err(SipRunnerError::Session(
+                return Err(RtpSipError::Session(
                     "Dialog not established for this call".to_string(),
                 ));
             };
             let remote_addr = sess.remote_addr.ok_or_else(|| {
-                SipRunnerError::Session("Remote address not available".to_string())
+                RtpSipError::Session("Remote address not available".to_string())
             })?;
             let local_uri = sess.local_uri.clone().ok_or_else(|| {
-                SipRunnerError::Session("Local URI not available".to_string())
+                RtpSipError::Session("Local URI not available".to_string())
             })?;
             let remote_uri = sess.remote_uri.clone().ok_or_else(|| {
-                SipRunnerError::Session("Remote URI not available".to_string())
+                RtpSipError::Session("Remote URI not available".to_string())
             })?;
             let local_contact = sess.local_contact.clone().ok_or_else(|| {
-                SipRunnerError::Session("Local contact not available".to_string())
+                RtpSipError::Session("Local contact not available".to_string())
             })?;
             let cseq = sess.next_cseq();
 
@@ -1855,13 +1855,13 @@ impl SipEngine {
 
         // Send via UDP socket
         let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-            SipRunnerError::Sip(format!("Failed to bind UDP socket for REFER: {}", e))
+            RtpSipError::Sip(format!("Failed to bind UDP socket for REFER: {}", e))
         })?;
 
         socket
             .send_to(request_bytes.as_bytes(), remote_addr)
             .await
-            .map_err(|e| SipRunnerError::Sip(format!("Failed to send REFER: {}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Failed to send REFER: {}", e)))?;
 
         tracing::info!(
             "REFER sent to {} for call {} -> {}",
@@ -1887,7 +1887,7 @@ impl SipEngine {
     ) -> Result<rsip::Request> {
         // Parse the Request-URI (where to send the request)
         let request_uri = rsip::Uri::try_from(remote_uri)
-            .map_err(|e| SipRunnerError::Sip(format!("Invalid remote URI: {:?}", e)))?;
+            .map_err(|e| RtpSipError::Sip(format!("Invalid remote URI: {:?}", e)))?;
 
         // Generate unique branch parameter for Via header
         let branch = format!("z9hG4bK{}", uuid::Uuid::new_v4().simple());

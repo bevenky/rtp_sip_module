@@ -98,7 +98,7 @@ class ProviderConfig:
 
 class CallEvent:
     """
-    Call event received from SipRunner.
+    Call event from rtpsip.
 
     Attributes:
         event_type: Event type ("incoming", "ringing", "early_media", "answered",

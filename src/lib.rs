@@ -44,7 +44,7 @@ pub mod sip;
 
 mod python;
 
-pub use error::{Result, SipRunnerError};
+pub use error::{Result, RtpSipError};
 pub use rtp::{CodecType, G711Codec, JitterBuffer, JitterStats, RtpEngine, RtpPacket};
 
 /// Python module definition

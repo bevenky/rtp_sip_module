@@ -48,7 +48,7 @@
 //! - Video streams ignored.
 //! - Encryption (SRTP) attributes not parsed.
 
-use crate::error::{Result, SipRunnerError};
+use crate::error::{Result, RtpSipError};
 use crate::rtp::CodecType;
 use std::net::{IpAddr, SocketAddr};
 
@@ -317,7 +317,7 @@ impl Sdp {
     fn parse_origin(value: &str) -> Result<SdpOrigin> {
         let parts: Vec<&str> = value.split_whitespace().collect();
         if parts.len() < 6 {
-            return Err(SipRunnerError::Sdp("Invalid origin line".to_string()));
+            return Err(RtpSipError::Sdp("Invalid origin line".to_string()));
         }
 
         Ok(SdpOrigin {
@@ -334,19 +334,19 @@ impl Sdp {
         // Format: IN IP4 192.168.1.1 or IN IP6 ::1
         let parts: Vec<&str> = value.split_whitespace().collect();
         if parts.len() < 3 {
-            return Err(SipRunnerError::Sdp("Invalid connection line".to_string()));
+            return Err(RtpSipError::Sdp("Invalid connection line".to_string()));
         }
 
         parts[2]
             .parse()
-            .map_err(|_| SipRunnerError::Sdp(format!("Invalid IP address: {}", parts[2])))
+            .map_err(|_| RtpSipError::Sdp(format!("Invalid IP address: {}", parts[2])))
     }
 
     fn parse_media_line(value: &str) -> Result<MediaDescription> {
         // Format: audio 49170 RTP/AVP 0 8 97
         let parts: Vec<&str> = value.split_whitespace().collect();
         if parts.len() < 4 {
-            return Err(SipRunnerError::Sdp("Invalid media line".to_string()));
+            return Err(RtpSipError::Sdp("Invalid media line".to_string()));
         }
 
         let media_type = parts[0].to_string();
@@ -378,12 +378,12 @@ impl Sdp {
         // Format: 0 PCMU/8000 or 97 opus/48000/2
         let parts: Vec<&str> = value.split_whitespace().collect();
         if parts.len() < 2 {
-            return Err(SipRunnerError::Sdp("Invalid rtpmap".to_string()));
+            return Err(RtpSipError::Sdp("Invalid rtpmap".to_string()));
         }
 
         let payload_type: u8 = parts[0]
             .parse()
-            .map_err(|_| SipRunnerError::Sdp("Invalid payload type".to_string()))?;
+            .map_err(|_| RtpSipError::Sdp("Invalid payload type".to_string()))?;
 
         let codec_parts: Vec<&str> = parts[1].split('/').collect();
         let encoding_name = codec_parts[0].to_string();

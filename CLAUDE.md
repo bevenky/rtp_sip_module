@@ -617,7 +617,7 @@ rtp_sip_module/
 │   └── python/
 │       ├── session.rs       # PyRtpSession (Mode B)
 │       ├── events.rs        # PyCallEvent, PyCallState
-│       └── client.rs        # PySipRunner (Mode A)
+│       └── client.rs        # SipRunner Python bindings (Mode A)
 └── python/
     ├── rtpsip/
     │   ├── __init__.py      # Main exports

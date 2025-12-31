@@ -4,7 +4,7 @@ use thiserror::Error;
 
 /// Main error type for rtpsip
 #[derive(Error, Debug)]
-pub enum SipRunnerError {
+pub enum RtpSipError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -54,10 +54,10 @@ pub enum SipRunnerError {
     InvalidState(String),
 }
 
-impl From<SipRunnerError> for PyErr {
-    fn from(err: SipRunnerError) -> Self {
+impl From<RtpSipError> for PyErr {
+    fn from(err: RtpSipError) -> Self {
         match &err {
-            SipRunnerError::Config(_) | SipRunnerError::Parse(_) => {
+            RtpSipError::Config(_) | RtpSipError::Parse(_) => {
                 PyValueError::new_err(err.to_string())
             }
             _ => PyRuntimeError::new_err(err.to_string()),
@@ -66,4 +66,4 @@ impl From<SipRunnerError> for PyErr {
 }
 
 /// Result type alias for rtpsip operations
-pub type Result<T> = std::result::Result<T, SipRunnerError>;
+pub type Result<T> = std::result::Result<T, RtpSipError>;

@@ -71,7 +71,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
-use crate::error::{Result, SipRunnerError};
+use crate::error::{Result, RtpSipError};
 
 /// Default payload type for telephone-event (RFC 4733)
 pub const TELEPHONE_EVENT_PT: u8 = 101;
@@ -548,7 +548,7 @@ impl DtmfSender {
     /// Returns the packets to send immediately (first packet with marker bit)
     pub fn start_digit(&self, digit: char, duration_ms: u32) -> Result<Vec<DtmfPacket>> {
         let event = DtmfEvent::from_char(digit)
-            .ok_or_else(|| SipRunnerError::Rtp(format!("Invalid DTMF digit: {}", digit)))?;
+            .ok_or_else(|| RtpSipError::Rtp(format!("Invalid DTMF digit: {}", digit)))?;
 
         // Store current digit state
         *self.out_digit.lock() = Some(event);
