@@ -2,8 +2,6 @@
 SIP RTP Serializer for Pipecat
 
 A generic SIP trunking serializer that works with any SIP provider:
-- Twilio SIP Trunking
-- Telnyx
 - Plivo SIP
 - Bandwidth
 - Vonage
@@ -20,10 +18,10 @@ Example:
 
     # Single provider setup
     transport = SipRtpTransport(
-        provider_name="twilio",
-        server="sip.twilio.com",
-        username="ACCOUNT_SID",
-        password="AUTH_TOKEN",
+        provider_name="plivo",
+        server="sip.plivo.com",
+        auth_username="AUTH_ID",
+        auth_password="AUTH_TOKEN",
     )
 
     # Or multi-provider from config
@@ -83,8 +81,8 @@ class SipTransportParams:
     # Provider settings (for single provider mode)
     provider_name: str = ""
     server: str = ""
-    username: str = ""
-    password: str = ""
+    auth_username: str = ""
+    auth_password: str = ""
     port: int = 5060
 
     # Or use config file (for multi-provider)
@@ -397,10 +395,10 @@ class SipRtpTransport(BaseTransport if PIPECAT_AVAILABLE else object):
     Example:
         # Single provider
         transport = SipRtpTransport(
-            provider_name="twilio",
-            server="sip.twilio.com",
-            username="ACCOUNT_SID",
-            password="AUTH_TOKEN",
+            provider_name="plivo",
+            server="sip.plivo.com",
+            auth_username="AUTH_ID",
+            auth_password="AUTH_TOKEN",
         )
 
         # Multi-provider from config
@@ -427,8 +425,8 @@ class SipRtpTransport(BaseTransport if PIPECAT_AVAILABLE else object):
         self,
         provider_name: str = "",
         server: str = "",
-        username: str = "",
-        password: str = "",
+        auth_username: str = "",
+        auth_password: str = "",
         config_path: Optional[str] = None,
         params: Optional[SipTransportParams] = None,
         **kwargs,
@@ -439,8 +437,8 @@ class SipRtpTransport(BaseTransport if PIPECAT_AVAILABLE else object):
             self._params = SipTransportParams(
                 provider_name=provider_name,
                 server=server,
-                username=username,
-                password=password,
+                auth_username=auth_username,
+                auth_password=auth_password,
                 config_path=config_path,
                 **kwargs,
             )
@@ -457,8 +455,8 @@ class SipRtpTransport(BaseTransport if PIPECAT_AVAILABLE else object):
             self._runner = SipRunner(
                 provider_name=self._params.provider_name,
                 provider_server=self._params.server,
-                username=self._params.username,
-                password=self._params.password,
+                username=self._params.auth_username,
+                password=self._params.auth_password,
             )
 
         self._runner.start()
