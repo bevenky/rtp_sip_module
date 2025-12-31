@@ -1,0 +1,69 @@
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::PyErr;
+use thiserror::Error;
+
+/// Main error type for siprunner
+#[derive(Error, Debug)]
+pub enum SipRunnerError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("RTP error: {0}")]
+    Rtp(String),
+
+    #[error("SIP error: {0}")]
+    Sip(String),
+
+    #[error("SDP error: {0}")]
+    Sdp(String),
+
+    #[error("Codec error: {0}")]
+    Codec(String),
+
+    #[error("Session error: {0}")]
+    Session(String),
+
+    #[error("Provider error: {0}")]
+    Provider(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("Authentication error: {0}")]
+    Auth(String),
+
+    #[error("Parse error: {0}")]
+    Parse(String),
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
+    #[error("Channel closed")]
+    ChannelClosed,
+
+    #[error("Not connected")]
+    NotConnected,
+
+    #[error("Already started")]
+    AlreadyStarted,
+
+    #[error("Not started")]
+    NotStarted,
+
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
+}
+
+impl From<SipRunnerError> for PyErr {
+    fn from(err: SipRunnerError) -> Self {
+        match &err {
+            SipRunnerError::Config(_) | SipRunnerError::Parse(_) => {
+                PyValueError::new_err(err.to_string())
+            }
+            _ => PyRuntimeError::new_err(err.to_string()),
+        }
+    }
+}
+
+/// Result type alias for siprunner operations
+pub type Result<T> = std::result::Result<T, SipRunnerError>;

@@ -1,468 +1,503 @@
-# rtp_sip
+# siprunner
 
-Python bindings with **embedded libfs (FreeSWITCH)** for SIP/RTP telephony. No external dependencies required.
+High-performance SIP/RTP library for Voice AI applications, written in Rust with Python bindings.
 
-## Overview
+## Two Operating Modes
 
-rtp_sip provides async Python bindings to libfs (FreeSWITCH 1.10.12) for SIP signaling and RTP audio transport. libfs is **statically linked** into the Python module - no separate FreeSWITCH installation needed.
+| Feature | Mode A: SIP+RTP | Mode B: RTP-Only |
+|---------|-----------------|------------------|
+| **Use Case** | Full telephony | External signaling (WebSocket) |
+| **SIP Signaling** | Built-in | Not included |
+| **Audio Transport** | RTP with G.711 | RTP with G.711 |
+| **Audio I/O** | PCM i16 (L16) | PCM i16 (L16) |
+| **Jitter Buffer** | Adaptive | Adaptive |
+| **DTMF** | RFC 2833 + SIP INFO | Not included* |
+| **Providers/Trunks** | Multi-provider routing | Not applicable |
+| **Hold/Transfer** | Full support | Not applicable |
 
-**Design Philosophy**: Embedded libfs with thin wrappers. The final `.whl` file (~15-20MB) contains everything needed for telephony.
+*Mode B is pure audio transport - DTMF and signaling handled externally via WebSocket.
 
-## Three Modes
+## Features (Mode A)
 
-| Mode | Description | Status |
-|------|-------------|--------|
-| **Mode 3: RTP-Only** | External SIP, rtp_sip handles RTP only | **Working** |
-| **Mode 1: Outbound** | Python initiates calls via `SIP.dial()` | Limited (mod_sofia unavailable) |
-| **Mode 2: Inbound** | Python receives calls via `set_inbound_handler()` | Limited (mod_sofia unavailable) |
+- **Full SIP Stack** - Make and receive calls with multi-provider routing
+- **RTP Media** - G.711 (PCMU/PCMA) codec with adaptive jitter buffer
+- **DTMF Support** - RFC 2833 (in-band RTP) and SIP INFO (out-of-band)
+- **Device Compatibility** - Auto-detection for Sonus, Cisco, and other equipment
+- **Hold/Resume** - RFC 6337 compliant with direction attribute handling
+- **Call Transfer** - Blind transfer via REFER (RFC 3515)
 
-**Note:** RTP-only mode is fully functional. SIP modes are limited because mod_sofia doesn't load in embedded mode.
+## Features (Mode B)
+
+- **Pure Audio Transport** - Send/receive PCM i16 samples at 8kHz
+- **Adaptive Jitter Buffer** - RFC 3550 compliant with packet loss concealment
+- **G.711 Codec** - PCMU (μ-law) or PCMA (A-law) encoding
+- **Zero SIP Overhead** - No signaling, authentication, or DTMF processing
+- **GIL-Optimized** - Releases Python GIL during all blocking operations
 
 ## Installation
 
-### Using Docker (Recommended)
+```bash
+pip install siprunner
+```
+
+Or build from source:
 
 ```bash
-# Build the builder image (includes libfs)
-docker build -t pyswitch-builder -f docker-build/Dockerfile .
-
-# Build the wheel
-docker run --rm -v "$(pwd)":/workspace -w /workspace pyswitch-builder \
-    maturin build --release
-
-# Install the wheel
-pip install target/wheels/rtp_sip-*.whl
+git clone https://github.com/your-org/siprunner
+cd siprunner
+python -m venv .venv && source .venv/bin/activate
+pip install maturin
+maturin develop
 ```
 
-### From Source (requires pre-built libfs)
+---
+
+## Mode A: Full SIP + RTP
+
+Complete telephony solution with SIP signaling and RTP media.
+
+### Quick Start
+
+```python
+from siprunner import SipRunner, CallState, DtmfMode
+
+# Create runner with single provider
+runner = SipRunner(
+    provider_name="twilio",
+    provider_server="sip.twilio.com",
+    username="your_account_sid",
+    password="your_auth_token",
+)
+
+# Start the engine (begins listening for incoming calls)
+runner.start()
+
+# Make an outbound call
+call_id = runner.call(to="+14155551234", from_="+14155550000")
+
+# Event loop
+while True:
+    event = runner.next_event(timeout_ms=30000)
+    if event is None:
+        continue
+
+    if event.is_ringing():
+        print(f"Call {event.call_id} is ringing")
+
+    elif event.is_early_media():
+        print(f"Early media available (ringback tone)")
+        # Can receive audio here (remote ringback)
+
+    elif event.is_answered():
+        print(f"Call answered!")
+        # Full duplex audio now available
+
+    elif event.is_dtmf():
+        print(f"DTMF received: {event.digit}")
+
+    elif event.is_hangup():
+        print(f"Call ended: {event.reason}")
+        break
+
+runner.stop()
+```
+
+### Multi-Provider Configuration
+
+```python
+# Use config file for multiple providers with prefix routing
+runner = SipRunner.from_config("config.toml")
+```
+
+**config.toml:**
+```toml
+[sip]
+local_ip = "0.0.0.0"
+local_port = 5060
+transport = "udp"
+
+[rtp]
+local_ip = "0.0.0.0"
+port_start = 10000
+port_end = 20000
+
+# Provider for US numbers
+[[providers]]
+name = "twilio"
+server = "sip.twilio.com"
+username = "ACCOUNT_SID"
+password = "AUTH_TOKEN"
+prefixes = ["+1"]
+
+# Provider for UK numbers
+[[providers]]
+name = "telnyx"
+server = "sip.telnyx.com"
+username = "USER"
+password = "PASS"
+prefixes = ["+44"]
+default = true  # Fallback for unmatched prefixes
+
+[routing]
+blocked_prefixes = ["+1900", "+1976"]  # Premium rate blocking
+```
+
+### Inbound Call Handling
+
+```python
+from siprunner import SipRunner
+
+runner = SipRunner.from_config("config.toml")
+runner.start()
+
+while True:
+    event = runner.next_event(timeout_ms=30000)
+
+    if event and event.is_incoming():
+        print(f"Incoming call from {event.from_uri}")
+
+        # Accept the call
+        runner.answer(event.call_id)
+
+        # Or reject with status code
+        # runner.reject(event.call_id, 486)  # 486 = Busy
+        # runner.reject(event.call_id, 603)  # 603 = Decline
+```
+
+### Audio Streaming
+
+```python
+# Send audio (PCM i16 samples, 8kHz mono, 160 samples = 20ms)
+samples = [0] * 160  # 20ms of silence
+runner.send_audio(call_id, samples)
+
+# Receive audio (returns None on timeout)
+audio = runner.recv_audio(call_id, timeout_ms=100)
+if audio:
+    # Process received audio samples
+    process_audio(audio)
+```
+
+### DTMF (Dual-Tone Multi-Frequency)
+
+```python
+# Send DTMF (auto-selects RFC 2833 or SIP INFO based on remote capability)
+runner.send_dtmf(call_id, "1234#", duration_ms=100, inter_digit_ms=100)
+
+# With pauses: w = 500ms, W = 1000ms
+runner.send_dtmf(call_id, "1w2w3w4#")
+
+# Check which mode is being used
+mode = runner.get_dtmf_mode(call_id)  # DtmfMode.Rfc2833 or DtmfMode.Info
+
+# Receive RFC 2833 DTMF from RTP stream
+dtmf = runner.recv_dtmf(call_id)
+if dtmf:
+    digit, duration_ms = dtmf
+    print(f"Received: {digit} ({duration_ms}ms)")
+
+# Note: SIP INFO DTMF arrives via next_event() with is_dtmf() == True
+```
+
+### Hold/Resume
+
+```python
+# Put call on hold (sends re-INVITE with sendonly SDP)
+runner.hold(call_id)
+
+# Resume call (sends re-INVITE with sendrecv SDP)
+runner.unhold(call_id)
+
+# Check call state
+state = runner.get_call_state(call_id)
+if state == CallState.Hold:
+    print("Call is on hold")
+```
+
+### Call Transfer (REFER)
+
+```python
+# Blind transfer to another number
+runner.transfer(call_id, "sip:+14155559999@sip.provider.com")
+```
+
+---
+
+## Mode B: RTP-Only (External Signaling)
+
+Pure audio transport for use with external signaling (WebSocket, custom SIP, etc.).
+
+**What's included:** Audio send/receive, adaptive jitter buffer, packet loss concealment, G.711 codec.
+
+**What's NOT included:** SIP signaling, DTMF, authentication, providers, hold/transfer - handle these externally.
+
+### Quick Start
+
+```python
+from siprunner import RtpSession
+
+# Create session with local and remote addresses
+session = RtpSession(
+    local_addr="0.0.0.0:0",      # 0 = auto-assign port
+    remote_addr="192.168.1.100:5004",
+    codec="PCMU",                 # or "PCMA"
+)
+
+# Start RTP processing
+session.start()
+
+# Check actual local port
+print(f"Listening on: {session.local_addr}")
+
+# Send audio (PCM i16 samples, 8kHz mono)
+samples = [0] * 160  # 20ms frame
+session.send_audio(samples)
+
+# Receive audio with timeout
+audio = session.recv_audio(timeout_ms=100)
+if audio:
+    process_audio(audio)
+
+# Non-blocking receive
+audio = session.try_recv_audio()
+
+# Get jitter buffer statistics
+stats = session.get_stats()
+print(f"Packets received: {stats.packets_received}")
+print(f"Packets lost: {stats.packets_lost}")
+print(f"Jitter: {stats.jitter_ms:.1f}ms")
+
+session.stop()
+```
+
+### Dynamic Remote Address
+
+```python
+session = RtpSession(local_addr="0.0.0.0:5004", codec="PCMU")
+session.start()
+
+# Set remote address later (e.g., from SDP)
+session.set_remote("192.168.1.100:5006")
+```
+
+### Jitter Buffer Control
+
+```python
+# Reset jitter buffer (e.g., after call transfer)
+session.reset_jitter_buffer()
+
+# Get detailed statistics
+stats = session.get_stats()
+print(f"Buffer size: {stats.buffer_size}")
+print(f"Buffer delay: {stats.buffer_delay_ms}ms")
+print(f"Packets reordered: {stats.packets_reordered}")
+print(f"Packets dropped: {stats.packets_dropped}")
+```
+
+---
+
+## Examples
+
+Complete example applications are available in the `examples/` directory:
+
+### WebSocket + RTP Integration (Mode B)
+
+**File:** `examples/websocket_rtp_example.py`
+
+For Voice AI applications using external WebSocket signaling:
+
+```python
+from siprunner import RtpSession
+
+# Workflow for external signaling (e.g., Twilio MediaStreams, custom WebSocket)
+
+# 1. Receive remote RTP endpoint from signaling server via WebSocket
+# remote_host, remote_port = websocket.recv()
+
+# 2. Create session with dynamic port allocation
+session = RtpSession(local_addr="0.0.0.0:0", codec="PCMU")
+session.start()
+
+# 3. Get allocated port to send back via WebSocket
+local_port = int(session.local_addr.split(":")[1])
+# websocket.send({"rtp_host": my_public_ip, "rtp_port": local_port})
+
+# 4. Set remote endpoint when server confirms
+session.set_remote(f"{remote_host}:{remote_port}")
+
+# 5. Audio flows - receive L16 samples for speech-to-text
+while True:
+    audio = session.recv_audio(100)  # List[int] - PCM i16 @ 8kHz
+    if audio:
+        text = speech_to_text(audio)
+        response = ai_generate(text)
+        response_audio = text_to_speech(response)
+        session.send_audio(response_audio)
+
+# DTMF in Mode B: handled via WebSocket, not RTP
+# websocket.send({"type": "dtmf", "digits": "123#"})
+```
+
+### Full SIP Telephony (Mode A)
+
+**File:** `examples/sip_example.py`
+
+For traditional telephony with built-in SIP stack:
+
+```python
+from siprunner import SipRunner, DtmfMode
+
+# Create with multi-provider config
+runner = SipRunner.from_config("config.toml")
+runner.start()
+
+# Make outbound call (auto-routes based on prefix)
+call_id = runner.call(to="+14155551234", from_="+14155550000")
+
+# Handle events
+while True:
+    event = runner.next_event(timeout_ms=30000)
+
+    if event.is_answered():
+        # Send DTMF (auto RFC 2833 or SIP INFO)
+        runner.send_dtmf(call_id, "123#")
+
+        # Check DTMF mode
+        mode = runner.get_dtmf_mode(call_id)
+        print(f"Using: {'RFC 2833' if mode == DtmfMode.Rfc2833 else 'SIP INFO'}")
+
+    elif event.is_dtmf():
+        # Receive DTMF (SIP INFO arrives via events)
+        print(f"DTMF: {event.digit}")
+
+        # RFC 2833 DTMF from RTP stream
+        rfc2833_dtmf = runner.recv_dtmf(call_id)
+        if rfc2833_dtmf:
+            digit, duration = rfc2833_dtmf
+            print(f"RFC 2833 DTMF: {digit}")
+
+    elif event.is_hangup():
+        break
+
+# Hold, resume, transfer
+runner.hold(call_id)
+runner.unhold(call_id)
+runner.transfer(call_id, "sip:+14155559999@provider.com")
+
+runner.stop()
+```
+
+### Running the Examples
 
 ```bash
-# 1. Build libfs static libraries first
-./scripts/build-freeswitch.sh
+# WebSocket + RTP demo (runs in demo mode without websockets package)
+python examples/websocket_rtp_example.py
 
-# 2. Build Python module
-maturin build --release
-pip install target/wheels/rtp_sip-*.whl
+# SIP demo (shows config and usage)
+python examples/sip_example.py
 ```
 
-### Requirements
-
-- Python 3.9+
-- Rust 1.70+
-- libfs static libraries (built by `scripts/build-freeswitch.sh`)
-
-The wheel is self-contained - no runtime dependencies on FreeSWITCH.
-
-## Quick Start
-
-### Mode 3: RTP-Only
-
-For external SIP signaling (WebSocket, SIP proxy):
-
-```python
-import asyncio
-from rtp_sip import RtpSession, AudioFrame
-
-async def main():
-    # Create RTP session (remote IP, remote port)
-    session = RtpSession("192.168.1.100", 5006)
-    session.with_local_port(5004)  # Optional: set local port
-
-    await session.start()
-    print(f"RTP session started on port {session.local_port}")
-
-    try:
-        while True:
-            # Receive audio (L16 PCM, 16kHz, mono)
-            frame = await session.recv_audio(100)
-            if frame:
-                # Process with STT, generate TTS response...
-                await session.send_audio(frame)
-    finally:
-        await session.stop()
-
-asyncio.run(main())
-```
-
-### Mode 1: Outbound Calls
-
-Python initiates calls via SIP trunk:
-
-```python
-import asyncio
-from rtp_sip import SIP, SipConfig, TrunkConfig
-
-async def main():
-    # Configure SIP stack
-    sip = SIP(SipConfig(local_port=5060))
-    await sip.start()
-
-    # Add SIP trunk (carrier/provider)
-    await sip.add_trunk(TrunkConfig(
-        "mytrunk", "sip.provider.com",
-        username="user", password="secret"
-    ))
-
-    # Dial outbound call
-    call = await sip.dial("+18005551234", "mytrunk")
-
-    print(f"Call connected: {call.id}")
-
-    # Audio loop
-    while call.is_active:
-        frame = await call.recv_audio(100)  # L16 @ 16kHz
-        if frame:
-            # Process with STT, generate TTS...
-            await call.send_audio(response_frame)
-
-    await call.hangup()
-    await sip.stop()
-
-asyncio.run(main())
-```
-
-### Mode 2: Inbound Calls
-
-Python receives incoming calls:
-
-```python
-import asyncio
-from rtp_sip import SIP, SipConfig, TrunkConfig
-
-async def handle_call(call):
-    """Handler for incoming calls"""
-    print(f"Incoming call: {call.id}")
-
-    # Answer the call
-    await call.answer()
-
-    # Audio processing loop
-    while call.is_active:
-        frame = await call.recv_audio(100)
-        if frame:
-            # Process audio (STT -> LLM -> TTS)
-            await call.send_audio(response_frame)
-
-    print(f"Call {call.id} ended")
-
-async def main():
-    sip = SIP(SipConfig(local_port=5060))
-
-    # Register inbound handler
-    sip.set_inbound_handler(handle_call)
-
-    await sip.start()
-
-    # Add trunk with registration for inbound
-    await sip.add_trunk(TrunkConfig(
-        "mytrunk", "sip.provider.com",
-        username="user", password="secret"
-    ))
-
-    print("Waiting for incoming calls...")
-
-    # Keep running
-    try:
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        pass
-
-    await sip.stop()
-
-asyncio.run(main())
-```
-
-## Architecture
-
-### Audio Pipeline
-
-```
-INBOUND (Caller -> Python):
-  RTP UDP (G.711 @ 8kHz) -> FreeSWITCH Decode -> Resample 8k->16k -> Python
-
-OUTBOUND (Python -> Caller):
-  Python (L16 @ 16kHz) -> Resample 16k->8k -> FreeSWITCH Encode G.711 -> RTP UDP
-```
-
-| Direction | Wire Format | Python Format |
-|-----------|-------------|---------------|
-| RTP In/Out | G.711 PCMU/PCMA @ 8kHz | L16 PCM @ 16kHz mono |
-
-Conversion is automatic - you always work with 16kHz L16 in Python.
-
-### Threading Model
-
-```
-Python Main Thread (asyncio)
-         |
-         | pyo3-asyncio (GIL released)
-         v
-Tokio Runtime (multi-threaded)
-    +-- RTP Rx Task (recv from UDP, decode, resample, queue)
-    +-- RTP Tx Task (dequeue, resample, encode, send UDP)
-    +-- SIP Event Loop (FreeSWITCH mod_sofia)
-```
-
-Audio frames are passed via bounded crossbeam channels (100 frame capacity = ~2 seconds buffer).
-
-### SIP Stack Integration
-
-The SIP stack is a **thin wrapper** around FreeSWITCH's mod_sofia. FreeSWITCH handles:
-
-- SIP registration with carriers
-- INVITE/BYE/CANCEL state machines
-- RTP negotiation (SDP)
-- Codec selection
-- NAT traversal (STUN/TURN)
-
-**For inbound calls to work**, FreeSWITCH must be:
-1. Running (embedded mode or standalone)
-2. Configured to route incoming calls to the Python handler
-3. Registered with the SIP trunk (if `register=True`)
-
-### RTP Session Flow
-
-The RTP session provides audio transport when SIP signaling is handled externally:
-
-1. **Configuration**: Specify local/remote IP:port pairs
-2. **Start**: Binds UDP socket, begins RX/TX loops
-3. **Receive**: `recv_audio()` returns decoded, resampled frames
-4. **Send**: `send_audio()` queues frames for encoding and transmission
-5. **Stop**: Closes socket, cleans up
+---
 
 ## API Reference
 
-### SipConfig
+### SipRunner
 
-```python
-SipConfig(
-    local_ip: str = "0.0.0.0",      # IP to bind for SIP
-    local_port: int = 5060,          # SIP port
-    user_agent: str = "plivo-sip-agent",  # SIP User-Agent header
-    debug: bool = False              # Enable SIP debug logging
-)
-```
-
-### TrunkConfig
-
-```python
-TrunkConfig(
-    name: str,                       # Trunk identifier
-    host: str,                       # Gateway host (IP or hostname)
-    port: int = 5060,                # Gateway port
-    username: Optional[str] = None,  # Auth username
-    password: Optional[str] = None,  # Auth password
-    register: bool = False,          # Register with gateway
-    caller_id_name: Optional[str] = None,    # Default caller ID name
-    caller_id_number: Optional[str] = None   # Default caller ID number
-)
-```
-
-### SipStack
-
-```python
-sip = SipStack(config: SipConfig)
-
-await sip.start()
-await sip.stop()
-
-await sip.add_trunk(trunk: TrunkConfig)
-await sip.remove_trunk(name: str)
-
-call = await sip.dial(
-    destination: str,           # Phone number or SIP URI
-    trunk: str,                 # Trunk name to use
-    timeout_sec: int = 60,      # Ring timeout
-    caller_id_name: str = None, # Override caller ID
-    caller_id_number: str = None
-)
-
-sip.set_inbound_handler(handler: Callable[[Call], Awaitable[None]])
-
-sip.is_running  # bool
-```
-
-### Call
-
-```python
-call.uuid           # str - Unique call identifier
-call.direction      # CallDirection.INBOUND or OUTBOUND
-call.caller_id      # Optional[str]
-call.destination    # Optional[str]
-call.is_active      # bool
-call.is_media_ready # bool - True after answer
-
-await call.answer()                    # Answer inbound call
-await call.hangup(reason="normal_clearing")
-await call.recv_audio(timeout_ms=100)  # Returns AudioFrame or None
-await call.send_audio(frame)
-await call.send_dtmf("1234#")
-call.get_variable("channel_name")      # FreeSWITCH channel variable
-```
-
-### RtpConfig
-
-```python
-config = RtpConfig(
-    local_ip: str,      # IP to bind for RTP
-    local_port: int,    # Port to bind
-    remote_ip: str,     # Remote RTP host
-    remote_port: int    # Remote RTP port
-)
-config = config.with_codec(Codec.PCMU)  # PCMU, PCMA, or L16
-config = config.with_ptime(20)          # Packet time in ms
-config = config.with_sample_rate(8000)
-```
+| Method | Description |
+|--------|-------------|
+| `SipRunner(provider_name, provider_server, ...)` | Create with single provider |
+| `SipRunner.from_config(path)` | Create from TOML config file |
+| `start()` | Start SIP engine and listener |
+| `stop()` | Stop engine and hangup all calls |
+| `call(to, from_)` | Make outbound call, returns call_id |
+| `hangup(call_id)` | End a call |
+| `answer(call_id)` | Answer incoming call |
+| `reject(call_id, status_code)` | Reject incoming call |
+| `next_event(timeout_ms)` | Wait for next event |
+| `send_audio(call_id, samples)` | Send PCM i16 audio |
+| `recv_audio(call_id, timeout_ms)` | Receive audio with timeout |
+| `send_dtmf(call_id, digits, ...)` | Send DTMF digits |
+| `recv_dtmf(call_id)` | Non-blocking DTMF receive |
+| `recv_dtmf_blocking(call_id, timeout_ms)` | Blocking DTMF receive |
+| `get_dtmf_mode(call_id)` | Get current DTMF mode |
+| `set_dtmf_mode(call_id, mode)` | Override DTMF mode |
+| `hold(call_id)` | Put call on hold |
+| `unhold(call_id)` | Resume from hold |
+| `transfer(call_id, target_uri)` | Blind transfer (REFER) |
 
 ### RtpSession
 
-```python
-session = RtpSession(config: RtpConfig)
+| Method | Description |
+|--------|-------------|
+| `RtpSession(local_addr, remote_addr, codec, ssrc)` | Create session |
+| `start()` | Start RTP processing |
+| `stop()` | Stop RTP processing |
+| `set_remote(addr)` | Set/change remote address |
+| `send_audio(samples)` | Send PCM i16 audio |
+| `recv_audio(timeout_ms)` | Receive with timeout |
+| `try_recv_audio()` | Non-blocking receive |
+| `get_stats()` | Get jitter buffer stats |
+| `reset_jitter_buffer()` | Reset jitter buffer |
 
-await session.start()
-await session.stop()
-
-frame = await session.recv_audio(timeout_ms=100)  # Returns AudioFrame or None
-await session.send_audio(frame)
-await session.send_audio_bytes(data: bytes)
-
-session.update_remote(ip: str, port: int)  # Change remote endpoint
-
-session.local_port  # int
-session.is_running  # bool
-session.stats       # RtpStats
-```
-
-### AudioFrame
+### CallState Enum
 
 ```python
-frame = AudioFrame(samples: bytes, sample_rate: int = 16000)
-frame = AudioFrame.from_bytes(data, sample_rate=16000)
-frame = AudioFrame.silence_20ms()
+from siprunner import CallState
 
-frame.samples       # bytes - L16 PCM little-endian
-frame.sample_rate   # int
-frame.channels      # int (always 1)
-frame.timestamp     # int - RTP timestamp
-frame.duration_ms   # int
-frame.num_samples() # int
-frame.is_empty()    # bool
+CallState.Ringing    # 180 - Ringing, no media
+CallState.EarlyMedia # 183 - Early media (ringback)
+CallState.Active     # 200 OK - Call answered
+CallState.Hold       # On hold
+CallState.Ended      # Call terminated
 ```
 
-### Codec
+### DtmfMode Enum
 
 ```python
-Codec.PCMU  # G.711 u-law (payload type 0)
-Codec.PCMA  # G.711 A-law (payload type 8)
-Codec.L16   # Linear 16-bit PCM (payload type 11)
+from siprunner import DtmfMode
 
-codec.payload_type  # int
+DtmfMode.Auto    # Auto-detect from remote SDP (recommended)
+DtmfMode.Rfc2833 # Force RFC 2833 in RTP
+DtmfMode.Info    # Force SIP INFO
 ```
 
-## Building for Distribution
+---
 
-### Build Wheel
+## Performance
 
-```bash
-# Build for current platform
-maturin build --release
+### GIL Handling
 
-# Find wheel in target/wheels/
-ls target/wheels/pyswitch-*.whl
-```
-
-### Build with Docker (cross-platform)
-
-```dockerfile
-FROM python:3.11-slim-bookworm
-
-RUN apt-get update && apt-get install -y \
-    build-essential curl pkg-config libssl-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-RUN pip install maturin
-
-WORKDIR /app
-COPY . .
-RUN maturin build --release
-```
-
-### Publishing to PyPI
-
-```bash
-# Build wheels for multiple Python versions
-maturin build --release
-
-# Upload to PyPI
-pip install twine
-twine upload target/wheels/pyswitch-*.whl
-```
-
-## Testing
-
-**Always use Docker for testing:**
-
-```bash
-# Build and run all tests
-docker run --rm -v "$(pwd)":/workspace -w /workspace pyswitch-builder bash -c '
-    maturin build --release
-    pip install --force-reinstall target/wheels/*.whl
-    pytest python/tests/ -v
-'
-```
-
-### Test Isolation
-
-SIP tests and RTP tests are mutually exclusive due to mode locking. The default `pytest` run excludes SIP tests:
-
-```bash
-# Run RTP tests (default)
-pytest python/tests/ -v
-
-# Run SIP tests only (separate process)
-pytest python/tests/test_sip_loopback.py -v -m sip_mode
-```
-
-### Performance (200 concurrent sessions)
-
-- Session creation: ~400-500ms (after init)
-- Audio send: ~8-20ms
-- Session stop: ~8-20ms
-
-## Known Limitations
-
-1. **Mode Locking**: Once initialized, the process is locked to either RTP-only or SIP mode. Cannot switch modes without restarting.
-
-2. **SIP Mode Limited**: mod_sofia doesn't load in embedded mode. SIP modes initialize but cannot make/receive calls.
-
-3. **Single Codec**: Currently supports G.711 (PCMU/PCMA) only.
-
-## Project Structure
+All blocking operations release the Python GIL, enabling true concurrency:
 
 ```
-pyswitch/
-├── Cargo.toml              # Workspace root
-├── pyproject.toml          # Python package config
-├── Dockerfile              # Docker build
-├── crates/
-│   ├── freeswitch-sys/     # FFI bindings (manual)
-│   ├── pyswitch-core/      # Core Rust logic
-│   │   └── src/
-│   │       ├── audio/      # AudioFrame, Codec, Resampler
-│   │       ├── call/       # Call session
-│   │       ├── rtp/        # RTP session
-│   │       ├── sip/        # SIP stack, TrunkConfig
-│   │       └── runtime.rs  # Tokio runtime
-│   └── pyswitch/           # PyO3 bindings
-│       ├── src/lib.rs
-│       └── pyswitch.pyi    # Type stubs
-└── python/
-    ├── pyswitch/           # Python package
-    └── examples/           # Usage examples
+Benchmark Results (4 concurrent sessions):
+- Sequential time: ~1000ms
+- Parallel time: ~303ms
+- Speedup: 3.30x
+- Efficiency: 82.4%
 ```
+
+### Architecture
+
+- **Rust core** with zero-copy where possible
+- **Tokio async runtime** for SIP/RTP I/O
+- **parking_lot::Mutex** for fast synchronization
+- **Broadcast channels** for event distribution
+
+---
+
+## Device Compatibility
+
+Automatic workarounds for known device quirks:
+
+| Device | Issue | Workaround |
+|--------|-------|------------|
+| Sonus | Expects wrong DTMF timestamp | Auto-enabled via User-Agent |
+| Cisco | Skips marker bit handling | Auto-enabled via User-Agent |
+| Avaya | Legacy c=0.0.0.0 hold | Detected and handled |
+| Mobile carriers | 180 after 183 | State machine handles correctly |
+
+---
 
 ## License
 

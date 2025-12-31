@@ -1,0 +1,1299 @@
+//! RFC 2833/4733 DTMF over RTP (telephone-event)
+//!
+//! Implements DTMF signaling via RTP payload type (typically 101) for telephone-event.
+//! Works identically for inbound and outbound calls.
+//!
+//! # Payload Format (4 bytes)
+//!
+//! ```text
+//! 0                   1                   2                   3
+//! 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |     event     |E|R| volume    |          duration            |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! ```
+//! - **event**: 0-9 = digits, 10 = *, 11 = #, 12-15 = A-D
+//! - **E**: End bit (1 = final packet for this event)
+//! - **R**: Reserved (must be 0)
+//! - **volume**: Power level in dBm0 (0-63, typically 10)
+//! - **duration**: In timestamp units (at 8000Hz, 160 = 20ms)
+//!
+//! # Edge Cases Handled (Send & Receive)
+//!
+//! ## Marker Bit (First Packet)
+//! - **RFC 4733 Section 2.5**: First packet of new digit MUST have marker bit set.
+//! - Helps receiver detect digit boundaries, especially after packet loss.
+//! - We always set marker on first packet of each digit.
+//!
+//! ## End Bit Redundancy
+//! - **RFC 4733 Section 2.5**: End packet MUST be sent 3 times for reliability.
+//! - Packet loss of end packet causes digit to "hang" (duration keeps increasing).
+//! - We send end packet 3x with same sequence number increment each time.
+//!
+//! ## Timestamp Handling
+//! - **Constant timestamp during digit**: All packets for one digit share same timestamp.
+//! - Duration field increases in each packet, timestamp stays constant.
+//! - New digit = new timestamp (advanced by previous digit's duration).
+//!
+//! ## Sanity Checking (Receive)
+//! - **Stuck stream detection**: If we receive same timestamp too many times (8000+),
+//!   assume stream is broken and reset detector state.
+//! - **Event code validation**: Codes > 15 rejected (not DTMF).
+//! - **Deduplication**: Only report digit on END packet, ignore intermediate packets.
+//!
+//! ## Interoperability Considerations
+//!
+//! ### Variable Payload Type
+//! - Usually 101, but can be any dynamic PT (96-127).
+//! - Negotiate from SDP `a=rtpmap:XX telephone-event/8000`.
+//! - Some older systems use 96 or 100.
+//!
+//! ### Clock Rate
+//! - Always 8000Hz for telephone-event, regardless of audio codec rate.
+//! - Duration conversion: 8 timestamp units = 1ms.
+//!
+//! ### Volume Level
+//! - Default 10 dBm0 (per Orc implementation).
+//! - Some systems ignore this field entirely.
+//! - Some require specific values for detection.
+//!
+//! ### Packet Interval
+//! - Typically 20ms (same as audio).
+//! - Some systems send more frequently (10ms) for better reliability.
+//!
+//! # Known Limitations
+//!
+//! - **Flash (event 16)**: Recognized but not fully supported.
+//! - **Events 17-255**: Not implemented (fax tones, etc).
+//! - **Concurrent digits**: Not supported (would need multiple SSRC).
+
+use bytes::Bytes;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+
+use crate::error::{Result, SipRunnerError};
+
+/// Default payload type for telephone-event (RFC 4733)
+pub const TELEPHONE_EVENT_PT: u8 = 101;
+
+/// Default volume level (10 dBm0)
+pub const DEFAULT_VOLUME: u8 = 10;
+
+/// Sample rate for telephone-event (8000 Hz)
+pub const TELEPHONE_EVENT_RATE: u32 = 8000;
+
+/// Sanity check limit for detecting stuck/invalid streams.
+/// At 8kHz with 20ms packets, 1500 packets = ~30 seconds.
+/// Beyond this, assume stream is broken and reset.
+const DTMF_SANITY_LIMIT: u32 = 1500;
+
+/// Maximum duration for a single DTMF digit (30 seconds at 8kHz = 240,000 samples).
+/// Most DTMF digits are < 1 second. Beyond 30 seconds, assume stuck stream.
+const DTMF_MAX_DURATION: u32 = 30 * 8000;
+
+/// DTMF event codes per RFC 4733
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DtmfEvent {
+    Digit0 = 0,
+    Digit1 = 1,
+    Digit2 = 2,
+    Digit3 = 3,
+    Digit4 = 4,
+    Digit5 = 5,
+    Digit6 = 6,
+    Digit7 = 7,
+    Digit8 = 8,
+    Digit9 = 9,
+    Star = 10,
+    Pound = 11,
+    A = 12,
+    B = 13,
+    C = 14,
+    D = 15,
+}
+
+impl DtmfEvent {
+    /// Convert from character to DTMF event
+    pub fn from_char(c: char) -> Option<Self> {
+        match c {
+            '0' => Some(Self::Digit0),
+            '1' => Some(Self::Digit1),
+            '2' => Some(Self::Digit2),
+            '3' => Some(Self::Digit3),
+            '4' => Some(Self::Digit4),
+            '5' => Some(Self::Digit5),
+            '6' => Some(Self::Digit6),
+            '7' => Some(Self::Digit7),
+            '8' => Some(Self::Digit8),
+            '9' => Some(Self::Digit9),
+            '*' => Some(Self::Star),
+            '#' => Some(Self::Pound),
+            'A' | 'a' => Some(Self::A),
+            'B' | 'b' => Some(Self::B),
+            'C' | 'c' => Some(Self::C),
+            'D' | 'd' => Some(Self::D),
+            _ => None,
+        }
+    }
+
+    /// Convert from event code to DTMF event
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Digit0),
+            1 => Some(Self::Digit1),
+            2 => Some(Self::Digit2),
+            3 => Some(Self::Digit3),
+            4 => Some(Self::Digit4),
+            5 => Some(Self::Digit5),
+            6 => Some(Self::Digit6),
+            7 => Some(Self::Digit7),
+            8 => Some(Self::Digit8),
+            9 => Some(Self::Digit9),
+            10 => Some(Self::Star),
+            11 => Some(Self::Pound),
+            12 => Some(Self::A),
+            13 => Some(Self::B),
+            14 => Some(Self::C),
+            15 => Some(Self::D),
+            _ => None,
+        }
+    }
+
+    /// Convert to character
+    pub fn to_char(self) -> char {
+        match self {
+            Self::Digit0 => '0',
+            Self::Digit1 => '1',
+            Self::Digit2 => '2',
+            Self::Digit3 => '3',
+            Self::Digit4 => '4',
+            Self::Digit5 => '5',
+            Self::Digit6 => '6',
+            Self::Digit7 => '7',
+            Self::Digit8 => '8',
+            Self::Digit9 => '9',
+            Self::Star => '*',
+            Self::Pound => '#',
+            Self::A => 'A',
+            Self::B => 'B',
+            Self::C => 'C',
+            Self::D => 'D',
+        }
+    }
+
+    /// Get the event code
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Parsed DTMF payload from RTP packet (4 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtmfPayload {
+    /// DTMF event (digit)
+    pub event: u8,
+    /// End bit - true if this is the final packet for this event
+    pub is_end: bool,
+    /// Volume level (0-63 dBm0)
+    pub volume: u8,
+    /// Duration in timestamp units (at 8000Hz)
+    pub duration: u16,
+}
+
+impl DtmfPayload {
+    /// Create a new DTMF payload
+    pub fn new(event: DtmfEvent, is_end: bool, duration: u16) -> Self {
+        Self {
+            event: event.code(),
+            is_end,
+            volume: DEFAULT_VOLUME,
+            duration,
+        }
+    }
+
+    /// Parse DTMF payload from 4 bytes
+    /// packet[0] = event
+    /// packet[1] = E|R|volume (E=end bit, R=reserved)
+    /// packet[2..3] = duration (big-endian)
+    ///
+    /// # Edge Cases Handled
+    ///
+    /// - **4-byte offset padding**: Some VoIP equipment sends DTMF with
+    ///   4 bytes of zero padding before the actual payload. We detect this by
+    ///   checking if first 4 bytes are all zero and payload is 8+ bytes.
+    /// - **Invalid event codes**: Event > 15 rejected (not DTMF).
+    /// - **All-zero payload**: Rejected as invalid (malformed packets from
+    ///   certain SBCs/gateways).
+    pub fn parse(packet: &[u8]) -> Option<Self> {
+        if packet.len() < 4 {
+            return None;
+        }
+
+        // Edge case: detect 4-byte padding offset
+        // Some SBCs/gateways send [0,0,0,0,event,flags,dur_hi,dur_lo]
+        let offset = if packet.len() >= 8
+            && packet[0] == 0
+            && packet[1] == 0
+            && packet[2] == 0
+            && packet[3] == 0
+            && packet[4] <= 15
+        {
+            4 // Skip 4-byte padding
+        } else {
+            0
+        };
+
+        let data = &packet[offset..];
+        if data.len() < 4 {
+            return None;
+        }
+
+        let event = data[0];
+        // Validate event code (0-15 for DTMF)
+        if event > 15 {
+            return None;
+        }
+
+        // Edge case: reject all-zero payload (malformed packet from certain equipment)
+        if data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0 {
+            return None;
+        }
+
+        let is_end = (data[1] & 0x80) != 0;
+        let volume = data[1] & 0x3F;
+        let duration = ((data[2] as u16) << 8) | (data[3] as u16);
+
+        Some(Self {
+            event,
+            is_end,
+            volume,
+            duration,
+        })
+    }
+
+    /// Serialize to 4-byte payload
+    pub fn serialize(&self) -> [u8; 4] {
+        let mut out = [0u8; 4];
+        out[0] = self.event;
+        out[1] = (if self.is_end { 0x80 } else { 0x00 }) | (self.volume & 0x3F);
+        out[2] = (self.duration >> 8) as u8;
+        out[3] = (self.duration & 0xFF) as u8;
+        out
+    }
+
+    /// Convert duration from milliseconds to timestamp units (at 8000Hz)
+    pub fn ms_to_timestamp(ms: u32) -> u16 {
+        // 8000 samples/sec * ms / 1000 = 8 * ms
+        (ms * 8).min(u16::MAX as u32) as u16
+    }
+
+    /// Convert duration from timestamp units to milliseconds
+    pub fn timestamp_to_ms(ts: u16) -> u32 {
+        ts as u32 / 8
+    }
+
+    /// Get event as char (if valid)
+    pub fn to_char(&self) -> Option<char> {
+        DtmfEvent::from_code(self.event).map(|e| e.to_char())
+    }
+}
+
+/// RTP bug flags for device-specific workarounds
+///
+/// These flags enable compatibility modes for devices that don't fully comply
+/// with RFC 4733 (DTMF over RTP). They can be:
+/// 1. Auto-detected from User-Agent header via `RtpBugFlags::detect_from_user_agent()`
+/// 2. Manually configured via struct fields
+///
+/// # Auto-Detection
+///
+/// Call `detect_from_user_agent()` with the remote party's User-Agent header:
+/// ```ignore
+/// let bugs = RtpBugFlags::detect_from_user_agent("Sonus/5.0");
+/// sender.set_rtp_bugs(bugs);
+/// ```
+///
+/// # Known Device Issues
+///
+/// ## Sonus Gateways/SBCs
+/// Sonus devices expect INCORRECT RFC 2833 behavior:
+/// - Timestamp should increment with each packet (RFC says constant)
+/// - No marker bit on first packet
+/// Without this workaround, Sonus won't detect DTMF digits properly.
+///
+/// ## Cisco Devices
+/// Some Cisco endpoints skip the marker bit on DTMF packets.
+/// We detect and adapt to this when receiving DTMF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtpBugFlags {
+    /// Sonus DTMF timestamp bug workaround.
+    ///
+    /// # The Problem
+    /// Per RFC 4733, all packets for a single DTMF digit should have the
+    /// SAME timestamp, with only the duration field incrementing. This allows
+    /// receivers to reconstruct duration even if packets are lost.
+    ///
+    /// Sonus devices incorrectly expect timestamp to INCREMENT with each packet.
+    /// They won't detect DTMF if we send correct RFC 4733 packets.
+    ///
+    /// # The Workaround
+    /// When enabled:
+    /// - Timestamp increments by 160 (20ms at 8kHz) per packet
+    /// - Marker bit is disabled on first packet
+    /// - Duration field behavior unchanged
+    ///
+    /// # Detection
+    /// Auto-detected when User-Agent contains "Sonus" (case-insensitive).
+    pub sonus_dtmf_timestamp: bool,
+
+    /// Never send marker bit on DTMF packets.
+    ///
+    /// # The Problem
+    /// RFC 4733 requires marker bit on the first packet of each DTMF event.
+    /// Some endpoints mishandle this and either:
+    /// - Ignore packets with marker bit
+    /// - Treat marker as start of new digit (causing duplicates)
+    ///
+    /// # The Workaround
+    /// When enabled, marker bit is never set on DTMF packets.
+    ///
+    /// # Detection
+    /// Auto-detected when User-Agent contains "Cisco" (case-insensitive).
+    /// Also enabled when `sonus_dtmf_timestamp` is enabled (Sonus also
+    /// requires no marker bit).
+    pub never_send_marker: bool,
+}
+
+impl RtpBugFlags {
+    /// Auto-detect RTP bug workarounds from User-Agent header.
+    ///
+    /// This should be called when a call is established, using the
+    /// User-Agent header from the remote party's SIP messages.
+    ///
+    /// # Detected Devices
+    ///
+    /// | User-Agent Pattern | Flags Enabled |
+    /// |-------------------|---------------|
+    /// | Contains "Sonus" | `sonus_dtmf_timestamp`, `never_send_marker` |
+    /// | Contains "Cisco" | `never_send_marker` |
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use siprunner::rtp::dtmf::RtpBugFlags;
+    ///
+    /// // Sonus device detected
+    /// let bugs = RtpBugFlags::detect_from_user_agent("Sonus-SBC/5.1.0");
+    /// assert!(bugs.sonus_dtmf_timestamp);
+    /// assert!(bugs.never_send_marker);
+    ///
+    /// // Cisco device detected
+    /// let bugs = RtpBugFlags::detect_from_user_agent("Cisco-Gateway/IOS-12.x");
+    /// assert!(!bugs.sonus_dtmf_timestamp);
+    /// assert!(bugs.never_send_marker);
+    ///
+    /// // Unknown device - no workarounds
+    /// let bugs = RtpBugFlags::detect_from_user_agent("Orc-PBX/1.0");
+    /// assert!(!bugs.sonus_dtmf_timestamp);
+    /// assert!(!bugs.never_send_marker);
+    /// ```
+    pub fn detect_from_user_agent(user_agent: &str) -> Self {
+        let ua_lower = user_agent.to_lowercase();
+        let mut flags = Self::default();
+
+        // Sonus gateways/SBCs require incorrect DTMF timestamp handling
+        if ua_lower.contains("sonus") {
+            flags.sonus_dtmf_timestamp = true;
+            flags.never_send_marker = true;
+        }
+
+        // Cisco devices may skip marker bit handling
+        if ua_lower.contains("cisco") {
+            flags.never_send_marker = true;
+        }
+
+        flags
+    }
+
+    /// Check if any workarounds are enabled
+    pub fn has_workarounds(&self) -> bool {
+        self.sonus_dtmf_timestamp || self.never_send_marker
+    }
+
+    /// Merge with another set of flags (OR operation)
+    pub fn merge(&mut self, other: &Self) {
+        self.sonus_dtmf_timestamp |= other.sonus_dtmf_timestamp;
+        self.never_send_marker |= other.never_send_marker;
+    }
+}
+
+/// RFC 2833 DTMF sender state
+///
+/// Manages the out_digit_packet and duration tracking.
+/// Works for both inbound and outbound calls.
+///
+/// # Usage Pattern
+///
+/// ```ignore
+/// let sender = DtmfSender::new(ssrc);
+///
+/// // Send digit '5' for 100ms
+/// let packets = sender.generate_digit('5', 100, 20)?;
+/// for packet in packets {
+///     socket.send(&packet.to_rtp_bytes()).await?;
+///     tokio::time::sleep(Duration::from_millis(20)).await;
+/// }
+/// ```
+///
+/// # Packet Generation (Normal Mode)
+///
+/// For a 100ms digit with 20ms intervals:
+/// 1. **Packet 1**: Marker=1, Duration=0, End=0
+/// 2. **Packet 2**: Marker=0, Duration=160, End=0
+/// 3. **Packet 3**: Marker=0, Duration=320, End=0
+/// 4. **Packet 4**: Marker=0, Duration=480, End=0
+/// 5. **Packet 5**: Marker=0, Duration=640, End=0
+/// 6. **Packet 6-8**: Marker=0, Duration=800, End=1 (3x for redundancy)
+///
+/// # Sonus Mode (RTP_BUG_SONUS_SEND_INVALID_TIMESTAMP_2833)
+///
+/// Sonus devices expect INCORRECT behavior:
+/// - Timestamp increments with each packet (should be constant per RFC)
+/// - No marker bit on first packet
+/// - Duration may be same or increment (we reset to 0)
+///
+/// This is WRONG per RFC 4733, but required for Sonus compatibility.
+///
+/// # Edge Cases
+///
+/// - **Inter-digit gap**: Automatically handled. Timestamp advances after each digit.
+/// - **Very long digits**: Duration capped at u16::MAX (8.19 seconds at 8kHz).
+/// - **Rapid succession**: Each digit gets unique timestamp.
+pub struct DtmfSender {
+    /// Payload type (typically 101)
+    payload_type: u8,
+    /// SSRC for RTP packets
+    ssrc: u32,
+    /// Current sequence number
+    sequence: AtomicU16,
+    /// Timestamp for current digit (stays constant during digit in normal mode)
+    timestamp_dtmf: AtomicU32,
+    /// Current digit being sent (0xFF = none)
+    out_digit: Mutex<Option<DtmfEvent>>,
+    /// Duration sent so far (in timestamp units)
+    out_digit_sofar: AtomicU32,
+    /// Total duration for current digit
+    out_digit_dur: AtomicU32,
+    /// RTP bug workaround flags (Sonus, etc)
+    rtp_bugs: RtpBugFlags,
+}
+
+impl DtmfSender {
+    /// Create a new DTMF sender
+    pub fn new(ssrc: u32) -> Self {
+        Self {
+            payload_type: TELEPHONE_EVENT_PT,
+            ssrc,
+            sequence: AtomicU16::new(rand::random()),
+            timestamp_dtmf: AtomicU32::new(rand::random()),
+            out_digit: Mutex::new(None),
+            out_digit_sofar: AtomicU32::new(0),
+            out_digit_dur: AtomicU32::new(0),
+            rtp_bugs: RtpBugFlags::default(),
+        }
+    }
+
+    /// Create with custom payload type
+    pub fn with_payload_type(ssrc: u32, payload_type: u8) -> Self {
+        let mut sender = Self::new(ssrc);
+        sender.payload_type = payload_type;
+        sender
+    }
+
+    /// Create with RTP bug workaround flags
+    pub fn with_rtp_bugs(ssrc: u32, rtp_bugs: RtpBugFlags) -> Self {
+        let mut sender = Self::new(ssrc);
+        sender.rtp_bugs = rtp_bugs;
+        sender
+    }
+
+    /// Set RTP bug workaround flags
+    pub fn set_rtp_bugs(&mut self, rtp_bugs: RtpBugFlags) {
+        self.rtp_bugs = rtp_bugs;
+    }
+
+    /// Get current RTP bug flags
+    pub fn rtp_bugs(&self) -> RtpBugFlags {
+        self.rtp_bugs
+    }
+
+    /// Enable Sonus device workaround
+    ///
+    /// Sonus devices expect INCORRECT RFC 2833 behavior:
+    /// - Timestamp increments with each packet (should be constant)
+    /// - No marker bit on first packet
+    pub fn enable_sonus_mode(&mut self) {
+        self.rtp_bugs.sonus_dtmf_timestamp = true;
+        self.rtp_bugs.never_send_marker = true;
+    }
+
+    /// Get payload type
+    pub fn payload_type(&self) -> u8 {
+        self.payload_type
+    }
+
+    /// Start sending a new digit
+    ///
+    /// Returns the packets to send immediately (first packet with marker bit)
+    pub fn start_digit(&self, digit: char, duration_ms: u32) -> Result<Vec<DtmfPacket>> {
+        let event = DtmfEvent::from_char(digit)
+            .ok_or_else(|| SipRunnerError::Rtp(format!("Invalid DTMF digit: {}", digit)))?;
+
+        // Store current digit state
+        *self.out_digit.lock() = Some(event);
+        self.out_digit_dur
+            .store(DtmfPayload::ms_to_timestamp(duration_ms) as u32, Ordering::Relaxed);
+        self.out_digit_sofar.store(0, Ordering::Relaxed);
+
+        // Generate first packet with marker bit
+        let payload = DtmfPayload::new(event, false, 0);
+        let packet = self.build_packet(&payload, true);
+
+        Ok(vec![packet])
+    }
+
+    /// Continue sending current digit (call every 20ms)
+    ///
+    /// Returns packet to send, or None if digit is complete
+    pub fn continue_digit(&self, interval_ms: u32) -> Option<DtmfPacket> {
+        let digit = (*self.out_digit.lock())?;
+        let interval_ts = DtmfPayload::ms_to_timestamp(interval_ms) as u32;
+
+        let sofar = self.out_digit_sofar.fetch_add(interval_ts, Ordering::Relaxed) + interval_ts;
+        let total = self.out_digit_dur.load(Ordering::Relaxed);
+
+        if sofar >= total {
+            // Final packet(s) with end bit
+            let payload = DtmfPayload::new(digit, true, total.min(u16::MAX as u32) as u16);
+            Some(self.build_packet(&payload, false))
+        } else {
+            // Intermediate packet
+            let payload = DtmfPayload::new(digit, false, sofar.min(u16::MAX as u32) as u16);
+            Some(self.build_packet(&payload, false))
+        }
+    }
+
+    /// Check if we're done with current digit
+    pub fn is_complete(&self) -> bool {
+        let sofar = self.out_digit_sofar.load(Ordering::Relaxed);
+        let total = self.out_digit_dur.load(Ordering::Relaxed);
+        self.out_digit.lock().is_none() || sofar >= total
+    }
+
+    /// End current digit (generates final packets with end bit)
+    pub fn end_digit(&self) -> Vec<DtmfPacket> {
+        let mut packets = Vec::new();
+
+        if let Some(digit) = self.out_digit.lock().take() {
+            let total = self.out_digit_dur.load(Ordering::Relaxed);
+            let payload = DtmfPayload::new(digit, true, total.min(u16::MAX as u32) as u16);
+
+            // RFC 4733: Send end packet 3 times for redundancy
+            for _ in 0..3 {
+                packets.push(self.build_packet(&payload, false));
+            }
+
+            // Advance timestamp for next digit
+            self.timestamp_dtmf.fetch_add(total, Ordering::Relaxed);
+        }
+
+        packets
+    }
+
+    /// Generate all packets for a complete digit (convenience method)
+    pub fn generate_digit(&self, digit: char, duration_ms: u32, interval_ms: u32) -> Result<Vec<DtmfPacket>> {
+        let mut packets = self.start_digit(digit, duration_ms)?;
+
+        let num_intervals = (duration_ms / interval_ms).max(1);
+        for _ in 0..num_intervals {
+            if let Some(packet) = self.continue_digit(interval_ms) {
+                packets.push(packet);
+            }
+        }
+
+        packets.extend(self.end_digit());
+        Ok(packets)
+    }
+
+    fn build_packet(&self, payload: &DtmfPayload, marker: bool) -> DtmfPacket {
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+
+        // Sonus mode: increment timestamp with each packet (WRONG per RFC 4733)
+        // Normal mode: same timestamp throughout digit
+        let ts = if self.rtp_bugs.sonus_dtmf_timestamp {
+            // Sonus expects timestamp to increment by 160 (20ms at 8kHz) per packet
+            self.timestamp_dtmf.fetch_add(160, Ordering::Relaxed)
+        } else {
+            self.timestamp_dtmf.load(Ordering::Relaxed)
+        };
+
+        // Apply marker bit rules
+        let actual_marker = if self.rtp_bugs.never_send_marker || self.rtp_bugs.sonus_dtmf_timestamp {
+            // Sonus mode or never_send_marker: disable marker bit
+            false
+        } else {
+            marker
+        };
+
+        DtmfPacket {
+            payload_type: self.payload_type,
+            sequence: seq,
+            timestamp: ts,
+            ssrc: self.ssrc,
+            marker: actual_marker,
+            payload: payload.serialize(),
+        }
+    }
+}
+
+/// A single DTMF RTP packet ready to send
+#[derive(Debug, Clone)]
+pub struct DtmfPacket {
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub ssrc: u32,
+    pub marker: bool,
+    pub payload: [u8; 4],
+}
+
+impl DtmfPacket {
+    /// Serialize to RTP packet bytes
+    pub fn to_rtp_bytes(&self) -> Bytes {
+        let mut buf = Vec::with_capacity(16);
+
+        // RTP header (12 bytes)
+        buf.push(0x80); // V=2, P=0, X=0, CC=0
+        buf.push((if self.marker { 0x80 } else { 0x00 }) | (self.payload_type & 0x7F));
+        buf.push((self.sequence >> 8) as u8);
+        buf.push((self.sequence & 0xFF) as u8);
+        buf.push((self.timestamp >> 24) as u8);
+        buf.push((self.timestamp >> 16) as u8);
+        buf.push((self.timestamp >> 8) as u8);
+        buf.push((self.timestamp & 0xFF) as u8);
+        buf.push((self.ssrc >> 24) as u8);
+        buf.push((self.ssrc >> 16) as u8);
+        buf.push((self.ssrc >> 8) as u8);
+        buf.push((self.ssrc & 0xFF) as u8);
+        // Payload (4 bytes)
+        buf.extend_from_slice(&self.payload);
+
+        Bytes::from(buf)
+    }
+}
+
+/// RFC 2833 DTMF detector
+///
+/// Tracks incoming DTMF events with sanity checking and deduplication.
+/// Works for both inbound and outbound calls.
+///
+/// # Detection Strategy
+///
+/// 1. **Wait for END packet**: Only report digit when End bit is set.
+///    This ensures we have the complete duration.
+/// 2. **Timestamp-based digit identification**: Same timestamp = same digit.
+///    New timestamp = new digit (even if same event code).
+/// 3. **Deduplication**: Multiple end packets (redundancy) for same digit
+///    are ignored after first detection.
+///
+/// # Edge Cases Handled
+///
+/// ## Packet Loss
+/// - **Lost intermediate packets**: Duration jumps but still detected on END.
+/// - **Lost END packets**: Digit not reported (no false positives).
+/// - **Lost first packet**: Marker bit helps, but detection still works.
+///
+/// ## Stuck Streams
+/// - Some broken implementations send same packet repeatedly.
+/// - We count consecutive same-timestamp packets.
+/// - After 1500 packets (~30 seconds at 20ms), reset state.
+///
+/// ## Duration Wraparound ("flip" mechanism)
+/// - 16-bit duration field wraps at 0xFFFF (~8.19 seconds at 8kHz).
+/// - When duration decreases while timestamp stays same, we accumulate.
+/// - Detection threshold: when duration > 0xFC17 (~7.9s) and then decreases.
+///
+/// ## 4-Byte Payload Offset
+/// - Some SBCs/gateways send DTMF with 4 bytes of zero padding.
+/// - Auto-detected in DtmfPayload::parse().
+///
+/// ## All-Zero Payload
+/// - Rejected as invalid (malformed packet from certain equipment).
+/// - Auto-rejected in DtmfPayload::parse().
+///
+/// ## Out-of-Order Packets
+/// - Handled by timestamp tracking, not sequence number.
+/// - Reordered packets for same digit still have same timestamp.
+///
+/// ## 30-Second Digit Timeout
+/// - Maximum duration for any single digit is 30 seconds.
+/// - Beyond this, assume stream error and reset.
+///
+/// # Usage
+///
+/// ```ignore
+/// let detector = DtmfDetector::new();
+///
+/// // In RTP receive loop:
+/// if let Some(digit) = detector.process_rtp(payload_type, seq, ts, &payload) {
+///     println!("Detected: {} ({}ms)", digit.digit, digit.duration_ms);
+/// }
+///
+/// // Or poll the queue:
+/// while let Some(digit) = detector.pop_digit() {
+///     handle_dtmf(digit);
+/// }
+/// ```
+pub struct DtmfDetector {
+    /// Last received digit sequence number
+    in_digit_seq: AtomicU16,
+    /// Last received digit timestamp
+    in_digit_ts: AtomicU32,
+    /// Previous timestamp for comparison
+    last_in_digit_ts: AtomicU32,
+    /// Sanity counter for detecting stuck streams
+    in_digit_sanity: AtomicU32,
+    /// Last detected duration
+    last_duration: AtomicU16,
+    /// Duration accumulator for wraparound ("flip" mechanism)
+    /// When 16-bit duration wraps, we add 0xFFFF to this
+    duration_flip: AtomicU32,
+    /// Current digit being detected
+    current_digit: Mutex<Option<DtmfEvent>>,
+    /// Payload type to detect (0 = any dynamic PT 96-127)
+    expected_pt: u8,
+    /// Queue for detected digits
+    detected_queue: Mutex<Vec<DetectedDtmf>>,
+}
+
+impl DtmfDetector {
+    /// Create a new DTMF detector
+    pub fn new() -> Self {
+        Self {
+            in_digit_seq: AtomicU16::new(0),
+            in_digit_ts: AtomicU32::new(0),
+            last_in_digit_ts: AtomicU32::new(0),
+            in_digit_sanity: AtomicU32::new(0),
+            last_duration: AtomicU16::new(0),
+            duration_flip: AtomicU32::new(0),
+            current_digit: Mutex::new(None),
+            expected_pt: TELEPHONE_EVENT_PT,
+            detected_queue: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create with specific payload type (0 = accept any dynamic PT)
+    pub fn with_payload_type(pt: u8) -> Self {
+        let mut detector = Self::new();
+        detector.expected_pt = pt;
+        detector
+    }
+
+    /// Reset the detector state
+    pub fn reset(&self) {
+        self.in_digit_seq.store(0, Ordering::Relaxed);
+        self.in_digit_ts.store(0, Ordering::Relaxed);
+        self.last_in_digit_ts.store(0, Ordering::Relaxed);
+        self.in_digit_sanity.store(0, Ordering::Relaxed);
+        self.last_duration.store(0, Ordering::Relaxed);
+        self.duration_flip.store(0, Ordering::Relaxed);
+        *self.current_digit.lock() = None;
+        self.detected_queue.lock().clear();
+    }
+
+    /// Process incoming RTP packet
+    ///
+    /// Call this for every RTP packet. Returns detected digit on END packet.
+    ///
+    /// # Edge Cases Handled
+    ///
+    /// - Duration wraparound: 16-bit field wraps at ~8.19 seconds. We detect
+    ///   when duration decreases while timestamp stays same and accumulate.
+    /// - 30-second timeout: Digits longer than 30 seconds trigger reset.
+    /// - Stuck stream: Same timestamp for 1500+ packets triggers reset.
+    pub fn process_rtp(
+        &self,
+        payload_type: u8,
+        sequence: u16,
+        timestamp: u32,
+        payload: &[u8],
+    ) -> Option<DetectedDtmf> {
+        // Check payload type
+        if self.expected_pt != 0 {
+            if payload_type != self.expected_pt {
+                return None;
+            }
+        } else if payload_type < 96 || payload_type > 127 {
+            return None;
+        }
+
+        let dtmf = DtmfPayload::parse(payload)?;
+        let event = DtmfEvent::from_code(dtmf.event)?;
+
+        let last_ts = self.in_digit_ts.swap(timestamp, Ordering::Relaxed);
+        let _last_seq = self.in_digit_seq.swap(sequence, Ordering::Relaxed);
+
+        // Sanity check: detect out-of-order or stuck streams
+        if timestamp == last_ts {
+            let sanity = self.in_digit_sanity.fetch_add(1, Ordering::Relaxed);
+            if sanity > DTMF_SANITY_LIMIT {
+                // Stream appears stuck (same timestamp for 30+ seconds), reset
+                self.reset();
+                return None;
+            }
+        } else {
+            self.in_digit_sanity.store(0, Ordering::Relaxed);
+        }
+
+        // Check for new digit (timestamp changed)
+        let mut current = self.current_digit.lock();
+        if timestamp != self.last_in_digit_ts.load(Ordering::Relaxed) {
+            // New digit starting - reset duration tracking
+            *current = Some(event);
+            self.last_in_digit_ts.store(timestamp, Ordering::Relaxed);
+            self.last_duration.store(0, Ordering::Relaxed);
+            self.duration_flip.store(0, Ordering::Relaxed);
+        }
+
+        // Track duration with wraparound detection ("flip" mechanism)
+        // 16-bit duration field wraps at 0xFFFF (~8.19 seconds at 8kHz)
+        let last_dur = self.last_duration.swap(dtmf.duration, Ordering::Relaxed);
+
+        // Detect wraparound: duration decreased while same timestamp
+        // Threshold 0xFC17 (~7.9 seconds) detects impending wrap
+        if last_dur > 0xFC17 && dtmf.duration < last_dur {
+            // Duration wrapped around, accumulate 0xFFFF
+            self.duration_flip.fetch_add(0xFFFF, Ordering::Relaxed);
+        }
+
+        // Calculate total duration including any wraparound
+        let flip = self.duration_flip.load(Ordering::Relaxed);
+        let total_duration = dtmf.duration as u32 + flip;
+
+        // 30-second maximum duration sanity check (most digits are < 1 second)
+        if total_duration > DTMF_MAX_DURATION {
+            self.reset();
+            return None;
+        }
+
+        // Only report on END packet
+        if dtmf.is_end && current.is_some() {
+            let digit = current.take().unwrap();
+            // Convert total duration (in timestamp units) to ms
+            // At 8kHz: ms = total_duration / 8
+            let duration_ms = total_duration / 8;
+            let result = DetectedDtmf {
+                digit: digit.to_char(),
+                event: digit,
+                duration_ms,
+                is_end: true,
+            };
+
+            // Reset flip for next digit
+            self.duration_flip.store(0, Ordering::Relaxed);
+
+            // Queue it
+            self.detected_queue.lock().push(result.clone());
+
+            return Some(result);
+        }
+
+        None
+    }
+
+    /// Pop detected digit from queue
+    pub fn pop_digit(&self) -> Option<DetectedDtmf> {
+        let mut queue = self.detected_queue.lock();
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        }
+    }
+
+    /// Check if there are detected digits waiting
+    pub fn has_digits(&self) -> bool {
+        !self.detected_queue.lock().is_empty()
+    }
+}
+
+impl Default for DtmfDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Detected DTMF event
+#[derive(Debug, Clone)]
+pub struct DetectedDtmf {
+    /// DTMF digit character
+    pub digit: char,
+    /// DTMF event
+    pub event: DtmfEvent,
+    /// Duration in milliseconds
+    pub duration_ms: u32,
+    /// Whether this was detected from end packet
+    pub is_end: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dtmf_event_from_char() {
+        assert_eq!(DtmfEvent::from_char('0'), Some(DtmfEvent::Digit0));
+        assert_eq!(DtmfEvent::from_char('9'), Some(DtmfEvent::Digit9));
+        assert_eq!(DtmfEvent::from_char('*'), Some(DtmfEvent::Star));
+        assert_eq!(DtmfEvent::from_char('#'), Some(DtmfEvent::Pound));
+        assert_eq!(DtmfEvent::from_char('A'), Some(DtmfEvent::A));
+        assert_eq!(DtmfEvent::from_char('a'), Some(DtmfEvent::A));
+        assert_eq!(DtmfEvent::from_char('X'), None);
+    }
+
+    #[test]
+    fn test_dtmf_payload_parse() {
+        // Event 1, end=true, volume=10, duration=160
+        let data = [1, 0x8A, 0, 160];
+        let payload = DtmfPayload::parse(&data).unwrap();
+        assert_eq!(payload.event, 1);
+        assert!(payload.is_end);
+        assert_eq!(payload.volume, 10);
+        assert_eq!(payload.duration, 160);
+
+        // Event 2, end=false, volume=0, duration=160
+        let data = [2, 0x00, 0, 160];
+        let payload = DtmfPayload::parse(&data).unwrap();
+        assert_eq!(payload.event, 2);
+        assert!(!payload.is_end);
+
+        // Invalid event code (>15)
+        let data = [20, 0x80, 10, 100];
+        assert!(DtmfPayload::parse(&data).is_none());
+
+        // Too short
+        let data = [1, 0x80, 10];
+        assert!(DtmfPayload::parse(&data).is_none());
+
+        // Duration 800 = 0x0320
+        let data = [2, 0x8A, 3, 32];
+        let payload = DtmfPayload::parse(&data).unwrap();
+        assert_eq!(payload.duration, 800);
+    }
+
+    #[test]
+    fn test_dtmf_payload_serialize() {
+        let payload = DtmfPayload::new(DtmfEvent::Digit5, true, 160);
+        let bytes = payload.serialize();
+
+        assert_eq!(bytes[0], 5);
+        assert_eq!(bytes[1] & 0x80, 0x80); // end bit
+        assert_eq!(bytes[1] & 0x3F, DEFAULT_VOLUME);
+        assert_eq!((bytes[2] as u16) << 8 | bytes[3] as u16, 160);
+    }
+
+    #[test]
+    fn test_dtmf_payload_roundtrip() {
+        let original = DtmfPayload::new(DtmfEvent::Star, true, 320);
+        let bytes = original.serialize();
+        let parsed = DtmfPayload::parse(&bytes).unwrap();
+
+        assert_eq!(parsed.event, original.event);
+        assert_eq!(parsed.is_end, original.is_end);
+        assert_eq!(parsed.duration, original.duration);
+    }
+
+    #[test]
+    fn test_dtmf_duration_conversion() {
+        assert_eq!(DtmfPayload::ms_to_timestamp(100), 800);
+        assert_eq!(DtmfPayload::timestamp_to_ms(800), 100);
+        assert_eq!(DtmfPayload::ms_to_timestamp(20), 160);
+        assert_eq!(DtmfPayload::timestamp_to_ms(160), 20);
+    }
+
+    #[test]
+    fn test_dtmf_sender_generate_digit() {
+        let sender = DtmfSender::new(0x12345678);
+        let packets = sender.generate_digit('5', 100, 20).unwrap();
+
+        // Should have multiple packets
+        assert!(packets.len() >= 3); // At least start + end*3
+
+        // First packet should have marker
+        assert!(packets[0].marker);
+
+        // All packets should have same timestamp
+        let ts = packets[0].timestamp;
+        for packet in &packets {
+            assert_eq!(packet.timestamp, ts);
+        }
+
+        // Last 3 packets should have end bit
+        let last_payload = DtmfPayload::parse(&packets[packets.len() - 1].payload).unwrap();
+        assert!(last_payload.is_end);
+    }
+
+    #[test]
+    fn test_dtmf_detector() {
+        let detector = DtmfDetector::new();
+
+        // Simulate receiving DTMF digit '5' with increasing duration
+        let ts = 1000u32;
+
+        // Intermediate packets (no detection yet)
+        let payload1 = [5, 0x0A, 0, 160]; // duration=160, no end
+        let result = detector.process_rtp(101, 1, ts, &payload1);
+        assert!(result.is_none());
+
+        let payload2 = [5, 0x0A, 1, 64]; // duration=320, no end
+        let result = detector.process_rtp(101, 2, ts, &payload2);
+        assert!(result.is_none());
+
+        // End packet - should detect
+        let payload3 = [5, 0x8A, 3, 32]; // duration=800, end=true
+        let result = detector.process_rtp(101, 3, ts, &payload3);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().digit, '5');
+    }
+
+    #[test]
+    fn test_dtmf_detector_new_digit() {
+        let detector = DtmfDetector::new();
+
+        // First digit '5'
+        let payload1 = [5, 0x8A, 0, 160]; // end=true
+        let result = detector.process_rtp(101, 1, 1000, &payload1);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().digit, '5');
+
+        // New digit '6' with different timestamp
+        let payload2 = [6, 0x8A, 0, 160]; // end=true
+        let result = detector.process_rtp(101, 2, 2000, &payload2);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().digit, '6');
+    }
+
+    #[test]
+    fn test_dtmf_detector_wrong_pt() {
+        let detector = DtmfDetector::new(); // expects PT 101
+
+        let payload = [5, 0x8A, 0, 160];
+        let result = detector.process_rtp(0, 1, 1000, &payload);
+        assert!(result.is_none());
+    }
+
+    // === Device Compatibility Edge Case Tests ===
+
+    #[test]
+    fn test_dtmf_payload_4byte_offset() {
+        // Edge case: some SBCs/gateways send 4 bytes of zero padding
+        // [0,0,0,0,event,flags,dur_hi,dur_lo]
+        let data_with_padding = [0, 0, 0, 0, 5, 0x8A, 0, 160];
+        let payload = DtmfPayload::parse(&data_with_padding).unwrap();
+        assert_eq!(payload.event, 5);
+        assert!(payload.is_end);
+        assert_eq!(payload.duration, 160);
+    }
+
+    #[test]
+    fn test_dtmf_payload_all_zero_rejected() {
+        // Edge case: all-zero payload (malformed packet from certain equipment)
+        let data = [0, 0, 0, 0];
+        assert!(DtmfPayload::parse(&data).is_none());
+    }
+
+    #[test]
+    fn test_dtmf_detector_duration_wraparound() {
+        // "Flip" mechanism: 16-bit duration wraps at 0xFFFF (~8.19 seconds)
+        let detector = DtmfDetector::new();
+        let ts = 1000u32;
+
+        // Send packets with increasing duration approaching wrap
+        let payload1 = [5, 0x0A, 0xFC, 0x00]; // duration=0xFC00 (~7.9 sec)
+        detector.process_rtp(101, 1, ts, &payload1);
+
+        let payload2 = [5, 0x0A, 0xFF, 0x00]; // duration=0xFF00 (~8.1 sec)
+        detector.process_rtp(101, 2, ts, &payload2);
+
+        // Duration wraps around (went from 0xFF00 to 0x0100)
+        let payload3 = [5, 0x0A, 0x01, 0x00]; // duration=0x0100 (after wrap)
+        detector.process_rtp(101, 3, ts, &payload3);
+
+        // End packet with wrapped duration
+        let payload4 = [5, 0x8A, 0x02, 0x00]; // duration=0x0200, end=true
+        let result = detector.process_rtp(101, 4, ts, &payload4);
+
+        // Should have detected the wraparound and accumulated
+        assert!(result.is_some());
+        let detected = result.unwrap();
+        assert_eq!(detected.digit, '5');
+        // Total should be 0x0200 + 0xFFFF = 0x101FF = 65,791 samples
+        // At 8kHz: 65,791 / 8 = ~8223ms
+        assert!(detected.duration_ms > 8000);
+    }
+
+    #[test]
+    fn test_sonus_mode_timestamp_increment() {
+        // Sonus devices expect timestamp to increment with each packet (WRONG per RFC)
+        let mut sender = DtmfSender::new(0x12345678);
+        sender.enable_sonus_mode();
+
+        let packets = sender.generate_digit('5', 100, 20).unwrap();
+
+        // In Sonus mode, timestamps should increment (unlike normal mode)
+        assert!(packets.len() >= 3);
+
+        // Check that timestamps are different between packets
+        let ts1 = packets[0].timestamp;
+        let ts2 = packets[1].timestamp;
+
+        // In Sonus mode: timestamp increments by 160 (20ms at 8kHz) per packet
+        assert_ne!(ts1, ts2, "Sonus mode should have different timestamps per packet");
+        assert_eq!(ts2.wrapping_sub(ts1), 160, "Sonus mode should increment by 160");
+    }
+
+    #[test]
+    fn test_sonus_mode_no_marker_bit() {
+        // Sonus mode should disable marker bit
+        let mut sender = DtmfSender::new(0x12345678);
+        sender.enable_sonus_mode();
+
+        let packets = sender.generate_digit('5', 100, 20).unwrap();
+
+        // In Sonus mode, NO packet should have marker bit (even first one)
+        for packet in &packets {
+            assert!(!packet.marker, "Sonus mode should never set marker bit");
+        }
+    }
+
+    #[test]
+    fn test_normal_mode_constant_timestamp() {
+        // Normal mode: all packets for one digit have same timestamp
+        let sender = DtmfSender::new(0x12345678);
+        let packets = sender.generate_digit('5', 100, 20).unwrap();
+
+        assert!(packets.len() >= 3);
+
+        let ts = packets[0].timestamp;
+        for packet in &packets {
+            assert_eq!(packet.timestamp, ts, "Normal mode should have constant timestamp");
+        }
+    }
+
+    #[test]
+    fn test_normal_mode_marker_on_first() {
+        // Normal mode: first packet should have marker bit
+        let sender = DtmfSender::new(0x12345678);
+        let packets = sender.generate_digit('5', 100, 20).unwrap();
+
+        assert!(packets[0].marker, "Normal mode should set marker on first packet");
+
+        // Subsequent packets should NOT have marker
+        for packet in packets.iter().skip(1) {
+            assert!(!packet.marker, "Normal mode should not set marker on subsequent packets");
+        }
+    }
+
+    #[test]
+    fn test_rtp_bug_flags() {
+        // Test RtpBugFlags struct
+        let mut flags = RtpBugFlags::default();
+        assert!(!flags.sonus_dtmf_timestamp);
+        assert!(!flags.never_send_marker);
+
+        flags.sonus_dtmf_timestamp = true;
+        flags.never_send_marker = true;
+
+        let sender = DtmfSender::with_rtp_bugs(0x12345678, flags);
+        assert!(sender.rtp_bugs().sonus_dtmf_timestamp);
+        assert!(sender.rtp_bugs().never_send_marker);
+    }
+
+    #[test]
+    fn test_auto_detect_sonus() {
+        // Sonus devices should trigger both workarounds
+        let flags = RtpBugFlags::detect_from_user_agent("Sonus-SBC/5.1.0");
+        assert!(flags.sonus_dtmf_timestamp);
+        assert!(flags.never_send_marker);
+        assert!(flags.has_workarounds());
+
+        // Case insensitive
+        let flags = RtpBugFlags::detect_from_user_agent("SONUS_GATEWAY");
+        assert!(flags.sonus_dtmf_timestamp);
+
+        let flags = RtpBugFlags::detect_from_user_agent("sonus");
+        assert!(flags.sonus_dtmf_timestamp);
+    }
+
+    #[test]
+    fn test_auto_detect_cisco() {
+        // Cisco devices should only trigger marker bit workaround
+        let flags = RtpBugFlags::detect_from_user_agent("Cisco-Gateway/IOS-12.x");
+        assert!(!flags.sonus_dtmf_timestamp);
+        assert!(flags.never_send_marker);
+        assert!(flags.has_workarounds());
+
+        // Case insensitive
+        let flags = RtpBugFlags::detect_from_user_agent("CISCO_IOS");
+        assert!(flags.never_send_marker);
+    }
+
+    #[test]
+    fn test_auto_detect_unknown() {
+        // Unknown devices should have no workarounds
+        let flags = RtpBugFlags::detect_from_user_agent("Orc-PBX/1.0");
+        assert!(!flags.sonus_dtmf_timestamp);
+        assert!(!flags.never_send_marker);
+        assert!(!flags.has_workarounds());
+
+        let flags = RtpBugFlags::detect_from_user_agent("Asterisk/16.0");
+        assert!(!flags.has_workarounds());
+
+        let flags = RtpBugFlags::detect_from_user_agent("");
+        assert!(!flags.has_workarounds());
+    }
+
+    #[test]
+    fn test_rtp_bug_flags_merge() {
+        let mut flags1 = RtpBugFlags::default();
+        flags1.sonus_dtmf_timestamp = true;
+
+        let mut flags2 = RtpBugFlags::default();
+        flags2.never_send_marker = true;
+
+        flags1.merge(&flags2);
+        assert!(flags1.sonus_dtmf_timestamp);
+        assert!(flags1.never_send_marker);
+    }
+
+    #[test]
+    fn test_dtmf_packet_to_rtp_bytes() {
+        let packet = DtmfPacket {
+            payload_type: 101,
+            sequence: 0x1234,
+            timestamp: 0xABCDEF00,
+            ssrc: 0x12345678,
+            marker: true,
+            payload: [5, 0x8A, 0, 160],
+        };
+
+        let bytes = packet.to_rtp_bytes();
+
+        assert_eq!(bytes[0], 0x80); // V=2
+        assert_eq!(bytes[1], 0x80 | 101); // M=1, PT=101
+        assert_eq!((bytes[2] as u16) << 8 | bytes[3] as u16, 0x1234); // seq
+        assert_eq!(bytes[12], 5); // event
+        assert_eq!(bytes[13], 0x8A); // end + volume
+    }
+}

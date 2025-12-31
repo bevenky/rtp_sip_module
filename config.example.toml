@@ -1,0 +1,48 @@
+# siprunner configuration example
+
+[sip]
+# Local IP to bind SIP socket
+local_ip = "0.0.0.0"
+# Local SIP port
+local_port = 5060
+# Transport: "udp" or "tls"
+transport = "udp"
+# TLS certificate path (required if transport = "tls")
+# tls_cert = "/path/to/cert.pem"
+# TLS key path (required if transport = "tls")
+# tls_key = "/path/to/key.pem"
+
+[rtp]
+# Local IP to bind RTP sockets
+local_ip = "0.0.0.0"
+# RTP port range
+port_start = 10000
+port_end = 20000
+
+# Multiple providers supported - use [[providers]] for each
+# Routing uses longest prefix match
+
+[[providers]]
+name = "plivo"
+server = "sip.plivo.com"
+port = 5060
+username = "AUTH_ID"
+password = "AUTH_TOKEN"
+# Prefixes this provider handles
+prefixes = ["+1", "+1415"]
+# Set default = true for fallback provider
+default = false
+
+[[providers]]
+name = "telnyx"
+server = "sip.telnyx.com"
+port = 5060
+username = "USER"
+password = "PASS"
+prefixes = ["+44", "+49"]
+# This is the default/fallback provider
+default = true
+
+[routing]
+# Blocked prefixes (calls to these fail immediately)
+blocked_prefixes = ["+1900", "+1976"]
