@@ -24,8 +24,19 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# C extensions
+# C extensions and shared libraries
 *.so
+*.so.*
+*.dylib
+*.dylib.*
+*.dll
+*.pyd
+
+# Object files
+*.o
+*.obj
+*.a
+*.lib
 
 # Distribution / packaging
 .Python
@@ -163,3 +174,11 @@ temp/
 
 # Maturin build artifacts
 *.whl
+
+# Bundled libraries (auditwheel/delocate)
+*.libs/
+**/*.libs/
+
+# Executables
+*.exe
+*.out
