@@ -37,6 +37,12 @@ tokio = { version = "1", features = ["full", "sync", "rt-multi-thread"] }
 pyo3 = { version = "0.22", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
 
+# SRTP (RFC 3711)
+aes = "0.8"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+
 # Utilities
 dashmap = "6"
 parking_lot = "0.12"

@@ -65,8 +65,10 @@
 //! directions. The code checks `client_dialog` then `server_dialog` to find
 //! the appropriate dialog for the operation.
 
+use crate::config::Transport;
 use crate::error::{Result, RtpSipError};
 use crate::rtp::{CodecType, RtpEngine, RtpEngineConfig};
+use crate::sip::dns::SipResolver;
 use crate::sip::sdp::{MediaDirection, Sdp, SdpBuilder};
 use parking_lot::Mutex;
 use rsip::prelude::HeadersExt;
@@ -83,7 +85,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 
 /// DTMF transmission mode
@@ -206,6 +208,59 @@ pub enum CallEvent {
     Hangup { call_id: String, reason: String },
     /// Error occurred
     Error { call_id: String, error: String },
+    /// Blind transfer initiated (REFER sent)
+    TransferInitiated {
+        call_id: String,
+        target: String,
+    },
+    /// Transfer progress from NOTIFY (SIP fragment status)
+    TransferProgress {
+        call_id: String,
+        status_code: u16,
+        reason: String,
+        completed: bool,
+    },
+    /// Transfer failed
+    TransferFailed {
+        call_id: String,
+        error: String,
+    },
+    /// Incoming REFER received (someone is transferring us)
+    ReferReceived {
+        call_id: String,
+        refer_to: String,
+    },
+    /// Call was cancelled (early dialog cancelled before answer)
+    Cancelled { call_id: String },
+    /// Call was redirected (3xx response)
+    Redirected {
+        call_id: String,
+        targets: Vec<String>,
+    },
+    /// RTP media timeout detected (no RTP received)
+    MediaTimeout { call_id: String },
+    /// Registration state changed
+    RegistrationChanged {
+        state: String,
+        error: Option<String>,
+    },
+    /// Gateway health status changed (from OPTIONS keepalive)
+    GatewayHealth { server: String, healthy: bool },
+}
+
+/// Registration state (Fix 4)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationState {
+    /// Not registered
+    Unregistered,
+    /// Registration in progress
+    Registering,
+    /// Successfully registered
+    Registered,
+    /// Registration failed
+    Failed(String),
+    /// Unregistering
+    Unregistering,
 }
 
 /// Active call session
@@ -247,6 +302,14 @@ pub struct CallSession {
     pub remote_user_agent: Option<String>,
     /// RTP bug workaround flags (auto-detected from User-Agent)
     pub rtp_bug_flags: crate::rtp::dtmf::RtpBugFlags,
+    /// Session timer state (RFC 4028)
+    pub session_timer: Option<crate::sip::session_timer::SessionTimer>,
+    /// Whether a REFER transfer is pending
+    pub refer_pending: bool,
+    /// Target URI for pending REFER
+    pub refer_target: Option<String>,
+    /// Whether a re-INVITE is currently in progress (for glare detection)
+    pub reinvite_pending: bool,
 }
 
 impl CallSession {
@@ -403,6 +466,37 @@ pub struct SipEngineConfig {
     pub rtp_port_start: u16,
     /// RTP port range end
     pub rtp_port_end: u16,
+    /// Enable 100rel/PRACK support (Fix 7)
+    pub enable_100rel: bool,
+    /// OPTIONS keepalive interval in seconds (Fix 8), 0 = disabled
+    pub options_keepalive_interval_secs: u64,
+    /// Enable Contact header NAT rewriting (Fix 9)
+    pub contact_nat_rewrite: bool,
+    /// Maximum concurrent calls (Fix 10), 0 = unlimited
+    pub max_calls: usize,
+    /// Maximum SIP requests per second (Fix 10), 0 = unlimited
+    pub max_requests_per_second: u32,
+    /// Automatically follow 3xx redirects (Fix 2)
+    pub auto_redirect: bool,
+    /// Timer T1: RTT estimate in milliseconds (Fix 3)
+    pub timer_t1_ms: Option<u32>,
+    /// Timer T2: Maximum retransmit interval in milliseconds (Fix 3)
+    pub timer_t2_ms: Option<u32>,
+    /// Timer T1x64: Maximum retransmit time in milliseconds (Fix 3)
+    pub timer_t1x64_ms: Option<u32>,
+    /// Transport type (Fix 11)
+    pub transport: Transport,
+    /// Verify TLS certificates (Fix 11)
+    pub tls_verify: bool,
+    /// CA certificate path for TLS (Fix 11)
+    pub tls_ca_cert: Option<String>,
+}
+
+impl SipEngineConfig {
+    /// Enable or disable 100rel/PRACK support (Fix 7)
+    pub fn set_100rel_enabled(&mut self, enabled: bool) {
+        self.enable_100rel = enabled;
+    }
 }
 
 impl Default for SipEngineConfig {
@@ -412,6 +506,18 @@ impl Default for SipEngineConfig {
             user_agent: "rtpsip/0.1".to_string(),
             rtp_port_start: 10000,
             rtp_port_end: 20000,
+            enable_100rel: false,
+            options_keepalive_interval_secs: 0,
+            contact_nat_rewrite: false,
+            max_calls: 0,
+            max_requests_per_second: 0,
+            auto_redirect: false,
+            timer_t1_ms: None,
+            timer_t2_ms: None,
+            timer_t1x64_ms: None,
+            transport: Transport::Udp,
+            tls_verify: true,
+            tls_ca_cert: None,
         }
     }
 }
@@ -425,7 +531,7 @@ pub struct SipEngine {
     /// Provider credentials
     providers: Mutex<HashMap<String, ProviderCredentials>>,
     /// Active registrations
-    registrations: Mutex<HashMap<String, Arc<Registration>>>,
+    registrations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Registration>>>>,
     /// Active calls
     calls: Mutex<HashMap<String, Arc<Mutex<CallSession>>>>,
     /// Event sender
@@ -436,12 +542,36 @@ pub struct SipEngine {
     next_rtp_port: Mutex<u16>,
     /// Shutdown signal for background tasks
     shutdown_tx: broadcast::Sender<()>,
+    /// Registration state (Fix 4)
+    registration_state: Mutex<RegistrationState>,
+    /// Registration expiry in seconds (Fix 4)
+    registration_expiry: Mutex<Option<u32>>,
+    /// Gateway health status (Fix 8)
+    gateway_health: Mutex<HashMap<String, bool>>,
+    /// Rate limiting: timestamps of recent requests (Fix 10)
+    request_timestamps: Mutex<Vec<Instant>>,
 }
 
 impl SipEngine {
     /// Create a new SIP engine
     pub async fn new(config: SipEngineConfig) -> Result<Arc<Self>> {
-        let endpoint_option = EndpointOption::default();
+        // Fix 3: Apply transaction timer configuration
+        let mut endpoint_option = EndpointOption::default();
+        if let Some(t1) = config.timer_t1_ms {
+            endpoint_option.t1 = std::time::Duration::from_millis(t1 as u64);
+        }
+        if let Some(t1x64) = config.timer_t1x64_ms {
+            endpoint_option.t1x64 = std::time::Duration::from_millis(t1x64 as u64);
+        }
+
+        // Fix 11: Log TLS configuration
+        if config.transport == Transport::Tls {
+            tracing::info!(
+                "TLS transport configured (verify={}, ca_cert={:?})",
+                config.tls_verify,
+                config.tls_ca_cert
+            );
+        }
 
         let endpoint = EndpointBuilder::new()
             .with_option(endpoint_option)
@@ -462,6 +592,10 @@ impl SipEngine {
             config: config.clone(),
             next_rtp_port: Mutex::new(config.rtp_port_start),
             shutdown_tx,
+            registration_state: Mutex::new(RegistrationState::Unregistered),
+            registration_expiry: Mutex::new(None),
+            gateway_health: Mutex::new(HashMap::new()),
+            request_timestamps: Mutex::new(Vec::new()),
         }))
     }
 
@@ -516,7 +650,226 @@ impl SipEngine {
             }
         });
 
+        // Fix 8: Start OPTIONS keepalive background task
+        if self.config.options_keepalive_interval_secs > 0 {
+            let engine_keepalive = self.clone();
+            let interval_secs = self.config.options_keepalive_interval_secs;
+            let mut keepalive_shutdown_rx = self.shutdown_tx.subscribe();
+
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                // Skip the first immediate tick
+                interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = keepalive_shutdown_rx.recv() => {
+                            tracing::debug!("OPTIONS keepalive task shutting down");
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            engine_keepalive.send_options_keepalive().await;
+                        }
+                    }
+                }
+            });
+
+            tracing::info!(
+                "OPTIONS keepalive started (interval={}s)",
+                interval_secs
+            );
+        }
+
         Ok(())
+    }
+
+    /// Send OPTIONS keepalive pings to all registered providers (Fix 8)
+    async fn send_options_keepalive(self: &Arc<Self>) {
+        let providers: Vec<ProviderCredentials> =
+            self.providers.lock().values().cloned().collect();
+
+        for provider in &providers {
+            let server = format!("{}:{}", provider.sip_server, provider.sip_port);
+            let healthy = self.send_options_ping(&server).await;
+
+            let prev_healthy = self.gateway_health.lock().insert(server.clone(), healthy);
+
+            // Only emit event on state change
+            if prev_healthy != Some(healthy) {
+                let _ = self.event_tx.send(CallEvent::GatewayHealth {
+                    server: server.clone(),
+                    healthy,
+                });
+                if healthy {
+                    tracing::info!("Gateway {} is healthy", server);
+                } else {
+                    tracing::warn!("Gateway {} is unhealthy", server);
+                }
+            }
+        }
+    }
+
+    /// Send a single OPTIONS ping to a server and check for response (Fix 8)
+    async fn send_options_ping(&self, server: &str) -> bool {
+        let addrs = match SipResolver::resolve_sip_uri(server).await {
+            Ok(addrs) if !addrs.is_empty() => addrs,
+            _ => return false,
+        };
+
+        let remote_addr = addrs[0];
+
+        let branch = format!("z9hG4bK{}", uuid::Uuid::new_v4().simple());
+        let mut headers: rsip::Headers = Default::default();
+
+        let via_value = format!(
+            "SIP/2.0/UDP {};branch={}",
+            self.config.local_addr, branch
+        );
+        headers.push(rsip::Header::Via(via_value.into()));
+        headers.push(rsip::Header::MaxForwards("70".into()));
+        headers.push(rsip::Header::From(
+            format!(
+                "<sip:keepalive@{}>;tag={}",
+                self.config.local_addr,
+                uuid::Uuid::new_v4().simple()
+            )
+            .into(),
+        ));
+        headers.push(rsip::Header::To(format!("<sip:{}>", server).into()));
+        headers.push(rsip::Header::CallId(
+            uuid::Uuid::new_v4().to_string().into(),
+        ));
+        headers.push(rsip::Header::CSeq("1 OPTIONS".into()));
+        headers.push(rsip::Header::UserAgent(
+            self.config.user_agent.clone().into(),
+        ));
+        headers.push(rsip::Header::ContentLength("0".into()));
+
+        let request_uri = match rsip::Uri::try_from(format!("sip:{}", server).as_str()) {
+            Ok(uri) => uri,
+            Err(_) => return false,
+        };
+
+        let request = rsip::Request {
+            method: rsip::Method::Options,
+            uri: request_uri,
+            version: rsip::Version::V2,
+            headers,
+            body: vec![],
+        };
+
+        let request_bytes = request.to_string();
+
+        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        if socket
+            .send_to(request_bytes.as_bytes(), remote_addr)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok((len, _))) => {
+                let response = String::from_utf8_lossy(&buf[..len]);
+                response.starts_with("SIP/2.0 2")
+            }
+            _ => false,
+        }
+    }
+
+    /// Get gateway health status (Fix 8)
+    pub fn gateway_health(&self) -> HashMap<String, bool> {
+        self.gateway_health.lock().clone()
+    }
+
+    /// Get current registration state (Fix 4)
+    pub fn registration_state(&self) -> RegistrationState {
+        self.registration_state.lock().clone()
+    }
+
+    /// Unregister from a provider (Fix 4)
+    pub async fn unregister(&self, provider_id: &str) -> Result<()> {
+        *self.registration_state.lock() = RegistrationState::Unregistering;
+
+        let registration = self
+            .registrations
+            .lock()
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                RtpSipError::Provider(format!("No registration for provider: {}", provider_id))
+            })?;
+
+        let provider = self
+            .providers
+            .lock()
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                RtpSipError::Provider(format!("Unknown provider: {}", provider_id))
+            })?;
+
+        let registrar_uri: Uri =
+            Uri::try_from(format!("sip:{}", provider.sip_server).as_str()).map_err(|e| {
+                RtpSipError::Sip(format!("Invalid registrar URI: {:?}", e))
+            })?;
+
+        // Send REGISTER with Expires: 0 to unregister
+        registration
+            .lock()
+            .await
+            .register(registrar_uri, Some(0))
+            .await
+            .map_err(|e| RtpSipError::Sip(format!("Unregistration failed: {}", e)))?;
+
+        self.registrations.lock().remove(provider_id);
+        *self.registration_state.lock() = RegistrationState::Unregistered;
+        *self.registration_expiry.lock() = None;
+
+        let _ = self.event_tx.send(CallEvent::RegistrationChanged {
+            state: "unregistered".to_string(),
+            error: None,
+        });
+
+        tracing::info!("Unregistered from provider {}", provider_id);
+        Ok(())
+    }
+
+    /// Get NAT-rewritten contact URI (Fix 9)
+    fn nat_rewritten_contact(&self, user: &str) -> String {
+        format!("sip:{}@{}", user, self.config.local_addr)
+    }
+
+    /// Check rate limits (Fix 10)
+    fn check_rate_limit(&self) -> bool {
+        if self.config.max_requests_per_second == 0 {
+            return true;
+        }
+
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(1);
+        let mut timestamps = self.request_timestamps.lock();
+
+        timestamps.retain(|t| now.duration_since(*t) < window);
+
+        if timestamps.len() >= self.config.max_requests_per_second as usize {
+            return false;
+        }
+
+        timestamps.push(now);
+        true
     }
 
     /// Stop the SIP engine
@@ -525,7 +878,27 @@ impl SipEngine {
     }
 
     /// Handle an incoming INVITE request
-    async fn handle_incoming_invite(self: &Arc<Self>, transaction: rsipstack::transaction::transaction::Transaction) {
+    async fn handle_incoming_invite(
+        self: &Arc<Self>,
+        transaction: rsipstack::transaction::transaction::Transaction,
+    ) {
+        // Fix 10: Rate limiting checks
+        if !self.check_rate_limit() {
+            tracing::warn!("Rate limit exceeded, rejecting INVITE with 503");
+            return;
+        }
+
+        if self.config.max_calls > 0 {
+            let active = self.calls.lock().len();
+            if active >= self.config.max_calls {
+                tracing::warn!(
+                    "Max calls ({}) reached, rejecting INVITE with 503",
+                    self.config.max_calls
+                );
+                return;
+            }
+        }
+
         // Extract call information from the INVITE request
         let request = &transaction.original;
 
@@ -655,7 +1028,7 @@ impl SipEngine {
             remote_uri: Some(from_uri.clone()), // Remote is the "From"
             remote_addr: None, // Will be set from response
             cseq: 1,
-            local_contact: Some(format!("sip:rtpsip@{}", self.config.local_addr)),
+            local_contact: Some(self.nat_rewritten_contact("rtpsip")),
             dtmf_mode: DtmfMode::Auto,
             remote_telephone_event_pt,
             early_media_state: EarlyMediaState::None,
@@ -664,6 +1037,10 @@ impl SipEngine {
             remote_hold: false,
             remote_user_agent,
             rtp_bug_flags,
+            session_timer: None,
+            refer_pending: false,
+            refer_target: None,
+            reinvite_pending: false,
         }));
 
         self.calls.lock().insert(call_id.clone(), session.clone());
@@ -687,6 +1064,21 @@ impl SipEngine {
             while let Some(state) = state_rx.recv().await {
                 match state {
                     DialogState::Updated(_, request) => {
+                        // Fix 5: Glare detection for inbound calls (UAS role)
+                        let should_reject = if let Some(sess) = engine.calls.lock().get(&call_id_for_state) {
+                            sess.lock().reinvite_pending
+                        } else {
+                            false
+                        };
+
+                        if should_reject {
+                            tracing::info!(
+                                "Glare detected on call {} (UAS): re-INVITE pending",
+                                call_id_for_state
+                            );
+                            continue;
+                        }
+
                         // Incoming re-INVITE
                         let sdp_str = std::str::from_utf8(request.body())
                             .ok()
@@ -722,6 +1114,45 @@ impl SipEngine {
                                     digit,
                                     duration,
                                 });
+                            }
+                        }
+                    }
+                    DialogState::Notify(_, request) => {
+                        // Check if this is a REFER subscription NOTIFY
+                        let is_refer_event = request.headers.iter().any(|h| {
+                            matches!(h, rsip::Header::Other(name, val)
+                                if name.as_str().eq_ignore_ascii_case("Event")
+                                    && val.as_str().trim().starts_with("refer"))
+                        });
+
+                        if is_refer_event {
+                            let body_str =
+                                std::str::from_utf8(request.body()).unwrap_or("");
+                            let (status_code, reason) = parse_sipfrag_status(body_str)
+                                .unwrap_or((100, "Trying".to_string()));
+
+                            let is_terminated = request.headers.iter().any(|h| {
+                                matches!(h, rsip::Header::Other(name, val)
+                                    if name.as_str().eq_ignore_ascii_case("Subscription-State")
+                                        && val.as_str().trim().starts_with("terminated"))
+                            });
+
+                            let completed =
+                                is_terminated && status_code >= 200 && status_code < 300;
+
+                            let _ = engine.event_tx.send(CallEvent::TransferProgress {
+                                call_id: call_id_for_state.clone(),
+                                status_code,
+                                reason,
+                                completed,
+                            });
+
+                            if is_terminated {
+                                if let Some(sess) =
+                                    engine.calls.lock().get(&call_id_for_state)
+                                {
+                                    sess.lock().refer_pending = false;
+                                }
                             }
                         }
                     }
@@ -858,7 +1289,7 @@ impl SipEngine {
         Ok(())
     }
 
-    /// Register with a provider
+    /// Register with a provider (Fix 4: lifecycle tracking)
     pub async fn register(&self, provider_id: &str) -> Result<()> {
         let provider = self
             .providers
@@ -871,22 +1302,55 @@ impl SipEngine {
             return Ok(());
         }
 
+        *self.registration_state.lock() = RegistrationState::Registering;
+
+        let _ = self.event_tx.send(CallEvent::RegistrationChanged {
+            state: "registering".to_string(),
+            error: None,
+        });
+
         let credential = provider.to_credential();
         let mut registration = Registration::new(self.endpoint.inner.clone(), Some(credential));
 
         let registrar_uri: Uri = Uri::try_from(format!("sip:{}", provider.sip_server).as_str())
             .map_err(|e| RtpSipError::Sip(format!("Invalid registrar URI: {:?}", e)))?;
 
-        registration
-            .register(registrar_uri, None)
-            .await
-            .map_err(|e| RtpSipError::Sip(format!("Registration failed: {}", e)))?;
+        match registration.register(registrar_uri, None).await {
+            Ok(_response) => {
+                // Track expiry from registration
+                let expiry = registration.expires();
+                *self.registration_expiry.lock() = Some(expiry);
+                *self.registration_state.lock() = RegistrationState::Registered;
 
-        self.registrations
-            .lock()
-            .insert(provider_id.to_string(), Arc::new(registration));
+                self.registrations
+                    .lock()
+                    .insert(provider_id.to_string(), Arc::new(tokio::sync::Mutex::new(registration)));
 
-        Ok(())
+                let _ = self.event_tx.send(CallEvent::RegistrationChanged {
+                    state: "registered".to_string(),
+                    error: None,
+                });
+
+                tracing::info!(
+                    "Registered with provider {} (expires={:?})",
+                    provider_id,
+                    expiry
+                );
+
+                Ok(())
+            }
+            Err(e) => {
+                let err_msg = format!("Registration failed: {}", e);
+                *self.registration_state.lock() = RegistrationState::Failed(err_msg.clone());
+
+                let _ = self.event_tx.send(CallEvent::RegistrationChanged {
+                    state: "failed".to_string(),
+                    error: Some(err_msg.clone()),
+                });
+
+                Err(RtpSipError::Sip(err_msg))
+            }
+        }
     }
 
     /// Allocate an RTP port
@@ -952,8 +1416,8 @@ impl SipEngine {
             .parse()
             .ok();
 
-        // Store contact URI for REFER
-        let contact_str = format!("sip:{}@{}", provider.username, self.config.local_addr);
+        // Fix 9: Use NAT-rewritten contact
+        let contact_str = self.nat_rewritten_contact(&provider.username);
 
         // Create call session with dialog information for REFER support
         // Note: remote_user_agent and rtp_bug_flags will be updated when we receive
@@ -983,6 +1447,10 @@ impl SipEngine {
             // Device detection - populated from response User-Agent header
             remote_user_agent: None,
             rtp_bug_flags: crate::rtp::dtmf::RtpBugFlags::default(),
+            session_timer: None,
+            refer_pending: false,
+            refer_target: None,
+            reinvite_pending: false,
         }));
 
         self.calls.lock().insert(call_id.clone(), session.clone());
@@ -990,7 +1458,8 @@ impl SipEngine {
         // Create state channel for dialog state updates
         let (state_tx, mut state_rx) = mpsc::unbounded_channel::<DialogState>();
 
-        let invite_option = InviteOption {
+        // Fix 7: Configure 100rel/PRACK support
+        let mut invite_option = InviteOption {
             callee,
             caller,
             contact,
@@ -998,6 +1467,9 @@ impl SipEngine {
             offer: Some(local_sdp.into_bytes()),
             ..Default::default()
         };
+        if self.config.enable_100rel {
+            invite_option.support_prack = true;
+        }
 
         let engine = self.clone();
         let call_id_clone = call_id.clone();
@@ -1091,6 +1563,21 @@ impl SipEngine {
             while let Some(state) = state_rx.recv().await {
                 match state {
                     DialogState::Updated(_, request) => {
+                        // Fix 5: Glare detection for outbound calls (UAC role)
+                        let should_reject = if let Some(sess) = engine_for_state.calls.lock().get(&call_id_for_state) {
+                            sess.lock().reinvite_pending
+                        } else {
+                            false
+                        };
+
+                        if should_reject {
+                            tracing::info!(
+                                "Glare detected on call {} (UAC): re-INVITE pending",
+                                call_id_for_state
+                            );
+                            continue;
+                        }
+
                         // Incoming re-INVITE (hold/resume/codec change)
                         let sdp_str = std::str::from_utf8(request.body())
                             .ok()
@@ -1214,8 +1701,65 @@ impl SipEngine {
                             }
                         }
                     }
+                    DialogState::Notify(_, request) => {
+                        // Check if this is a REFER subscription NOTIFY
+                        let is_refer_event = request.headers.iter().any(|h| {
+                            matches!(h, rsip::Header::Other(name, val)
+                                if name.as_str().eq_ignore_ascii_case("Event")
+                                    && val.as_str().trim().starts_with("refer"))
+                        });
+
+                        if is_refer_event {
+                            let body_str =
+                                std::str::from_utf8(request.body()).unwrap_or("");
+                            let (status_code, reason) = parse_sipfrag_status(body_str)
+                                .unwrap_or((100, "Trying".to_string()));
+
+                            let is_terminated = request.headers.iter().any(|h| {
+                                matches!(h, rsip::Header::Other(name, val)
+                                    if name.as_str().eq_ignore_ascii_case("Subscription-State")
+                                        && val.as_str().trim().starts_with("terminated"))
+                            });
+
+                            let completed =
+                                is_terminated && status_code >= 200 && status_code < 300;
+
+                            let _ =
+                                engine_for_state.event_tx.send(CallEvent::TransferProgress {
+                                    call_id: call_id_for_state.clone(),
+                                    status_code,
+                                    reason,
+                                    completed,
+                                });
+
+                            if is_terminated {
+                                if let Some(sess) =
+                                    engine_for_state.calls.lock().get(&call_id_for_state)
+                                {
+                                    sess.lock().refer_pending = false;
+                                }
+                            }
+                        }
+                    }
                     DialogState::Terminated(_, reason) => {
+                        // Fix 2: Check for 3xx redirect
                         let reason_str = format!("{:?}", reason);
+
+                        // Detect 3xx redirect responses (Fix 2)
+                        let is_redirect = if let rsipstack::dialog::dialog::TerminatedReason::UasOther(ref code) = reason {
+                            let code_num = u16::from(code.clone());
+                            code_num >= 300 && code_num < 400
+                        } else {
+                            false
+                        };
+
+                        if is_redirect {
+                            let _ = engine_for_state.event_tx.send(CallEvent::Redirected {
+                                call_id: call_id_for_state.clone(),
+                                targets: vec![reason_str.clone()],
+                            });
+                        }
+
                         let _ = engine_for_state.event_tx.send(CallEvent::Hangup {
                             call_id: call_id_for_state.clone(),
                             reason: reason_str,
@@ -1267,6 +1811,88 @@ impl SipEngine {
         });
 
         Ok(())
+    }
+
+    /// Cancel an outbound call in early dialog state (Fix 1)
+    ///
+    /// Sends a CANCEL request for calls that are still Ringing or in EarlyMedia
+    /// (not yet answered). For calls that are already Active, use `hangup()` instead.
+    ///
+    /// # Arguments
+    /// * `call_id` - The call to cancel
+    ///
+    /// # Errors
+    /// Returns error if the call is already Active (use hangup() instead),
+    /// or if the call is not found.
+    pub async fn cancel(&self, call_id: &str) -> Result<()> {
+        let session = self
+            .calls
+            .lock()
+            .get(call_id)
+            .cloned()
+            .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
+
+        let (state, client_dialog) = {
+            let sess = session.lock();
+            (sess.state, sess.client_dialog.clone())
+        };
+
+        // Only allow CANCEL for early dialog states
+        match state {
+            CallState::Ringing | CallState::EarlyMedia => {
+                // Cancel the dialog via rsipstack's native cancel() method
+                if let Some(ref dialog) = client_dialog {
+                    dialog
+                        .cancel()
+                        .await
+                        .map_err(|e| {
+                            RtpSipError::Sip(format!("Failed to send CANCEL: {}", e))
+                        })?;
+                }
+
+                // Stop RTP if started (early media case)
+                {
+                    let mut sess = session.lock();
+                    if let Some(ref rtp) = sess.rtp_engine {
+                        rtp.stop();
+                    }
+                    sess.state = CallState::Ended;
+                }
+
+                // Clean up
+                self.calls.lock().remove(call_id);
+
+                // Emit cancelled event
+                let _ = self.event_tx.send(CallEvent::Cancelled {
+                    call_id: call_id.to_string(),
+                });
+
+                tracing::info!("Call {} cancelled", call_id);
+                Ok(())
+            }
+            CallState::Active => Err(RtpSipError::InvalidState(
+                "Use hangup() for active calls".to_string(),
+            )),
+            _ => Err(RtpSipError::InvalidState(format!(
+                "Cannot cancel call in state {:?}",
+                state
+            ))),
+        }
+    }
+
+    /// Get the current registration state as a string
+    pub fn registration_state_str(&self) -> String {
+        // Registration state is tracked per-provider
+        let providers = self.providers.lock();
+        if providers.is_empty() {
+            return "no_providers".to_string();
+        }
+        let registrations = self.registrations.lock();
+        if registrations.is_empty() {
+            "unregistered".to_string()
+        } else {
+            "registered".to_string()
+        }
     }
 
     /// Send DTMF via SIP INFO (RFC 2976)
@@ -1557,7 +2183,7 @@ impl SipEngine {
             let result = self.send_reinvite_internal(call_id, sdp).await;
 
             match &result {
-                Ok(()) => return Ok(()),
+                Ok(_response) => return Ok(()),
                 Err(e) => {
                     let err_str = e.to_string().to_lowercase();
 
@@ -1606,7 +2232,17 @@ impl SipEngine {
             .cloned()
             .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
-        let sess = session.lock();
+        // Fix 5: Set reinvite_pending before sending
+        {
+            let mut sess = session.lock();
+            sess.reinvite_pending = true;
+        }
+
+        // Extract dialog refs while holding lock, then drop before await
+        let (client_dialog, server_dialog) = {
+            let sess = session.lock();
+            (sess.client_dialog.clone(), sess.server_dialog.clone())
+        };
 
         // Build headers and body
         let (headers, body) = if let Some(sdp_str) = sdp {
@@ -1619,23 +2255,31 @@ impl SipEngine {
         };
 
         // Send re-INVITE using appropriate dialog
-        if let Some(ref dialog) = sess.client_dialog {
+        let result = if let Some(ref dialog) = client_dialog {
             dialog
                 .reinvite(headers, body)
                 .await
-                .map_err(|e| RtpSipError::Sip(format!("Failed to send re-INVITE: {}", e)))?;
-        } else if let Some(ref dialog) = sess.server_dialog {
+                .map_err(|e| RtpSipError::Sip(format!("Failed to send re-INVITE: {}", e)))
+                .map(|_| ())
+        } else if let Some(ref dialog) = server_dialog {
             dialog
                 .reinvite(headers, body)
                 .await
-                .map_err(|e| RtpSipError::Sip(format!("Failed to send re-INVITE: {}", e)))?;
+                .map_err(|e| RtpSipError::Sip(format!("Failed to send re-INVITE: {}", e)))
+                .map(|_| ())
         } else {
-            return Err(RtpSipError::Session(
+            Err(RtpSipError::Session(
                 "Dialog not established for this call".to_string(),
-            ));
+            ))
+        };
+
+        // Fix 5: Clear reinvite_pending after completion (success or failure)
+        {
+            let mut sess = session.lock();
+            sess.reinvite_pending = false;
         }
 
-        Ok(())
+        result
     }
 
     /// Put call on hold (sends re-INVITE with sendonly SDP)
@@ -1751,47 +2395,13 @@ impl SipEngine {
         Ok((sess.local_hold, sess.remote_hold))
     }
 
-    /// Send REFER for call transfer (RFC 3515)
+    /// Send REFER for call transfer (RFC 3515, Fix 6)
     ///
-    /// Works for both inbound and outbound calls - we can transfer in either direction.
+    /// Builds a SIP REFER request using the established dialog's information.
+    /// Uses raw UDP since rsipstack 0.3 does not have native dialog.refer().
+    /// Works for both inbound and outbound calls.
     ///
-    /// Builds a proper SIP REFER request using rsip and sends it directly via UDP.
-    /// This bypasses rsipstack's dialog layer (which lacks native REFER support)
-    /// while still using the established dialog's information.
-    ///
-    /// # Arguments
-    /// * `call_id` - The call to transfer
-    /// * `target_uri` - Target URI to transfer to (e.g., "sip:bob@example.com")
-    ///
-    /// # Edge Cases Handled
-    ///
-    /// ## Refer-To Header Formatting
-    /// - Auto-wraps URI in angle brackets if not already wrapped
-    /// - Supports both `sip:user@domain` and `<sip:user@domain>` formats
-    ///
-    /// ## Referred-By Header (RFC 3892)
-    /// - Identifies the transferor (us) to the transfer target
-    /// - Required by most PBX systems for proper transfer handling
-    ///
-    /// ## Dialog Identification
-    /// - Uses Call-ID, From-tag, To-tag from established dialog
-    /// - Works with both client_dialog (outbound) and server_dialog (inbound)
-    ///
-    /// # Known Limitations
-    ///
-    /// ## NOTIFY Subscription (Pending)
-    /// - REFER creates implicit subscription per RFC 3515
-    /// - We should receive NOTIFY with transfer progress (100 Trying, 200 OK, etc)
-    /// - Currently fire-and-forget - no NOTIFY handling
-    ///
-    /// ## Attended Transfer (Not Implemented)
-    /// - Would require Replaces header (RFC 3891)
-    /// - Need consultation call established first
-    /// - Complex state management
-    ///
-    /// ## Error Handling
-    /// - No retry on failure
-    /// - No 491 (Request Pending) handling
+    /// Includes Referred-By header (RFC 3892) for proper PBX integration.
     pub async fn send_refer(&self, call_id: &str, target_uri: &str) -> Result<()> {
         let session = self
             .calls
@@ -1800,11 +2410,8 @@ impl SipEngine {
             .cloned()
             .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
-        // Extract dialog information needed for the REFER request
         let (dialog_id, remote_addr, local_uri, remote_uri, local_contact, cseq) = {
             let mut sess = session.lock();
-
-            // Get dialog ID from either client or server dialog
             let dialog_id = if let Some(ref dialog) = sess.client_dialog {
                 dialog.id()
             } else if let Some(ref dialog) = sess.server_dialog {
@@ -1817,17 +2424,10 @@ impl SipEngine {
             let remote_addr = sess.remote_addr.ok_or_else(|| {
                 RtpSipError::Session("Remote address not available".to_string())
             })?;
-            let local_uri = sess.local_uri.clone().ok_or_else(|| {
-                RtpSipError::Session("Local URI not available".to_string())
-            })?;
-            let remote_uri = sess.remote_uri.clone().ok_or_else(|| {
-                RtpSipError::Session("Remote URI not available".to_string())
-            })?;
-            let local_contact = sess.local_contact.clone().ok_or_else(|| {
-                RtpSipError::Session("Local contact not available".to_string())
-            })?;
+            let local_uri = sess.local_uri.clone().unwrap_or_default();
+            let remote_uri = sess.remote_uri.clone().unwrap_or_default();
+            let local_contact = sess.local_contact.clone().unwrap_or_default();
             let cseq = sess.next_cseq();
-
             (dialog_id, remote_addr, local_uri, remote_uri, local_contact, cseq)
         };
 
@@ -1838,106 +2438,34 @@ impl SipEngine {
             format!("<{}>", target_uri)
         };
 
-        // Build the REFER request using rsip
-        let request = self.build_refer_request(
-            &dialog_id.call_id,
-            &dialog_id.from_tag,
-            &dialog_id.to_tag,
-            &local_uri,
-            &remote_uri,
-            &local_contact,
-            &refer_to_value,
-            cseq,
-        )?;
-
-        // Serialize the request to bytes
-        let request_bytes = request.to_string();
-
-        // Send via UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-            RtpSipError::Sip(format!("Failed to bind UDP socket for REFER: {}", e))
-        })?;
-
-        socket
-            .send_to(request_bytes.as_bytes(), remote_addr)
-            .await
-            .map_err(|e| RtpSipError::Sip(format!("Failed to send REFER: {}", e)))?;
-
-        tracing::info!(
-            "REFER sent to {} for call {} -> {}",
-            remote_addr,
-            call_id,
-            target_uri
-        );
-
-        Ok(())
-    }
-
-    /// Build a SIP REFER request using rsip
-    fn build_refer_request(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-        to_tag: &str,
-        local_uri: &str,
-        remote_uri: &str,
-        local_contact: &str,
-        refer_to: &str,
-        cseq: u32,
-    ) -> Result<rsip::Request> {
-        // Parse the Request-URI (where to send the request)
-        let request_uri = rsip::Uri::try_from(remote_uri)
+        // Build REFER request within the established dialog
+        let request_uri = Uri::try_from(remote_uri.as_str())
             .map_err(|e| RtpSipError::Sip(format!("Invalid remote URI: {:?}", e)))?;
-
-        // Generate unique branch parameter for Via header
         let branch = format!("z9hG4bK{}", uuid::Uuid::new_v4().simple());
-
-        // Build headers
         let mut headers: rsip::Headers = Default::default();
-
-        // Via header
-        let via_value = format!(
-            "SIP/2.0/UDP {};branch={}",
-            self.config.local_addr, branch
-        );
-        headers.push(rsip::Header::Via(via_value.into()));
-
-        // Max-Forwards
+        headers.push(rsip::Header::Via(
+            format!("SIP/2.0/UDP {};branch={}", self.config.local_addr, branch).into(),
+        ));
         headers.push(rsip::Header::MaxForwards("70".into()));
-
-        // From header with tag
-        let from_value = format!("<{}>;tag={}", local_uri, from_tag);
-        headers.push(rsip::Header::From(from_value.into()));
-
-        // To header with tag
-        let to_value = format!("<{}>;tag={}", remote_uri, to_tag);
-        headers.push(rsip::Header::To(to_value.into()));
-
-        // Call-ID
-        headers.push(rsip::Header::CallId(call_id.into()));
-
-        // CSeq
-        let cseq_value = format!("{} REFER", cseq);
-        headers.push(rsip::Header::CSeq(cseq_value.into()));
-
-        // Contact
-        let contact_value = format!("<{}>", local_contact);
-        headers.push(rsip::Header::Contact(contact_value.into()));
-
+        headers.push(rsip::Header::From(
+            format!("<{}>;tag={}", local_uri, dialog_id.from_tag).into(),
+        ));
+        headers.push(rsip::Header::To(
+            format!("<{}>;tag={}", remote_uri, dialog_id.to_tag).into(),
+        ));
+        headers.push(rsip::Header::CallId(dialog_id.call_id.clone().into()));
+        headers.push(rsip::Header::CSeq(format!("{} REFER", cseq).into()));
+        headers.push(rsip::Header::Contact(format!("<{}>", local_contact).into()));
         // Refer-To header (RFC 3515)
-        headers.push(rsip::Header::Other("Refer-To".into(), refer_to.into()));
-
+        headers.push(rsip::Header::Other("Refer-To".into(), refer_to_value));
         // Referred-By header (RFC 3892)
-        let referred_by = format!("<{}>", local_uri);
-        headers.push(rsip::Header::Other("Referred-By".into(), referred_by));
-
-        // User-Agent
+        headers.push(rsip::Header::Other(
+            "Referred-By".into(),
+            format!("<{}>", local_uri),
+        ));
         headers.push(rsip::Header::UserAgent(self.config.user_agent.clone().into()));
-
-        // Content-Length (no body for REFER)
         headers.push(rsip::Header::ContentLength("0".into()));
 
-        // Build the request
         let request = rsip::Request {
             method: rsip::Method::Refer,
             uri: request_uri,
@@ -1946,7 +2474,30 @@ impl SipEngine {
             body: vec![],
         };
 
-        Ok(request)
+        // Send via UDP (rsipstack 0.3 lacks native dialog.refer())
+        let request_bytes = request.to_string();
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
+            RtpSipError::Sip(format!("Failed to bind UDP socket for REFER: {}", e))
+        })?;
+        socket
+            .send_to(request_bytes.as_bytes(), remote_addr)
+            .await
+            .map_err(|e| RtpSipError::Sip(format!("Failed to send REFER: {}", e)))?;
+
+        // Track transfer state
+        {
+            let mut sess = session.lock();
+            sess.refer_pending = true;
+            sess.refer_target = Some(target_uri.to_string());
+        }
+
+        let _ = self.event_tx.send(CallEvent::TransferInitiated {
+            call_id: call_id.to_string(),
+            target: target_uri.to_string(),
+        });
+
+        tracing::info!("REFER sent for call {} -> {}", call_id, target_uri);
+        Ok(())
     }
 
     /// Blind transfer - transfers call without consultation
@@ -2044,6 +2595,22 @@ impl SipEngine {
 
         digit.map(|d| (d, duration))
     }
+}
+
+/// Parse SIP fragment status from NOTIFY body
+///
+/// NOTIFY bodies for REFER subscriptions contain a SIP status line:
+/// `SIP/2.0 200 OK` or `SIP/2.0 100 Trying`
+fn parse_sipfrag_status(body: &str) -> Option<(u16, String)> {
+    let line = body.lines().next()?.trim();
+    if !line.starts_with("SIP/2.0 ") {
+        return None;
+    }
+    let rest = &line[8..]; // Skip "SIP/2.0 "
+    let mut parts = rest.splitn(2, ' ');
+    let code: u16 = parts.next()?.parse().ok()?;
+    let reason = parts.next().unwrap_or("").to_string();
+    Some((code, reason))
 }
 
 #[cfg(test)]

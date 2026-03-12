@@ -3,15 +3,20 @@
 //! This module provides:
 //! - RTP packet parsing and building using the rtp crate
 //! - G.711 codec (PCMU/PCMA) encoding/decoding using audio-codec-algorithms
-//! - Adaptive jitter buffer with packet loss concealment
-//! - RTP send/receive engine
+//! - Adaptive jitter buffer with packet loss concealment and NACK support
+//! - RTP send/receive engine with media timeout, RTCP-mux, codec asymmetry,
+//!   ptime negotiation, SSRC collision recovery, and marker-bit restart
 //! - RFC 2833/4733 DTMF over RTP (telephone-event)
+//! - SRTP encryption/decryption (RFC 3711) with error recovery
+//! - RTCP (RFC 3550) with RTCP XR VoIP Metrics (RFC 3611)
 
 mod codec;
 pub mod dtmf;
 mod engine;
 mod jitter;
 mod packet;
+pub mod rtcp;
+pub mod srtp;
 
 pub use codec::{CodecType, G711Codec};
 pub use dtmf::{
@@ -21,3 +26,5 @@ pub use dtmf::{
 pub use engine::{RtpEngine, RtpEngineConfig};
 pub use jitter::{JitterBuffer, JitterConfig, JitterStats, PacketLossConcealer};
 pub use packet::{parse_rtp_packet, serialize_rtp_packet, RtpPacket, RtpPacketBuilder};
+pub use rtcp::VoipMetrics;
+pub use srtp::{CryptoAttribute, SrtpCipherSuite, SrtpContext};

@@ -204,6 +204,11 @@ impl PySipRunner {
                 transport: transport.to_string(),
                 tls_cert: None,
                 tls_key: None,
+                timer_t1_ms: None,
+                timer_t2_ms: None,
+                timer_t1x64_ms: None,
+                tls_verify: true,
+                tls_ca_cert: None,
             },
             rtp: RtpConfig {
                 local_ip: rtp_ip.to_string(),
@@ -263,6 +268,7 @@ impl PySipRunner {
             user_agent: Config::user_agent(),
             rtp_port_start: self.config.rtp.port_start,
             rtp_port_end: self.config.rtp.port_end,
+            ..Default::default()
         };
 
         let _guard = self.runtime.enter();
@@ -829,6 +835,41 @@ impl PySipRunner {
     #[getter]
     fn blocked_prefixes(&self) -> Vec<String> {
         self.config.routing.blocked_prefixes.clone()
+    }
+
+    /// Cancel an outbound call before it's answered
+    ///
+    /// Sends SIP CANCEL for calls in Ringing or EarlyMedia state.
+    /// For active calls, use hangup() instead.
+    ///
+    /// Args:
+    ///     call_id: Call ID to cancel
+    fn cancel(&self, py: Python<'_>, call_id: &str) -> PyResult<()> {
+        let engine = self.engine.lock().clone().ok_or_else(|| {
+            PyRuntimeError::new_err("Runner not started")
+        })?;
+
+        let call_id = call_id.to_string();
+        let runtime = self.runtime.clone();
+
+        py.allow_threads(|| {
+            let _guard = runtime.enter();
+            runtime
+                .block_on(engine.cancel(&call_id))
+                .map_err(|e| PyRuntimeError::new_err(format!("Cancel failed: {}", e)))
+        })
+    }
+
+    /// Get current registration state
+    ///
+    /// Returns:
+    ///     str: "registered", "unregistered", or "no_providers"
+    fn registration_state(&self) -> PyResult<String> {
+        let engine = self.engine.lock().clone().ok_or_else(|| {
+            PyRuntimeError::new_err("Runner not started")
+        })?;
+
+        Ok(engine.registration_state_str())
     }
 
     fn __repr__(&self) -> String {

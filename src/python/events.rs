@@ -30,6 +30,27 @@ pub struct PyCallEvent {
     /// DTMF duration in ms (for dtmf_received events)
     #[pyo3(get)]
     pub duration: Option<u32>,
+    /// Transfer target URI (for transfer_initiated, refer_received events)
+    #[pyo3(get)]
+    pub target: Option<String>,
+    /// Status code (for transfer_progress events)
+    #[pyo3(get)]
+    pub status_code: Option<u16>,
+    /// Whether a transfer completed (for transfer_progress events)
+    #[pyo3(get)]
+    pub completed: Option<bool>,
+    /// Redirect target URIs (for redirected events)
+    #[pyo3(get)]
+    pub targets: Option<Vec<String>>,
+    /// Registration/gateway state string (for registration_changed, gateway_health events)
+    #[pyo3(get)]
+    pub state: Option<String>,
+    /// Server address (for gateway_health events)
+    #[pyo3(get)]
+    pub server: Option<String>,
+    /// Health flag (for gateway_health events)
+    #[pyo3(get)]
+    pub healthy: Option<bool>,
 }
 
 #[pymethods]
@@ -85,6 +106,34 @@ impl PyCallEvent {
     fn is_error(&self) -> bool {
         self.event_type == "error"
     }
+
+    fn is_transfer_initiated(&self) -> bool {
+        self.event_type == "transfer_initiated"
+    }
+    fn is_transfer_progress(&self) -> bool {
+        self.event_type == "transfer_progress"
+    }
+    fn is_transfer_failed(&self) -> bool {
+        self.event_type == "transfer_failed"
+    }
+    fn is_refer_received(&self) -> bool {
+        self.event_type == "refer_received"
+    }
+    fn is_cancelled(&self) -> bool {
+        self.event_type == "cancelled"
+    }
+    fn is_redirected(&self) -> bool {
+        self.event_type == "redirected"
+    }
+    fn is_media_timeout(&self) -> bool {
+        self.event_type == "media_timeout"
+    }
+    fn is_registration_changed(&self) -> bool {
+        self.event_type == "registration_changed"
+    }
+    fn is_gateway_health(&self) -> bool {
+        self.event_type == "gateway_health"
+    }
 }
 
 impl From<RustCallEvent> for PyCallEvent {
@@ -100,6 +149,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp: None,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::Ringing { call_id } => PyCallEvent {
                 event_type: "ringing".to_string(),
@@ -111,6 +167,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp: None,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::EarlyMedia { call_id, sdp } => PyCallEvent {
                 event_type: "early_media".to_string(),
@@ -122,6 +185,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::Answered { call_id } => PyCallEvent {
                 event_type: "answered".to_string(),
@@ -133,6 +203,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp: None,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::AudioReady { call_id } => PyCallEvent {
                 event_type: "audio_ready".to_string(),
@@ -144,6 +221,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp: None,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::DtmfReceived { call_id, digit, duration } => PyCallEvent {
                 event_type: "dtmf_received".to_string(),
@@ -155,6 +239,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp: None,
                 digit: Some(digit.to_string()),
                 duration: Some(duration),
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::ReInvite { call_id, sdp } => PyCallEvent {
                 event_type: "reinvite".to_string(),
@@ -166,6 +257,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::Hangup { call_id, reason } => PyCallEvent {
                 event_type: "hangup".to_string(),
@@ -177,6 +275,13 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp: None,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
             },
             RustCallEvent::Error { call_id, error } => PyCallEvent {
                 event_type: "error".to_string(),
@@ -188,6 +293,94 @@ impl From<RustCallEvent> for PyCallEvent {
                 sdp: None,
                 digit: None,
                 duration: None,
+                target: None,
+                status_code: None,
+                completed: None,
+                targets: None,
+                state: None,
+                server: None,
+                healthy: None,
+            },
+            RustCallEvent::TransferInitiated { call_id, target } => PyCallEvent {
+                event_type: "transfer_initiated".to_string(),
+                call_id,
+                from_uri: None, to_uri: None, reason: None, error: None,
+                sdp: None, digit: None, duration: None,
+                target: Some(target),
+                status_code: None, completed: None, targets: None,
+                state: None, server: None, healthy: None,
+            },
+            RustCallEvent::TransferProgress { call_id, status_code, reason, completed } => PyCallEvent {
+                event_type: "transfer_progress".to_string(),
+                call_id,
+                from_uri: None, to_uri: None, reason: Some(reason), error: None,
+                sdp: None, digit: None, duration: None,
+                target: None,
+                status_code: Some(status_code), completed: Some(completed), targets: None,
+                state: None, server: None, healthy: None,
+            },
+            RustCallEvent::TransferFailed { call_id, error } => PyCallEvent {
+                event_type: "transfer_failed".to_string(),
+                call_id,
+                from_uri: None, to_uri: None, reason: None, error: Some(error),
+                sdp: None, digit: None, duration: None,
+                target: None,
+                status_code: None, completed: None, targets: None,
+                state: None, server: None, healthy: None,
+            },
+            RustCallEvent::ReferReceived { call_id, refer_to } => PyCallEvent {
+                event_type: "refer_received".to_string(),
+                call_id,
+                from_uri: None, to_uri: None, reason: None, error: None,
+                sdp: None, digit: None, duration: None,
+                target: Some(refer_to),
+                status_code: None, completed: None, targets: None,
+                state: None, server: None, healthy: None,
+            },
+            RustCallEvent::Cancelled { call_id } => PyCallEvent {
+                event_type: "cancelled".to_string(),
+                call_id,
+                from_uri: None, to_uri: None, reason: None, error: None,
+                sdp: None, digit: None, duration: None,
+                target: None,
+                status_code: None, completed: None, targets: None,
+                state: None, server: None, healthy: None,
+            },
+            RustCallEvent::Redirected { call_id, targets } => PyCallEvent {
+                event_type: "redirected".to_string(),
+                call_id,
+                from_uri: None, to_uri: None, reason: None, error: None,
+                sdp: None, digit: None, duration: None,
+                target: None,
+                status_code: None, completed: None, targets: Some(targets),
+                state: None, server: None, healthy: None,
+            },
+            RustCallEvent::MediaTimeout { call_id } => PyCallEvent {
+                event_type: "media_timeout".to_string(),
+                call_id,
+                from_uri: None, to_uri: None, reason: None, error: None,
+                sdp: None, digit: None, duration: None,
+                target: None,
+                status_code: None, completed: None, targets: None,
+                state: None, server: None, healthy: None,
+            },
+            RustCallEvent::RegistrationChanged { state, error } => PyCallEvent {
+                event_type: "registration_changed".to_string(),
+                call_id: String::new(),
+                from_uri: None, to_uri: None, reason: None, error,
+                sdp: None, digit: None, duration: None,
+                target: None,
+                status_code: None, completed: None, targets: None,
+                state: Some(state), server: None, healthy: None,
+            },
+            RustCallEvent::GatewayHealth { server, healthy } => PyCallEvent {
+                event_type: "gateway_health".to_string(),
+                call_id: String::new(),
+                from_uri: None, to_uri: None, reason: None, error: None,
+                sdp: None, digit: None, duration: None,
+                target: None,
+                status_code: None, completed: None, targets: None,
+                state: None, server: Some(server), healthy: Some(healthy),
             },
         }
     }

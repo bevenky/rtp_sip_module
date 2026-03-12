@@ -693,6 +693,11 @@ impl DtmfPacket {
     }
 }
 
+/// Minimum interdigit gap in timestamp units (80ms at 8kHz = 640 samples).
+/// Packets arriving within this gap after an END are suppressed to prevent
+/// overlap between consecutive DTMF digits.
+const DTMF_INTERDIGIT_GAP: u32 = 640;
+
 /// RFC 2833 DTMF detector
 ///
 /// Tracks incoming DTMF events with sanity checking and deduplication.
@@ -723,6 +728,11 @@ impl DtmfPacket {
 /// - 16-bit duration field wraps at 0xFFFF (~8.19 seconds at 8kHz).
 /// - When duration decreases while timestamp stays same, we accumulate.
 /// - Detection threshold: when duration > 0xFC17 (~7.9s) and then decreases.
+///
+/// ## Interdigit Overlap Protection
+/// - After an END packet, new digits arriving within 80ms (640 samples at
+///   8kHz) are suppressed to prevent glitchy duplicate detection at digit
+///   boundaries.
 ///
 /// ## 4-Byte Payload Offset
 /// - Some SBCs/gateways send DTMF with 4 bytes of zero padding.
@@ -775,6 +785,9 @@ pub struct DtmfDetector {
     expected_pt: u8,
     /// Queue for detected digits
     detected_queue: Mutex<Vec<DetectedDtmf>>,
+    /// Timestamp of the last END packet, for interdigit overlap protection.
+    /// 0 means no previous END has been seen.
+    last_end_timestamp: AtomicU32,
 }
 
 impl DtmfDetector {
@@ -790,6 +803,7 @@ impl DtmfDetector {
             current_digit: Mutex::new(None),
             expected_pt: TELEPHONE_EVENT_PT,
             detected_queue: Mutex::new(Vec::new()),
+            last_end_timestamp: AtomicU32::new(0),
         }
     }
 
@@ -810,6 +824,7 @@ impl DtmfDetector {
         self.duration_flip.store(0, Ordering::Relaxed);
         *self.current_digit.lock() = None;
         self.detected_queue.lock().clear();
+        self.last_end_timestamp.store(0, Ordering::Relaxed);
     }
 
     /// Process incoming RTP packet
@@ -840,6 +855,26 @@ impl DtmfDetector {
 
         let dtmf = DtmfPayload::parse(payload)?;
         let event = DtmfEvent::from_code(dtmf.event)?;
+
+        // Interdigit overlap protection: suppress new digits arriving within
+        // 80ms (640 samples at 8kHz) of the last END packet.
+        let last_end_ts = self.last_end_timestamp.load(Ordering::Relaxed);
+        if last_end_ts != 0 {
+            if timestamp == last_end_ts {
+                // Same timestamp as previous END — this is a redundant END
+                // packet or continuation of the same digit.  Allow it only
+                // if it carries the END bit (redundancy); otherwise drop.
+                if !dtmf.is_end {
+                    return None;
+                }
+            } else {
+                let gap = timestamp.wrapping_sub(last_end_ts);
+                // Only enforce gap for small forward differences (not wraparound)
+                if gap < DTMF_INTERDIGIT_GAP && gap < 0x8000_0000 {
+                    return None;
+                }
+            }
+        }
 
         let last_ts = self.in_digit_ts.swap(timestamp, Ordering::Relaxed);
         let _last_seq = self.in_digit_seq.swap(sequence, Ordering::Relaxed);
@@ -902,6 +937,9 @@ impl DtmfDetector {
 
             // Reset flip for next digit
             self.duration_flip.store(0, Ordering::Relaxed);
+
+            // Record end timestamp for interdigit overlap protection
+            self.last_end_timestamp.store(timestamp, Ordering::Relaxed);
 
             // Queue it
             self.detected_queue.lock().push(result.clone());
@@ -1295,5 +1333,59 @@ mod tests {
         assert_eq!((bytes[2] as u16) << 8 | bytes[3] as u16, 0x1234); // seq
         assert_eq!(bytes[12], 5); // event
         assert_eq!(bytes[13], 0x8A); // end + volume
+    }
+
+    // === Interdigit Overlap Protection Tests ===
+
+    #[test]
+    fn test_dtmf_interdigit_overlap_same_timestamp() {
+        // After an END packet, non-END packets at the same timestamp should
+        // be suppressed (they are late arrivals for the already-completed digit).
+        let detector = DtmfDetector::new();
+
+        // Digit '5' with END at timestamp 1000
+        let end_payload = [5, 0x8A, 0, 160]; // end=true
+        let result = detector.process_rtp(101, 1, 1000, &end_payload);
+        assert!(result.is_some());
+
+        // Non-END packet at the same timestamp — should be suppressed
+        let late_payload = [5, 0x0A, 0, 200]; // end=false, same ts
+        let result = detector.process_rtp(101, 2, 1000, &late_payload);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dtmf_interdigit_gap_too_short() {
+        // A new digit arriving within 80ms (640 samples) after the last END
+        // should be suppressed.
+        let detector = DtmfDetector::new();
+
+        // First digit END at timestamp 1000
+        let end_payload = [5, 0x8A, 0, 160];
+        let result = detector.process_rtp(101, 1, 1000, &end_payload);
+        assert!(result.is_some());
+
+        // New digit at timestamp 1000 + 320 (only 40ms gap) — too close
+        let new_digit = [6, 0x8A, 0, 160]; // end=true
+        let result = detector.process_rtp(101, 2, 1320, &new_digit);
+        assert!(result.is_none(), "Digit within interdigit gap should be suppressed");
+    }
+
+    #[test]
+    fn test_dtmf_interdigit_gap_sufficient() {
+        // A new digit arriving >= 80ms (640 samples) after the last END
+        // should be accepted.
+        let detector = DtmfDetector::new();
+
+        // First digit END at timestamp 1000
+        let end_payload = [5, 0x8A, 0, 160];
+        let result = detector.process_rtp(101, 1, 1000, &end_payload);
+        assert!(result.is_some());
+
+        // New digit at timestamp 1000 + 800 (100ms gap) — sufficient
+        let new_digit = [6, 0x8A, 0, 160]; // end=true
+        let result = detector.process_rtp(101, 2, 1800, &new_digit);
+        assert!(result.is_some(), "Digit beyond interdigit gap should be accepted");
+        assert_eq!(result.unwrap().digit, '6');
     }
 }

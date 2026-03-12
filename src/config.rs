@@ -9,19 +9,45 @@ use std::path::Path;
 /// SIP configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SipConfig {
-    /// Local IP to bind SIP socket
+    /// Local IP to bind SIP socket.
+    ///
+    /// Use "0.0.0.0" for IPv4 any-address, or "::" for IPv6 any-address (Fix 13).
+    /// When using "::", the SIP engine will bind to all IPv6 (and typically
+    /// IPv4-mapped) addresses.
     #[serde(default = "default_local_ip")]
     pub local_ip: String,
     /// Local SIP port
     #[serde(default = "default_sip_port")]
     pub local_port: u16,
-    /// Transport: "udp" or "tls"
+    /// Transport: "udp", "tcp", or "tls"
     #[serde(default = "default_transport")]
     pub transport: String,
     /// TLS certificate path
     pub tls_cert: Option<String>,
     /// TLS key path
     pub tls_key: Option<String>,
+
+    // --- Fix 3: Transaction timer configuration (RFC 3261) ---
+
+    /// Timer T1: RTT estimate in milliseconds (default 500ms).
+    /// Controls initial retransmission interval for unreliable transports.
+    pub timer_t1_ms: Option<u32>,
+    /// Timer T2: Maximum retransmit interval in milliseconds (default 4000ms).
+    /// Non-INVITE retransmissions cap at this interval.
+    pub timer_t2_ms: Option<u32>,
+    /// Timer T1x64: Maximum retransmit time in milliseconds (default 32000ms).
+    /// Transaction timeout after this duration.
+    pub timer_t1x64_ms: Option<u32>,
+
+    // --- Fix 11: TLS support ---
+
+    /// Verify server TLS certificate (default true).
+    /// Set to false for self-signed certificates in development.
+    #[serde(default = "default_true")]
+    pub tls_verify: bool,
+    /// Path to CA certificate for TLS verification.
+    /// If not specified, system trust store is used.
+    pub tls_ca_cert: Option<String>,
 }
 
 impl Default for SipConfig {
@@ -32,6 +58,49 @@ impl Default for SipConfig {
             transport: default_transport(),
             tls_cert: None,
             tls_key: None,
+            timer_t1_ms: None,
+            timer_t2_ms: None,
+            timer_t1x64_ms: None,
+            tls_verify: true,
+            tls_ca_cert: None,
+        }
+    }
+}
+
+/// SIP transport type (Fix 11)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Transport {
+    /// UDP transport (default)
+    Udp,
+    /// TCP transport
+    Tcp,
+    /// TLS transport (SIP over TLS / SIPS)
+    Tls,
+}
+
+impl Transport {
+    /// Parse from a transport string (case-insensitive)
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "tls" => Transport::Tls,
+            "tcp" => Transport::Tcp,
+            _ => Transport::Udp,
+        }
+    }
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Transport::Udp
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Transport::Udp => write!(f, "udp"),
+            Transport::Tcp => write!(f, "tcp"),
+            Transport::Tls => write!(f, "tls"),
         }
     }
 }
@@ -130,9 +199,12 @@ impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
         // Check transport
-        if self.sip.transport != "udp" && self.sip.transport != "tls" {
+        if self.sip.transport != "udp"
+            && self.sip.transport != "tcp"
+            && self.sip.transport != "tls"
+        {
             return Err(RtpSipError::Config(format!(
-                "Invalid transport '{}'. Must be 'udp' or 'tls'",
+                "Invalid transport '{}'. Must be 'udp', 'tcp', or 'tls'",
                 self.sip.transport
             )));
         }
@@ -239,6 +311,11 @@ impl Config {
         self.sip.transport == "tls"
     }
 
+    /// Get the parsed transport type (Fix 11)
+    pub fn transport(&self) -> Transport {
+        Transport::from_str_lossy(&self.sip.transport)
+    }
+
     /// Get provider by name
     pub fn get_provider(&self, name: &str) -> Option<&ProviderConfig> {
         self.providers.iter().find(|p| p.name == name)
@@ -264,6 +341,10 @@ fn default_rtp_port_start() -> u16 {
 
 fn default_rtp_port_end() -> u16 {
     20000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
