@@ -1,7 +1,7 @@
 //! Media hooks/tapping for audio forking
 //!
-//! Provides non-intrusive audio tapping similar to FreeSWITCH "media bugs"
-//! (switch_core_media_bug). Taps receive a copy of decoded audio frames
+//! Provides non-intrusive audio tapping ("media bugs"). Taps receive a
+//! copy of decoded audio frames
 //! without modifying the original audio stream.
 //!
 //! Use cases:
@@ -62,6 +62,12 @@ pub struct AudioFrame {
     pub direction: TapDirection,
 }
 
+/// Default channel capacity for media taps.
+/// 1000 packets at 50 packets/second (20ms ptime) = ~20 seconds of audio.
+/// This provides backpressure to prevent OOM from slow consumers while
+/// still allowing reasonable buffering for transient slowness.
+const DEFAULT_TAP_CHANNEL_CAPACITY: usize = 1000;
+
 /// A single media tap registration
 struct MediaTap {
     /// Unique identifier for this tap (stored for debug/logging)
@@ -70,17 +76,21 @@ struct MediaTap {
     /// Direction(s) to capture
     direction: TapDirection,
     /// Channel sender for delivering frames to the consumer.
-    /// Uses unbounded channel to prevent backpressure on the RTP path.
-    tx: mpsc::UnboundedSender<AudioFrame>,
+    /// Uses bounded channel with capacity DEFAULT_TAP_CHANNEL_CAPACITY to
+    /// provide backpressure and prevent OOM from slow consumers. When full,
+    /// the oldest frame concept is approximated by dropping the current frame
+    /// and logging a warning.
+    tx: mpsc::Sender<AudioFrame>,
 }
 
 /// Manages multiple media taps on a single RTP stream
 ///
 /// Thread-safe: all operations are protected by an internal Mutex.
-/// The distribute methods use `try_send` (unbounded) which never blocks,
-/// ensuring the RTP processing path is not affected by slow consumers.
-/// If a consumer's channel is closed (dropped receiver), the tap is
-/// automatically removed.
+/// The distribute methods use `try_send` which never blocks, ensuring the
+/// RTP processing path is not affected by slow consumers. If a consumer's
+/// channel is full, the frame is dropped and a warning is logged. If a
+/// consumer's channel is closed (dropped receiver), the tap is automatically
+/// removed.
 pub struct MediaTapManager {
     taps: Mutex<HashMap<String, MediaTap>>,
     next_id: Mutex<u64>,
@@ -99,11 +109,12 @@ impl MediaTapManager {
     ///
     /// Returns `(tap_id, receiver)` where receiver yields `AudioFrame`s.
     /// The tap is automatically removed when the receiver is dropped.
+    /// The channel has a bounded capacity of ~20 seconds of audio at 50pps.
     pub fn add_tap(
         &self,
         direction: TapDirection,
-    ) -> (String, mpsc::UnboundedReceiver<AudioFrame>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> (String, mpsc::Receiver<AudioFrame>) {
+        let (tx, rx) = mpsc::channel(DEFAULT_TAP_CHANNEL_CAPACITY);
 
         let id = {
             let mut next = self.next_id.lock();
@@ -157,8 +168,10 @@ impl MediaTapManager {
 
     /// Distribute an Rx (received) audio frame to all matching taps.
     ///
-    /// Non-blocking: uses unbounded channel send. If a consumer's channel
-    /// is closed, that tap is automatically removed.
+    /// Non-blocking: uses `try_send` on bounded channel. If a consumer's
+    /// channel is full, the frame is dropped and a warning is logged.
+    /// If a consumer's channel is closed (receiver dropped), the tap is
+    /// automatically removed.
     pub fn distribute_rx(&self, samples: &[i16], sample_rate: u32, timestamp: u32) {
         let mut taps = self.taps.lock();
         let mut closed_taps: Vec<String> = Vec::new();
@@ -171,9 +184,18 @@ impl MediaTapManager {
                     timestamp,
                     direction: TapDirection::Rx,
                 };
-                if tap.tx.send(frame).is_err() {
-                    // Receiver dropped — mark for cleanup
-                    closed_taps.push(id.clone());
+                match tap.tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            tap_id = %id,
+                            "media tap rx channel full, dropping frame (slow consumer)"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Receiver dropped — mark for cleanup
+                        closed_taps.push(id.clone());
+                    }
                 }
             }
         }
@@ -186,8 +208,10 @@ impl MediaTapManager {
 
     /// Distribute a Tx (transmitted) audio frame to all matching taps.
     ///
-    /// Non-blocking: uses unbounded channel send. If a consumer's channel
-    /// is closed, that tap is automatically removed.
+    /// Non-blocking: uses `try_send` on bounded channel. If a consumer's
+    /// channel is full, the frame is dropped and a warning is logged.
+    /// If a consumer's channel is closed (receiver dropped), the tap is
+    /// automatically removed.
     pub fn distribute_tx(&self, samples: &[i16], sample_rate: u32, timestamp: u32) {
         let mut taps = self.taps.lock();
         let mut closed_taps: Vec<String> = Vec::new();
@@ -200,9 +224,18 @@ impl MediaTapManager {
                     timestamp,
                     direction: TapDirection::Tx,
                 };
-                if tap.tx.send(frame).is_err() {
-                    // Receiver dropped — mark for cleanup
-                    closed_taps.push(id.clone());
+                match tap.tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            tap_id = %id,
+                            "media tap tx channel full, dropping frame (slow consumer)"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Receiver dropped — mark for cleanup
+                        closed_taps.push(id.clone());
+                    }
                 }
             }
         }
@@ -423,20 +456,43 @@ mod tests {
         assert_ne!(id1, id3);
     }
 
-    #[test]
-    fn test_audio_frame_clone() {
-        let frame = AudioFrame {
-            samples: vec![100, 200, 300],
-            sample_rate: 8000,
-            timestamp: 1000,
-            direction: TapDirection::Rx,
-        };
+    // test_audio_frame_clone removed: just testing derive(Clone)
 
-        let cloned = frame.clone();
-        assert_eq!(cloned.samples, frame.samples);
-        assert_eq!(cloned.sample_rate, frame.sample_rate);
-        assert_eq!(cloned.timestamp, frame.timestamp);
-        assert_eq!(cloned.direction, frame.direction);
+    #[test]
+    fn test_channel_full_drops_frame_does_not_block() {
+        // Verify that when the bounded channel is full, distribute_rx/tx
+        // drops frames instead of blocking (which would stall the RTP path).
+        let manager = MediaTapManager::new();
+        let (_id, _rx) = manager.add_tap(TapDirection::Rx);
+
+        // Fill the channel to capacity (DEFAULT_TAP_CHANNEL_CAPACITY = 1000)
+        let samples: Vec<i16> = vec![42; 160];
+        for i in 0..DEFAULT_TAP_CHANNEL_CAPACITY {
+            manager.distribute_rx(&samples, 8000, i as u32);
+        }
+
+        // This should NOT block -- the frame should be dropped.
+        // If this call blocks, the test will hang (and timeout), catching the bug.
+        manager.distribute_rx(&samples, 8000, 9999);
+
+        // The manager should still be functional; tap should still exist
+        // (channel full != channel closed).
+        assert_eq!(manager.tap_count(), 1);
+    }
+
+    #[test]
+    fn test_channel_full_tx_drops_frame() {
+        let manager = MediaTapManager::new();
+        let (_id, _rx) = manager.add_tap(TapDirection::Tx);
+
+        let samples: Vec<i16> = vec![42; 160];
+        for i in 0..DEFAULT_TAP_CHANNEL_CAPACITY {
+            manager.distribute_tx(&samples, 8000, i as u32);
+        }
+
+        // Should not block
+        manager.distribute_tx(&samples, 8000, 9999);
+        assert_eq!(manager.tap_count(), 1);
     }
 
     #[test]

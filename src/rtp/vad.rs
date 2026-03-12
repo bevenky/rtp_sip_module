@@ -1,165 +1,447 @@
 //! Voice Activity Detection (VAD) / Silence Detection
 //!
-//! Energy-based VAD for detecting silence in audio streams. Used to trigger
-//! comfort noise generation (CNG) and optimize bandwidth by suppressing
-//! silence packets.
-//!
-//! Modeled after FreeSWITCH's `switch_vad` which uses RMS energy thresholds
-//! with hangover to prevent choppy voice/silence transitions.
+//! Energy-based VAD for detecting voice/silence in audio streams.
+//! Used to trigger comfort noise generation (CNG) and optimize
+//! bandwidth by suppressing silence packets.
 //!
 //! # Algorithm
 //!
-//! 1. Compute RMS energy of each audio frame: `sqrt(sum(sample^2) / n)`
-//! 2. Compare against configurable threshold (~250 RMS = -30 dBFS for 16-bit PCM)
-//! 3. Transition to silence only after `hangover_frames` consecutive silent frames
-//! 4. Transition back to voice immediately on detection
+//! 1. Compute mean absolute energy of each frame: `sum(|sample|) / (n / divisor)`
+//!    where `divisor = sample_rate / 8000` normalizes across sample rates
+//! 2. Compare against configurable threshold (default 100)
+//! 3. Voice onset: require sustained energy above threshold for `voice_onset_ms`
+//!    (default 200ms) before emitting `StartTalking`
+//! 4. Silence holdoff: require sustained silence for `silence_holdoff_ms`
+//!    (default 500ms) before emitting `StopTalking`
+//! 5. `StartTalking` and `StopTalking` are one-shot transition events that
+//!    automatically advance to `Talking` and `None` on the next call
+//!
+//! # Multi-channel Support
+//!
+//! For interleaved multi-channel audio, set `channels > 1`. The VAD
+//! processes only channel 0 using stride-based access (`j += channels`),
+//! and the `samples` parameter to `process()` is the per-channel count.
+//!
+//! # VAD Modes
+//!
+//! - `VadMode::Energy` (default): Pure energy-based detection
+//! - `VadMode::Quality` through `VadMode::VeryAggressive`: WebRTC-style
+//!   detection modes. When enabled, the binary voice/non-voice result
+//!   is mapped to the energy score for the same state machine:
+//!   voice → `threshold + 100`, non-voice → `0`.
+//!
+//! # State Machine
+//!
+//! ```text
+//!  ┌──────┐  energy > thresh   ┌──────────────┐  onset confirmed  ┌────────────────┐
+//!  │ None │ ──── count ────→  │ (onset count) │ ────────────────→ │  StartTalking  │
+//!  └──────┘  for onset_ms     └──────────────┘                   └───────┬────────┘
+//!     ↑                                                                  │ auto
+//!     │                                                                  ▼
+//!     │                                                           ┌─────────┐
+//!     │  silence_holdoff_ms                                       │ Talking │
+//!     │  ◀──────────────────── silence count ◀────────────────── └────┬────┘
+//!     │                                                               │
+//!     │                        ┌──────────────┐                       │
+//!     └──── auto ◀──────────── │ StopTalking  │ ◀──── holdoff done ──┘
+//!                              └──────────────┘
+//! ```
 //!
 //! # Example
 //!
 //! ```
 //! use rtpsip::rtp::vad::{VoiceActivityDetector, VadState};
 //!
-//! let mut vad = VoiceActivityDetector::new();
+//! let mut vad = VoiceActivityDetector::new(8000);
 //!
 //! // Process a 20ms frame of silence (160 samples at 8kHz)
 //! let silence = vec![0i16; 160];
-//! let has_voice = vad.process(&silence);
-//! assert!(!has_voice);
-//! assert_eq!(vad.state(), VadState::Silence);
+//! let state = vad.process(&silence);
+//! assert_eq!(state, VadState::None);
 //! ```
 
-/// Voice activity state
+/// Voice Activity Detection states
+///
+/// The state machine has four states. `StartTalking` and `StopTalking` are
+/// one-shot transition events — they are emitted exactly once and then
+/// automatically advance to `Talking` or `None` on the next `process()` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VadState {
-    /// Voice (or non-silence) detected
-    Voice,
-    /// Silence detected (after hangover period)
-    Silence,
+    /// Silence / no voice detected (initial state)
+    None,
+    /// One-shot: voice onset just confirmed (will become `Talking` next frame)
+    StartTalking,
+    /// Sustained voice activity
+    Talking,
+    /// One-shot: silence onset just confirmed (will become `None` next frame)
+    StopTalking,
 }
 
 impl std::fmt::Display for VadState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VadState::Voice => write!(f, "Voice"),
-            VadState::Silence => write!(f, "Silence"),
+            VadState::None => write!(f, "None"),
+            VadState::StartTalking => write!(f, "StartTalking"),
+            VadState::Talking => write!(f, "Talking"),
+            VadState::StopTalking => write!(f, "StopTalking"),
         }
+    }
+}
+
+impl VadState {
+    /// Returns true if this state represents active voice (StartTalking or Talking)
+    pub fn is_talking(&self) -> bool {
+        matches!(self, VadState::StartTalking | VadState::Talking)
+    }
+
+    /// Returns true if this state represents silence (None or StopTalking)
+    pub fn is_silent(&self) -> bool {
+        matches!(self, VadState::None | VadState::StopTalking)
+    }
+}
+
+/// VAD detection mode
+///
+/// Controls how voice activity is detected. `Energy` uses mean absolute
+/// energy (default). The WebRTC-style modes (Quality through VeryAggressive)
+/// use a more sophisticated detection algorithm that maps binary
+/// voice/non-voice results to the energy score for the same state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VadMode {
+    /// Pure energy-based detection (default)
+    Energy,
+    /// WebRTC-style mode 0: highest quality, least aggressive
+    Quality,
+    /// WebRTC-style mode 1: low bitrate
+    LowBitrate,
+    /// WebRTC-style mode 2: aggressive
+    Aggressive,
+    /// WebRTC-style mode 3: most aggressive, may clip speech edges
+    VeryAggressive,
+}
+
+impl VadMode {
+    /// Returns the numeric mode index for WebRTC-style modes, or -1 for Energy.
+    #[cfg(test)]
+    fn mode_index(&self) -> i32 {
+        match self {
+            VadMode::Energy => -1,
+            VadMode::Quality => 0,
+            VadMode::LowBitrate => 1,
+            VadMode::Aggressive => 2,
+            VadMode::VeryAggressive => 3,
+        }
+    }
+
+    /// Whether this mode uses WebRTC-style detection
+    pub fn is_webrtc_style(&self) -> bool {
+        *self != VadMode::Energy
     }
 }
 
 /// Energy-based Voice Activity Detector
 ///
-/// Uses RMS energy thresholds with a hangover mechanism to provide
-/// stable voice/silence classification. The hangover prevents rapid
-/// toggling during natural speech pauses.
+/// Uses mean absolute energy with sample-rate normalization, voice onset
+/// confirmation, and silence holdoff.
+///
+/// Supports multi-channel interleaved audio (processes channel 0 only)
+/// and optional WebRTC-style detection modes.
 pub struct VoiceActivityDetector {
-    /// Energy threshold (RMS) below which audio is considered silence
-    threshold: f64,
-    /// Number of consecutive silent frames before declaring silence
-    hangover_frames: u32,
-    /// Current silent frame counter
-    silent_count: u32,
+    /// Energy threshold (mean absolute, normalized)
+    threshold: u32,
+    /// Sample rate (Hz)
+    sample_rate: u32,
+    /// Divisor for sample-rate normalization: sample_rate / 8000
+    divisor: u32,
+    /// Number of interleaved audio channels (1 = mono)
+    channels: u32,
+
+    /// Voice onset confirmation: samples of sustained voice needed
+    voice_onset_samples: u32,
+    /// Silence holdoff: samples of sustained silence before StopTalking
+    silence_holdoff_samples: u32,
+
+    /// Accumulated voice samples during onset confirmation
+    voice_sample_count: u32,
+    /// Accumulated silence samples during holdoff
+    silence_sample_count: u32,
+
     /// Current VAD state
     state: VadState,
-    /// RMS energy of the last processed frame
-    last_energy: f64,
+    /// Energy of the last processed frame (mean absolute, normalized)
+    last_energy: u32,
+
+    /// Detection mode
+    mode: VadMode,
 }
 
 impl VoiceActivityDetector {
-    /// Create a new Voice Activity Detector with default settings
+    /// Create a new Voice Activity Detector with production defaults
     ///
     /// Defaults:
-    /// - Threshold: 250.0 RMS (~-30 dBFS for 16-bit PCM)
-    /// - Hangover: 10 frames (200ms at 20ms frame size)
-    pub fn new() -> Self {
-        Self {
-            threshold: 250.0,
-            hangover_frames: 10,
-            silent_count: 0,
-            state: VadState::Silence,
-            last_energy: 0.0,
-        }
-    }
-
-    /// Create a VAD with custom threshold and hangover
+    /// - Threshold: 100 (mean absolute energy, normalized)
+    /// - Voice onset: 200ms of sustained voice before StartTalking
+    /// - Silence holdoff: 500ms of sustained silence before StopTalking
+    /// - Channels: 1 (mono)
+    /// - Mode: Energy
     ///
     /// # Arguments
-    /// - `threshold` - RMS energy threshold (clamped to >= 0.0)
-    /// - `hangover_frames` - Number of consecutive silent frames before
-    ///   transitioning to silence state
-    pub fn with_config(threshold: f64, hangover_frames: u32) -> Self {
+    /// - `sample_rate` - Audio sample rate in Hz (8000, 16000, etc.)
+    pub fn new(sample_rate: u32) -> Self {
+        let sample_rate = sample_rate.max(8000);
+        let divisor = (sample_rate / 8000).max(1);
         Self {
-            threshold: threshold.max(0.0),
-            hangover_frames,
-            silent_count: 0,
-            state: VadState::Silence,
-            last_energy: 0.0,
+            threshold: 100,
+            sample_rate,
+            divisor,
+            channels: 1,
+            voice_onset_samples: 200 * (sample_rate / 1000),
+            silence_holdoff_samples: 500 * (sample_rate / 1000),
+            voice_sample_count: 0,
+            silence_sample_count: 0,
+            state: VadState::None,
+            last_energy: 0,
+            mode: VadMode::Energy,
         }
     }
 
-    /// Set the energy threshold (default 250 RMS)
+    /// Create a VAD with custom configuration
     ///
-    /// Higher values make the detector less sensitive (more audio classified
-    /// as silence). Lower values make it more sensitive.
+    /// # Arguments
+    /// - `sample_rate` - Audio sample rate in Hz
+    /// - `threshold` - Mean absolute energy threshold (default 100)
+    /// - `voice_onset_ms` - Milliseconds of sustained voice before StartTalking (default 200)
+    /// - `silence_holdoff_ms` - Milliseconds of sustained silence before StopTalking (default 500)
+    pub fn with_config(
+        sample_rate: u32,
+        threshold: u32,
+        voice_onset_ms: u32,
+        silence_holdoff_ms: u32,
+    ) -> Self {
+        let sample_rate = sample_rate.max(8000);
+        let divisor = (sample_rate / 8000).max(1);
+        Self {
+            threshold,
+            sample_rate,
+            divisor,
+            channels: 1,
+            voice_onset_samples: sample_rate * voice_onset_ms / 1000,
+            silence_holdoff_samples: sample_rate * silence_holdoff_ms / 1000,
+            voice_sample_count: 0,
+            silence_sample_count: 0,
+            state: VadState::None,
+            last_energy: 0,
+            mode: VadMode::Energy,
+        }
+    }
+
+    /// Set the number of interleaved audio channels.
     ///
-    /// Reference points for 16-bit PCM:
-    /// - ~50 RMS: very quiet background noise
-    /// - ~250 RMS: typical silence threshold (~-30 dBFS)
-    /// - ~1000 RMS: moderate speech
-    /// - ~10000 RMS: loud speech
-    pub fn set_threshold(&mut self, threshold: f64) {
-        self.threshold = threshold.max(0.0);
+    /// When `channels > 1`, the VAD processes only channel 0 by
+    /// striding through the interleaved buffer. The `samples` slice
+    /// passed to `process()` contains all channels interleaved,
+    /// and `per_channel_count = samples.len() / channels`.
+    pub fn set_channels(&mut self, channels: u32) {
+        self.channels = channels.max(1);
+    }
+
+    /// Get the number of configured channels
+    pub fn channels(&self) -> u32 {
+        self.channels
+    }
+
+    /// Set the VAD detection mode.
+    ///
+    /// - `VadMode::Energy`: pure energy-based (default)
+    /// - `VadMode::Quality` through `VadMode::VeryAggressive`: WebRTC-style
+    pub fn set_mode(&mut self, mode: VadMode) {
+        self.mode = mode;
+    }
+
+    /// Get the current VAD mode
+    pub fn mode(&self) -> VadMode {
+        self.mode
+    }
+
+    /// Set the energy threshold (default 100)
+    ///
+    /// This is the mean absolute energy threshold, normalized by sample rate.
+    /// Higher values = less sensitive. Lower values = more sensitive.
+    pub fn set_threshold(&mut self, threshold: u32) {
+        self.threshold = threshold;
     }
 
     /// Get the current energy threshold
-    pub fn threshold(&self) -> f64 {
+    pub fn threshold(&self) -> u32 {
         self.threshold
     }
 
-    /// Set hangover duration in frames (default 10 = 200ms at 20ms frames)
+    /// Set voice onset confirmation duration in milliseconds (default 200)
     ///
-    /// The hangover prevents choppy detection during natural speech pauses.
-    /// A value of 0 disables hangover (immediate silence transition).
-    pub fn set_hangover(&mut self, frames: u32) {
-        self.hangover_frames = frames;
+    /// Voice must persist this long before `StartTalking` is emitted.
+    /// Prevents false triggers from transient noises.
+    pub fn set_voice_onset_ms(&mut self, ms: u32) {
+        self.voice_onset_samples = self.sample_rate * ms / 1000;
     }
 
-    /// Get the current hangover frame count
-    pub fn hangover(&self) -> u32 {
-        self.hangover_frames
+    /// Set silence holdoff duration in milliseconds (default 500)
+    ///
+    /// Silence must persist this long before `StopTalking` is emitted.
+    /// Prevents premature silence detection during natural speech pauses.
+    pub fn set_silence_holdoff_ms(&mut self, ms: u32) {
+        self.silence_holdoff_samples = self.sample_rate * ms / 1000;
     }
 
-    /// Process one audio frame (typically 160 samples at 8kHz = 20ms)
+    /// Get the configured sample rate
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Process one audio frame and return the resulting VAD state
     ///
-    /// Returns `true` if the frame contains voice activity, `false` if silence.
+    /// The state machine:
+    /// - `None` → accumulates voice samples → `StartTalking` when onset confirmed
+    /// - `StartTalking` → automatically becomes `Talking`
+    /// - `Talking` → accumulates silence samples → `StopTalking` when holdoff expires
+    /// - `StopTalking` → automatically becomes `None`
     ///
-    /// The state machine works as follows:
-    /// - Voice -> Silence: only after `hangover_frames` consecutive below-threshold frames
-    /// - Silence -> Voice: immediately on first above-threshold frame
+    /// For multi-channel interleaved audio, `samples` contains all channels
+    /// interleaved. The per-channel sample count is `samples.len() / channels`.
     ///
-    /// An empty slice is treated as silence (energy = 0.0).
-    pub fn process(&mut self, samples: &[i16]) -> bool {
-        let energy = compute_rms(samples);
+    /// An empty slice is treated as silence (energy = 0).
+    pub fn process(&mut self, samples: &[i16]) -> VadState {
+        // Advance one-shot states before processing
+        match self.state {
+            VadState::StartTalking => self.state = VadState::Talking,
+            VadState::StopTalking => self.state = VadState::None,
+            _ => {}
+        }
+
+        if samples.is_empty() {
+            self.last_energy = 0;
+            return self.process_silence(0);
+        }
+
+        // Per-channel sample count
+        let per_channel = samples.len() as u32 / self.channels;
+
+        // Compute energy based on mode
+        let energy = if self.mode.is_webrtc_style() {
+            self.compute_webrtc_score(samples, per_channel)
+        } else {
+            compute_mean_abs_multichannel(samples, self.divisor, self.channels)
+        };
         self.last_energy = energy;
 
-        if energy >= self.threshold {
-            // Voice detected — reset counter and transition immediately
-            self.silent_count = 0;
-            self.state = VadState::Voice;
-            true
+        if energy > self.threshold {
+            self.process_voice(per_channel)
         } else {
-            // Below threshold — increment silent frame counter
-            self.silent_count = self.silent_count.saturating_add(1);
-
-            if self.silent_count > self.hangover_frames {
-                // Enough consecutive silent frames — declare silence
-                self.state = VadState::Silence;
-                false
-            } else {
-                // Still in hangover period — report as voice to avoid choppiness
-                self.state = VadState::Voice;
-                true
-            }
+            self.process_silence(per_channel)
         }
+    }
+
+    /// WebRTC-style VAD scoring.
+    ///
+    /// Uses energy plus zero-crossing rate (ZCR) analysis, inspired by the
+    /// WebRTC VAD. Voiced speech has high energy and low ZCR, while noise
+    /// tends to have high ZCR relative to energy. Higher mode numbers are
+    /// more aggressive (more likely to classify as silence).
+    ///
+    /// Returns: if voice detected → `threshold + 100`, else → `0`.
+    /// This maps the binary result into the energy-based state machine.
+    fn compute_webrtc_score(&self, samples: &[i16], per_channel: u32) -> u32 {
+        if per_channel < 2 {
+            return 0;
+        }
+
+        let channels = self.channels as usize;
+        let n = per_channel as usize;
+
+        // Compute RMS energy and zero-crossing rate on channel 0
+        let mut sum_sq: u64 = 0;
+        let mut zero_crossings: u32 = 0;
+        let mut prev_sign = samples[0] >= 0;
+
+        for i in 0..n {
+            let idx = i * channels;
+            if idx >= samples.len() {
+                break;
+            }
+            let s = samples[idx] as i64;
+            sum_sq += (s * s) as u64;
+
+            let cur_sign = samples[idx] >= 0;
+            if cur_sign != prev_sign {
+                zero_crossings += 1;
+            }
+            prev_sign = cur_sign;
+        }
+
+        let rms = ((sum_sq / n as u64) as f64).sqrt() as u64;
+
+        // Mode-dependent minimum RMS threshold (higher = more aggressive)
+        let min_rms: u64 = match self.mode {
+            VadMode::Quality => 8,
+            VadMode::LowBitrate => 15,
+            VadMode::Aggressive => 30,
+            VadMode::VeryAggressive => 60,
+            VadMode::Energy => 8,
+        };
+
+        // Must exceed minimum energy
+        if rms < min_rms {
+            return 0;
+        }
+
+        // Zero-crossing rate: fraction of sample transitions that cross zero.
+        // Voiced speech (100-400Hz) at 8kHz has ~25-100 crossings per 160 samples.
+        // White noise has ~80 crossings per 160 samples.
+        // Very high ZCR relative to frame length suggests noise, not voice.
+        let zcr_ratio = zero_crossings as f64 / n as f64;
+
+        // Mode-dependent ZCR threshold (lower = more strict about ZCR)
+        let max_zcr: f64 = match self.mode {
+            VadMode::Quality => 0.8,      // very permissive
+            VadMode::LowBitrate => 0.6,   // moderate
+            VadMode::Aggressive => 0.45,  // stricter
+            VadMode::VeryAggressive => 0.35, // strictest
+            VadMode::Energy => 1.0,
+        };
+
+        if zcr_ratio > max_zcr {
+            return 0; // too many zero crossings → likely noise
+        }
+
+        self.threshold + 100 // voice detected
+    }
+
+    /// Handle a voice frame (energy above threshold)
+    ///
+    /// Uses strictly `>` for the threshold comparison, meaning onset
+    /// fires on the frame AFTER the sample count exceeds the threshold.
+    fn process_voice(&mut self, num_samples: u32) -> VadState {
+        self.silence_sample_count = 0;
+        self.voice_sample_count = self.voice_sample_count.saturating_add(num_samples);
+
+        // Strictly greater than (>) not >=
+        if self.state == VadState::None && self.voice_sample_count > self.voice_onset_samples {
+            self.state = VadState::StartTalking;
+        }
+
+        self.state
+    }
+
+    /// Handle a silence frame (energy at or below threshold)
+    fn process_silence(&mut self, num_samples: u32) -> VadState {
+        self.silence_sample_count = self.silence_sample_count.saturating_add(num_samples);
+        self.voice_sample_count = 0;
+
+        // Strictly greater than (>) not >=
+        if self.state == VadState::Talking && self.silence_sample_count > self.silence_holdoff_samples {
+            self.state = VadState::StopTalking;
+        }
+
+        self.state
     }
 
     /// Get the current VAD state
@@ -167,15 +449,20 @@ impl VoiceActivityDetector {
         self.state
     }
 
-    /// Check if currently in silence state
+    /// Check if currently in a silent state (None or StopTalking)
     pub fn is_silent(&self) -> bool {
-        self.state == VadState::Silence
+        self.state.is_silent()
     }
 
-    /// Get the RMS energy of the last processed frame
+    /// Check if currently in a talking state (StartTalking or Talking)
+    pub fn is_talking(&self) -> bool {
+        self.state.is_talking()
+    }
+
+    /// Get the mean absolute energy of the last processed frame (normalized)
     ///
-    /// Returns 0.0 if no frame has been processed yet.
-    pub fn last_energy(&self) -> f64 {
+    /// Returns 0 if no frame has been processed yet.
+    pub fn last_energy(&self) -> u32 {
         self.last_energy
     }
 
@@ -183,374 +470,692 @@ impl VoiceActivityDetector {
     ///
     /// Useful after hold/resume or transfer where audio context changes.
     pub fn reset(&mut self) {
-        self.silent_count = 0;
-        self.state = VadState::Silence;
-        self.last_energy = 0.0;
+        self.voice_sample_count = 0;
+        self.silence_sample_count = 0;
+        self.state = VadState::None;
+        self.last_energy = 0;
     }
 }
 
 impl Default for VoiceActivityDetector {
     fn default() -> Self {
-        Self::new()
+        Self::new(8000)
     }
 }
 
-/// Compute RMS (Root Mean Square) energy of PCM samples
+/// Compute mean absolute energy with sample-rate normalization and
+/// multi-channel support.
 ///
-/// Returns 0.0 for empty input. Uses `i64` accumulation to avoid
-/// overflow with 16-bit samples (max sum of squares for 160 samples:
-/// 160 * 32767^2 = ~1.7e11, well within i64 range).
-fn compute_rms(samples: &[i16]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
+/// For multi-channel interleaved audio, processes only channel 0 using
+/// stride-based access (`j += channels`). The per-channel sample count
+/// is `total_samples / channels`.
+///
+/// Formula: `sum(|sample[j]|) / (per_channel_count / divisor)`
+///
+/// The divisor normalizes for sample rate: `divisor = sample_rate / 8000`.
+///
+/// Short frame guard: if per-channel count < divisor, score stays 0.
+/// This prevents false voice detection on very short frames.
+///
+/// Returns 0 for empty input or frames shorter than divisor.
+fn compute_mean_abs_multichannel(samples: &[i16], divisor: u32, channels: u32) -> u32 {
+    let channels = channels.max(1) as usize;
+    let per_channel = samples.len() / channels;
+    let n = per_channel as u32;
+
+    // Short frame guard: if per-channel count < divisor, return 0
+    if n == 0 || divisor == 0 || n < divisor {
+        return 0;
     }
 
-    let sum_sq: i64 = samples.iter().map(|&s| (s as i64) * (s as i64)).sum();
-    let mean_sq = sum_sq as f64 / samples.len() as f64;
-    mean_sq.sqrt()
+    // Sum absolute values of channel 0 only, striding by channels
+    let mut sum: u64 = 0;
+    let mut j = 0usize;
+    for _ in 0..per_channel {
+        if j < samples.len() {
+            sum += samples[j].unsigned_abs() as u64;
+        }
+        j += channels;
+    }
+
+    // score = energy / (per_channel_count / divisor)
+    let normalized_count = (n / divisor) as u64;
+    (sum / normalized_count) as u32
+}
+
+/// Backward-compatible mono wrapper
+#[cfg(test)]
+fn compute_mean_abs(samples: &[i16], divisor: u32) -> u32 {
+    compute_mean_abs_multichannel(samples, divisor, 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ========== compute_rms tests ==========
+    // ========== compute_mean_abs tests ==========
 
     #[test]
-    fn test_rms_pure_silence() {
+    fn test_mean_abs_pure_silence() {
         let silence = vec![0i16; 160];
-        assert_eq!(compute_rms(&silence), 0.0);
+        assert_eq!(compute_mean_abs(&silence, 1), 0);
     }
 
     #[test]
-    fn test_rms_empty_slice() {
-        assert_eq!(compute_rms(&[]), 0.0);
+    fn test_mean_abs_empty_slice() {
+        assert_eq!(compute_mean_abs(&[], 1), 0);
     }
 
     #[test]
-    fn test_rms_single_sample() {
-        // RMS of a single sample = |sample|
-        assert!((compute_rms(&[1000]) - 1000.0).abs() < 0.01);
-        assert!((compute_rms(&[-1000]) - 1000.0).abs() < 0.01);
+    fn test_mean_abs_constant_positive() {
+        let samples = vec![1000i16; 160];
+        assert_eq!(compute_mean_abs(&samples, 1), 1000);
     }
 
     #[test]
-    fn test_rms_known_value() {
-        // All samples at 100 → RMS = 100
-        let samples = vec![100i16; 160];
-        let rms = compute_rms(&samples);
-        assert!((rms - 100.0).abs() < 0.01, "RMS of constant 100 = {}", rms);
+    fn test_mean_abs_constant_negative() {
+        let samples = vec![-1000i16; 160];
+        assert_eq!(compute_mean_abs(&samples, 1), 1000);
     }
 
     #[test]
-    fn test_rms_symmetric_signal() {
-        // Alternating +1000 / -1000 → RMS = 1000
-        let samples: Vec<i16> = (0..160).map(|i| if i % 2 == 0 { 1000 } else { -1000 }).collect();
-        let rms = compute_rms(&samples);
-        assert!((rms - 1000.0).abs() < 0.01, "RMS = {}", rms);
+    fn test_mean_abs_alternating() {
+        let samples: Vec<i16> = (0..160).map(|i| if i % 2 == 0 { 500 } else { -500 }).collect();
+        assert_eq!(compute_mean_abs(&samples, 1), 500);
     }
 
     #[test]
-    fn test_rms_max_amplitude() {
-        // Full-scale 16-bit: all samples at i16::MAX
+    fn test_mean_abs_sample_rate_normalization() {
+        // score = energy / (samples / divisor)
+        // 8kHz (divisor=1): 160*1000 / (160/1) = 1000
+        // 16kHz (divisor=2): 320*1000 / (320/2) = 2000
+        let samples_8k = vec![1000i16; 160];
+        let samples_16k = vec![1000i16; 320];
+        assert_eq!(compute_mean_abs(&samples_8k, 1), 1000);
+        assert_eq!(compute_mean_abs(&samples_16k, 2), 2000);
+    }
+
+    #[test]
+    fn test_mean_abs_48khz_normalization() {
+        // 48kHz (divisor=6): 960*1000 / (960/6) = 960000/160 = 6000
+        let samples = vec![1000i16; 960];
+        assert_eq!(compute_mean_abs(&samples, 6), 6000);
+    }
+
+    #[test]
+    fn test_mean_abs_short_frame_guard() {
+        // If per-channel count < divisor, score stays 0
+        // At 16kHz (divisor=2), a single sample is < divisor → energy = 0
+        assert_eq!(compute_mean_abs(&[10000], 2), 0);
+        // At 48kHz (divisor=6), 5 samples is < divisor → energy = 0
+        assert_eq!(compute_mean_abs(&[10000; 5], 6), 0);
+        // Exactly divisor samples: 2 samples at divisor=2 → allowed
+        assert_eq!(compute_mean_abs(&[1000, 1000], 2), 2000); // sum=2000, 2/2=1, 2000/1=2000
+    }
+
+    #[test]
+    fn test_mean_abs_max_amplitude() {
         let samples = vec![i16::MAX; 160];
-        let rms = compute_rms(&samples);
-        assert!(
-            (rms - 32767.0).abs() < 1.0,
-            "RMS of max amplitude = {}",
-            rms
+        assert_eq!(compute_mean_abs(&samples, 1), 32767);
+    }
+
+    #[test]
+    fn test_mean_abs_i16_min() {
+        // i16::MIN = -32768, unsigned_abs() = 32768
+        let samples = vec![i16::MIN; 160];
+        assert_eq!(compute_mean_abs(&samples, 1), 32768);
+    }
+
+    #[test]
+    fn test_mean_abs_no_overflow_large_frame() {
+        // 8000 samples at max amplitude — u64 accumulation prevents overflow
+        let samples = vec![i16::MAX; 8000];
+        assert_eq!(compute_mean_abs(&samples, 1), 32767);
+    }
+
+    #[test]
+    fn test_mean_abs_divisor_zero_returns_zero() {
+        // Guard: divisor=0 → return 0 (shouldn't happen but defensive)
+        assert_eq!(compute_mean_abs(&[1000; 160], 0), 0);
+    }
+
+    // ========== Multi-channel compute_mean_abs tests ==========
+
+    #[test]
+    fn test_multichannel_stereo_processes_channel_0() {
+        // Stereo interleaved: [ch0, ch1, ch0, ch1, ...]
+        // Channel 0 = 1000, Channel 1 = 0
+        // Per-channel count = 4, divisor = 1
+        // Energy should be based only on channel 0
+        let samples: Vec<i16> = vec![1000, 0, 1000, 0, 1000, 0, 1000, 0];
+        assert_eq!(compute_mean_abs_multichannel(&samples, 1, 2), 1000);
+    }
+
+    #[test]
+    fn test_multichannel_stereo_ignores_channel_1() {
+        // Channel 0 = 0 (silence), Channel 1 = 10000 (loud)
+        // VAD should see silence from channel 0
+        let samples: Vec<i16> = vec![0, 10000, 0, 10000, 0, 10000, 0, 10000];
+        assert_eq!(compute_mean_abs_multichannel(&samples, 1, 2), 0);
+    }
+
+    #[test]
+    fn test_multichannel_mono_same_as_regular() {
+        let samples = vec![1000i16; 160];
+        assert_eq!(
+            compute_mean_abs_multichannel(&samples, 1, 1),
+            compute_mean_abs(&samples, 1)
         );
     }
 
     #[test]
-    fn test_rms_no_overflow() {
-        // Worst case: 8000 samples (1 second at 8kHz) all at max amplitude
-        let samples = vec![i16::MAX; 8000];
-        let rms = compute_rms(&samples);
-        assert!(rms.is_finite());
-        assert!(rms > 32000.0);
+    fn test_multichannel_stereo_with_divisor() {
+        // 16kHz stereo: 320 interleaved samples = 160 per channel, divisor=2
+        // Channel 0 = 500
+        let mut samples = vec![0i16; 320];
+        for i in 0..160 {
+            samples[i * 2] = 500; // ch0
+            samples[i * 2 + 1] = 0; // ch1
+        }
+        // per_channel=160, sum=160*500=80000, normalized_count=160/2=80
+        // energy = 80000/80 = 1000
+        assert_eq!(compute_mean_abs_multichannel(&samples, 2, 2), 1000);
+    }
+
+    #[test]
+    fn test_multichannel_short_frame_guard() {
+        // 16kHz stereo: 2 total samples = 1 per channel, divisor=2
+        // 1 < 2 → short frame guard → 0
+        assert_eq!(compute_mean_abs_multichannel(&[10000, 5000], 2, 2), 0);
+    }
+
+    #[test]
+    fn test_multichannel_6_channels() {
+        // 6-channel (5.1 surround), 6 total samples = 1 per channel
+        let samples: Vec<i16> = vec![5000, 1000, 2000, 3000, 4000, 500];
+        // per_channel = 1, divisor = 1, channel 0 = 5000
+        assert_eq!(compute_mean_abs_multichannel(&samples, 1, 6), 5000);
     }
 
     // ========== VadState tests ==========
 
     #[test]
     fn test_vad_state_display() {
-        assert_eq!(VadState::Voice.to_string(), "Voice");
-        assert_eq!(VadState::Silence.to_string(), "Silence");
+        assert_eq!(VadState::None.to_string(), "None");
+        assert_eq!(VadState::StartTalking.to_string(), "StartTalking");
+        assert_eq!(VadState::Talking.to_string(), "Talking");
+        assert_eq!(VadState::StopTalking.to_string(), "StopTalking");
     }
 
     #[test]
-    fn test_vad_state_equality() {
-        assert_eq!(VadState::Voice, VadState::Voice);
-        assert_eq!(VadState::Silence, VadState::Silence);
-        assert_ne!(VadState::Voice, VadState::Silence);
+    fn test_vad_state_is_talking() {
+        assert!(!VadState::None.is_talking());
+        assert!(VadState::StartTalking.is_talking());
+        assert!(VadState::Talking.is_talking());
+        assert!(!VadState::StopTalking.is_talking());
     }
 
-    // ========== VoiceActivityDetector basic tests ==========
+    #[test]
+    fn test_vad_state_is_silent() {
+        assert!(VadState::None.is_silent());
+        assert!(!VadState::StartTalking.is_silent());
+        assert!(!VadState::Talking.is_silent());
+        assert!(VadState::StopTalking.is_silent());
+    }
+
+    // ========== Construction — verify defaults ==========
 
     #[test]
-    fn test_vad_default_creation() {
-        let vad = VoiceActivityDetector::new();
-        assert_eq!(vad.threshold(), 250.0);
-        assert_eq!(vad.hangover(), 10);
-        assert!(vad.is_silent());
-        assert_eq!(vad.state(), VadState::Silence);
-        assert_eq!(vad.last_energy(), 0.0);
+    fn test_vad_defaults() {
+        // Defaults:
+        //   thresh = 100
+        //   voice_samples_thresh = 200 * (sample_rate / 1000) = 1600 at 8kHz
+        //   silence_samples_thresh = 500 * (sample_rate / 1000) = 4000 at 8kHz
+        //   divisor = sample_rate / 8000 = 1
+        //   channels = 1
+        //   mode = Energy
+        let vad = VoiceActivityDetector::new(8000);
+        assert_eq!(vad.threshold(), 100);
+        assert_eq!(vad.divisor, 1);
+        assert_eq!(vad.voice_onset_samples, 1600);
+        assert_eq!(vad.silence_holdoff_samples, 4000);
+        assert_eq!(vad.state(), VadState::None);
+        assert_eq!(vad.channels(), 1);
+        assert_eq!(vad.mode(), VadMode::Energy);
+    }
+
+    #[test]
+    fn test_vad_defaults_16khz() {
+        // At 16kHz:
+        //   thresh = 100
+        //   voice_samples_thresh = 200 * 16 = 3200
+        //   silence_samples_thresh = 500 * 16 = 8000
+        //   divisor = 16000/8000 = 2
+        let vad = VoiceActivityDetector::new(16000);
+        assert_eq!(vad.threshold(), 100);
+        assert_eq!(vad.divisor, 2);
+        assert_eq!(vad.voice_onset_samples, 3200);
+        assert_eq!(vad.silence_holdoff_samples, 8000);
     }
 
     #[test]
     fn test_vad_default_trait() {
         let vad = VoiceActivityDetector::default();
-        assert_eq!(vad.threshold(), 250.0);
+        assert_eq!(vad.sample_rate(), 8000);
+        assert_eq!(vad.threshold(), 100);
     }
 
     #[test]
     fn test_vad_with_config() {
-        let vad = VoiceActivityDetector::with_config(500.0, 20);
-        assert_eq!(vad.threshold(), 500.0);
-        assert_eq!(vad.hangover(), 20);
-    }
-
-    #[test]
-    fn test_vad_negative_threshold_clamped() {
-        let vad = VoiceActivityDetector::with_config(-100.0, 5);
-        assert_eq!(vad.threshold(), 0.0);
-
-        let mut vad2 = VoiceActivityDetector::new();
-        vad2.set_threshold(-50.0);
-        assert_eq!(vad2.threshold(), 0.0);
+        let vad = VoiceActivityDetector::with_config(8000, 500, 100, 300);
+        assert_eq!(vad.threshold(), 500);
+        assert_eq!(vad.voice_onset_samples, 800);   // 100ms * 8
+        assert_eq!(vad.silence_holdoff_samples, 2400); // 300ms * 8
     }
 
     #[test]
     fn test_vad_set_threshold() {
-        let mut vad = VoiceActivityDetector::new();
-        vad.set_threshold(500.0);
-        assert_eq!(vad.threshold(), 500.0);
+        let mut vad = VoiceActivityDetector::new(8000);
+        vad.set_threshold(500);
+        assert_eq!(vad.threshold(), 500);
     }
 
     #[test]
-    fn test_vad_set_hangover() {
-        let mut vad = VoiceActivityDetector::new();
-        vad.set_hangover(20);
-        assert_eq!(vad.hangover(), 20);
-    }
-
-    // ========== Voice detection tests ==========
-
-    #[test]
-    fn test_vad_detects_voice() {
-        let mut vad = VoiceActivityDetector::new();
-
-        // Generate a frame with RMS well above threshold (250)
-        // Samples at amplitude 1000 → RMS = 1000
-        let voice_frame = vec![1000i16; 160];
-        let result = vad.process(&voice_frame);
-
-        assert!(result, "Should detect voice");
-        assert_eq!(vad.state(), VadState::Voice);
-        assert!(!vad.is_silent());
-        assert!((vad.last_energy() - 1000.0).abs() < 1.0);
+    fn test_vad_set_onset_ms() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        vad.set_voice_onset_ms(100);
+        assert_eq!(vad.voice_onset_samples, 800);
     }
 
     #[test]
-    fn test_vad_detects_loud_voice() {
-        let mut vad = VoiceActivityDetector::new();
-
-        // Near full-scale audio
-        let loud_frame = vec![20000i16; 160];
-        assert!(vad.process(&loud_frame));
-        assert_eq!(vad.state(), VadState::Voice);
+    fn test_vad_set_holdoff_ms() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        vad.set_silence_holdoff_ms(300);
+        assert_eq!(vad.silence_holdoff_samples, 2400);
     }
 
     #[test]
-    fn test_vad_detects_threshold_boundary() {
-        let mut vad = VoiceActivityDetector::with_config(100.0, 0);
-
-        // Exactly at threshold — should be detected as voice (>= threshold)
-        let at_threshold = vec![100i16; 160];
-        assert!(vad.process(&at_threshold));
-
-        // Just below threshold
-        let below = vec![99i16; 160];
-        assert!(!vad.process(&below));
-    }
-
-    // ========== Silence detection tests ==========
-
-    #[test]
-    fn test_vad_detects_pure_silence() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 0); // No hangover
-        let silence = vec![0i16; 160];
-
-        let result = vad.process(&silence);
-        assert!(!result, "Should detect silence");
-        assert_eq!(vad.state(), VadState::Silence);
-        assert!(vad.is_silent());
-        assert_eq!(vad.last_energy(), 0.0);
+    fn test_vad_set_channels() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        assert_eq!(vad.channels(), 1);
+        vad.set_channels(2);
+        assert_eq!(vad.channels(), 2);
+        // channels=0 is clamped to 1
+        vad.set_channels(0);
+        assert_eq!(vad.channels(), 1);
     }
 
     #[test]
-    fn test_vad_detects_low_noise_as_silence() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 0);
-
-        // Very low amplitude noise (RMS ~10)
-        let low_noise = vec![10i16; 160];
-        assert!(!vad.process(&low_noise));
-        assert!(vad.is_silent());
+    fn test_vad_set_mode() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        assert_eq!(vad.mode(), VadMode::Energy);
+        vad.set_mode(VadMode::Aggressive);
+        assert_eq!(vad.mode(), VadMode::Aggressive);
     }
 
-    #[test]
-    fn test_vad_empty_frame_is_silence() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 0);
-        assert!(!vad.process(&[]));
-        assert!(vad.is_silent());
-        assert_eq!(vad.last_energy(), 0.0);
-    }
-
-    // ========== Hangover behavior tests ==========
+    // ========== Voice onset — strictly greater than (>) ==========
+    // At default 8kHz: voice_onset_samples=1600, so we need >1600 samples.
+    // 10 frames = 1600 samples: NOT > 1600, stays None.
+    // 11th frame = 1760 samples: > 1600, fires StartTalking.
 
     #[test]
-    fn test_vad_hangover_prevents_immediate_silence() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 5);
+    fn test_vad_onset_strictly_greater_than() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        let voice = vec![1000i16; 160]; // well above threshold 100
 
-        // First, establish voice state
-        let voice = vec![1000i16; 160];
-        vad.process(&voice);
-        assert_eq!(vad.state(), VadState::Voice);
-
-        // Send silent frames — should stay in voice during hangover
-        let silence = vec![0i16; 160];
-        for i in 0..5 {
-            let result = vad.process(&silence);
-            assert!(
-                result,
-                "Frame {} during hangover should report voice",
-                i + 1
-            );
-            assert_eq!(vad.state(), VadState::Voice);
-        }
-
-        // One more silent frame pushes past hangover → silence
-        let result = vad.process(&silence);
-        assert!(!result, "Should transition to silence after hangover");
-        assert_eq!(vad.state(), VadState::Silence);
-    }
-
-    #[test]
-    fn test_vad_hangover_reset_on_voice() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 5);
-
-        // Establish voice
-        let voice = vec![1000i16; 160];
-        vad.process(&voice);
-
-        // Send 3 silent frames (less than hangover of 5)
-        let silence = vec![0i16; 160];
-        for _ in 0..3 {
-            let result = vad.process(&silence);
-            assert!(result, "Still in hangover");
-        }
-
-        // Voice comes back — hangover counter should reset
-        assert!(vad.process(&voice));
-        assert_eq!(vad.state(), VadState::Voice);
-
-        // Now need full 5 silent frames again before silence
-        for i in 0..5 {
-            let result = vad.process(&silence);
-            assert!(result, "Hangover frame {} should be voice", i + 1);
-        }
-
-        // 6th silent frame → silence
-        assert!(!vad.process(&silence));
-        assert_eq!(vad.state(), VadState::Silence);
-    }
-
-    #[test]
-    fn test_vad_zero_hangover() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 0);
-
-        // Voice
-        let voice = vec![1000i16; 160];
-        vad.process(&voice);
-        assert_eq!(vad.state(), VadState::Voice);
-
-        // Immediate silence transition with zero hangover
-        let silence = vec![0i16; 160];
-        assert!(!vad.process(&silence));
-        assert_eq!(vad.state(), VadState::Silence);
-    }
-
-    #[test]
-    fn test_vad_immediate_voice_from_silence() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 10);
-
-        // Start in silence
-        let silence = vec![0i16; 160];
-        for _ in 0..20 {
-            vad.process(&silence);
-        }
-        assert!(vad.is_silent());
-
-        // Single voice frame → immediate transition to voice
-        let voice = vec![1000i16; 160];
-        assert!(vad.process(&voice));
-        assert_eq!(vad.state(), VadState::Voice);
-        assert!(!vad.is_silent());
-    }
-
-    // ========== Realistic scenario tests ==========
-
-    #[test]
-    fn test_vad_speech_burst() {
-        let mut vad = VoiceActivityDetector::new(); // threshold=250, hangover=10
-
-        let silence = vec![0i16; 160];
-        let speech = vec![2000i16; 160];
-
-        // Initial silence
-        for _ in 0..20 {
-            vad.process(&silence);
-        }
-        assert!(vad.is_silent());
-
-        // Speech burst (10 frames = 200ms)
-        for _ in 0..10 {
-            assert!(vad.process(&speech));
-        }
-        assert_eq!(vad.state(), VadState::Voice);
-
-        // Post-speech silence — voice for hangover (10 frames), then silence
+        // Frames 1-10: accumulate 1600 samples. 1600 is NOT > 1600 → None
         for i in 0..10 {
-            let result = vad.process(&silence);
-            assert!(result, "Hangover frame {}", i + 1);
+            let state = vad.process(&voice);
+            assert_eq!(state, VadState::None, "Frame {} should still be None", i + 1);
         }
 
-        // Frame 11 → silence
-        assert!(!vad.process(&silence));
-        assert!(vad.is_silent());
+        // Frame 11: 1760 samples > 1600 → StartTalking
+        let state = vad.process(&voice);
+        assert_eq!(state, VadState::StartTalking);
     }
 
     #[test]
-    fn test_vad_alternating_voice_silence() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 3);
-
-        let silence = vec![0i16; 160];
+    fn test_vad_start_talking_becomes_talking() {
+        // Use custom config: onset=20ms=160 samples. Need >160, so 2 frames (320 > 160).
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 500);
         let voice = vec![1000i16; 160];
 
-        // Pattern: voice, silence, silence, voice (gap shorter than hangover)
-        assert!(vad.process(&voice));
-        assert!(vad.process(&silence)); // hangover 1
-        assert!(vad.process(&silence)); // hangover 2
-        assert!(vad.process(&voice)); // resets counter
+        // Frame 1: voice_samples=160. 160 NOT > 160 → None
+        assert_eq!(vad.process(&voice), VadState::None);
 
-        // Should still be voice — gap was shorter than hangover
-        assert_eq!(vad.state(), VadState::Voice);
+        // Frame 2: voice_samples=320. 320 > 160 → StartTalking
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
+
+        // Frame 3: auto-advance → Talking
+        assert_eq!(vad.process(&voice), VadState::Talking);
+    }
+
+    #[test]
+    fn test_vad_voice_onset_reset_by_silence() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        // 5 voice frames (800 samples, partial onset)
+        for _ in 0..5 {
+            vad.process(&voice);
+        }
+        assert_eq!(vad.state(), VadState::None);
+
+        // Silence interrupts — resets voice_sample_count to 0
+        vad.process(&silence);
+
+        // Need full 11 frames of voice again (>1600 samples)
+        for i in 0..10 {
+            assert_eq!(vad.process(&voice), VadState::None, "Frame {} after reset", i + 1);
+        }
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
+    }
+
+    // ========== Silence holdoff — strictly greater than (>) ==========
+    // At 500ms holdoff: silence_samples_thresh=4000, need >4000 samples.
+    // 25 frames = 4000 samples: NOT > 4000, stays Talking.
+    // 26th frame = 4160 samples: > 4000, fires StopTalking.
+
+    #[test]
+    fn test_vad_holdoff_strictly_greater_than() {
+        // onset=20ms so we can get to Talking quickly
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 500);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        // Get to Talking: need >160 voice_samples → 2 voice frames
+        vad.process(&voice); // voice_samples=160, None
+        vad.process(&voice); // voice_samples=320 > 160, StartTalking
+        vad.process(&voice); // Talking
+
+        // 25 silent frames = 4000 samples. 4000 NOT > 4000 → stays Talking
+        for i in 0..25 {
+            let state = vad.process(&silence);
+            assert_eq!(state, VadState::Talking, "Holdoff frame {} should be Talking", i + 1);
+        }
+
+        // 26th frame = 4160 > 4000 → StopTalking
+        assert_eq!(vad.process(&silence), VadState::StopTalking);
+    }
+
+    #[test]
+    fn test_vad_stop_talking_becomes_none() {
+        // holdoff=20ms=160 samples. Need >160 → 2 silent frames.
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        // Get to Talking
+        vad.process(&voice); // None (160 not > 160)
+        vad.process(&voice); // StartTalking (320 > 160)
+        vad.process(&voice); // Talking
+
+        // Silent frame 1: 160 not > 160 → Talking
+        assert_eq!(vad.process(&silence), VadState::Talking);
+        // Silent frame 2: 320 > 160 → StopTalking
+        assert_eq!(vad.process(&silence), VadState::StopTalking);
+        // Auto-advance → None
+        assert_eq!(vad.process(&silence), VadState::None);
+    }
+
+    #[test]
+    fn test_vad_silence_holdoff_reset_by_voice() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 500);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        // Get to Talking
+        vad.process(&voice);
+        vad.process(&voice); // StartTalking
+        vad.process(&voice); // Talking
+
+        // 15 silent frames (partial holdoff)
+        for _ in 0..15 {
+            vad.process(&silence);
+        }
+        assert_eq!(vad.state(), VadState::Talking);
+
+        // Voice returns — resets silence_sample_count
+        vad.process(&voice);
+        assert_eq!(vad.state(), VadState::Talking);
+
+        // Need full 26 frames of silence again (>4000 samples)
+        for i in 0..25 {
+            assert_eq!(vad.process(&silence), VadState::Talking, "Frame {}", i + 1);
+        }
+        assert_eq!(vad.process(&silence), VadState::StopTalking);
+    }
+
+    // ========== Full lifecycle ==========
+
+    #[test]
+    fn test_vad_full_lifecycle() {
+        // onset=20ms (>160 samples → 2 frames), holdoff=40ms (>320 samples → 3 frames)
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 40);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        assert_eq!(vad.state(), VadState::None);
+
+        // Voice onset: frame 1 (160 not > 160) → None, frame 2 (320 > 160) → StartTalking
+        assert_eq!(vad.process(&voice), VadState::None);
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
+
+        // Auto-advance → Talking
+        assert_eq!(vad.process(&voice), VadState::Talking);
+
+        // Silence holdoff: frames 1-2 (160, 320 not > 320) → Talking, frame 3 (480 > 320) → StopTalking
+        assert_eq!(vad.process(&silence), VadState::Talking);
+        assert_eq!(vad.process(&silence), VadState::Talking);
+        assert_eq!(vad.process(&silence), VadState::StopTalking);
+
+        // Auto-advance → None
+        assert_eq!(vad.process(&silence), VadState::None);
+    }
+
+    #[test]
+    fn test_vad_sustained_silence_stays_none() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        let silence = vec![0i16; 160];
+        for _ in 0..100 {
+            assert_eq!(vad.process(&silence), VadState::None);
+        }
+    }
+
+    #[test]
+    fn test_vad_sustained_voice_stays_talking() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 500);
+        let voice = vec![1000i16; 160];
+
+        // Get to Talking
+        vad.process(&voice);
+        vad.process(&voice); // StartTalking
+        vad.process(&voice); // Talking
+
+        for _ in 0..100 {
+            assert_eq!(vad.process(&voice), VadState::Talking);
+        }
+    }
+
+    // ========== Speech with natural pauses ==========
+
+    #[test]
+    fn test_vad_speech_with_short_pauses() {
+        // 500ms holdoff: short pauses (200ms) should NOT trigger StopTalking
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 500);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        // Get to Talking
+        vad.process(&voice);
+        vad.process(&voice); // StartTalking
+        vad.process(&voice); // Talking
+
+        // 12 silent frames = 1920 samples, well under 4000
+        for _ in 0..12 {
+            assert_eq!(vad.process(&silence), VadState::Talking);
+        }
+
+        // Speech resumes — holdoff was reset
+        assert_eq!(vad.process(&voice), VadState::Talking);
+    }
+
+    // ========== Edge cases ==========
+
+    #[test]
+    fn test_vad_empty_frame() {
+        let mut vad = VoiceActivityDetector::new(8000);
+        assert_eq!(vad.process(&[]), VadState::None);
+        assert_eq!(vad.last_energy(), 0);
+    }
+
+    #[test]
+    fn test_vad_single_sample_at_8khz() {
+        // At 8kHz, divisor=1, single sample is >= divisor, so energy IS computed.
+        // But onset requires >1600 samples, so state stays None.
+        let mut vad = VoiceActivityDetector::new(8000);
+        let state = vad.process(&[10000]);
+        assert_eq!(state, VadState::None);
+        // Energy is computed: sum=10000, samples/divisor=1/1=1, score=10000
+        assert_eq!(vad.last_energy(), 10000);
+    }
+
+    #[test]
+    fn test_vad_single_sample_at_16khz_is_silence() {
+        // At 16kHz, divisor=2, single sample (1 < 2) → short frame guard: score=0
+        let mut vad = VoiceActivityDetector::new(16000);
+        let state = vad.process(&[10000]);
+        assert_eq!(state, VadState::None);
+        // Energy is 0 because short frame guard triggered
+        assert_eq!(vad.last_energy(), 0);
+    }
+
+    #[test]
+    fn test_vad_threshold_zero() {
+        // Threshold 0: any non-zero audio is voice (energy > 0)
+        // onset=20ms → need >160 samples = 2 frames
+        let mut vad = VoiceActivityDetector::with_config(8000, 0, 20, 20);
+        let tiny = vec![1i16; 160];
+        let silence = vec![0i16; 160];
+
+        // Frame 1: energy=1 > 0 → voice, but voice_samples=160, not > 160 → None
+        assert_eq!(vad.process(&tiny), VadState::None);
+        // Frame 2: voice_samples=320 > 160 → StartTalking
+        assert_eq!(vad.process(&tiny), VadState::StartTalking);
+
+        // Now silence: 2 frames needed (>160)
+        // Frame 1: Talking (one-shot advance from StartTalking)
+        //          silence_samples=160, not > 160 → Talking
+        assert_eq!(vad.process(&silence), VadState::Talking);
+        // Frame 2: silence_samples=320 > 160 → StopTalking
+        assert_eq!(vad.process(&silence), VadState::StopTalking);
+    }
+
+    #[test]
+    fn test_vad_reset() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 500);
+        let voice = vec![5000i16; 160];
+
+        // Get to Talking
+        vad.process(&voice);
+        vad.process(&voice); // StartTalking
+        vad.process(&voice); // Talking
+        assert_eq!(vad.state(), VadState::Talking);
+
+        vad.reset();
+        assert_eq!(vad.state(), VadState::None);
+        assert!(vad.is_silent());
+        assert_eq!(vad.last_energy(), 0);
+    }
+
+    #[test]
+    fn test_vad_counter_saturation() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 500);
+        let silence = vec![0i16; 160];
+
+        // Process many silence frames
+        for _ in 0..100_000 {
+            vad.process(&silence);
+        }
+        assert_eq!(vad.state(), VadState::None);
+
+        // onset=20ms=160 samples, need >160 → 2 voice frames
+        let voice = vec![1000i16; 160];
+        assert_eq!(vad.process(&voice), VadState::None);
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
+        assert_eq!(vad.process(&voice), VadState::Talking);
+    }
+
+    #[test]
+    fn test_vad_one_shot_events_fire_once() {
+        // onset=20ms (>160 → 2 frames), holdoff=20ms (>160 → 2 frames)
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        let mut start_count = 0;
+        let mut stop_count = 0;
+
+        for _ in 0..30 {
+            let state = vad.process(&voice);
+            if state == VadState::StartTalking {
+                start_count += 1;
+            }
+        }
+        for _ in 0..30 {
+            let state = vad.process(&silence);
+            if state == VadState::StopTalking {
+                stop_count += 1;
+            }
+        }
+
+        assert_eq!(start_count, 1, "StartTalking should fire exactly once");
+        assert_eq!(stop_count, 1, "StopTalking should fire exactly once");
+    }
+
+    #[test]
+    fn test_vad_multiple_talk_cycles() {
+        // onset=20ms (2 frames), holdoff=20ms (2 frames)
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        let voice = vec![1000i16; 160];
+        let silence = vec![0i16; 160];
+
+        for _cycle in 0..3 {
+            // Onset: frame 1 → None, frame 2 → StartTalking
+            assert_eq!(vad.process(&voice), VadState::None);
+            assert_eq!(vad.process(&voice), VadState::StartTalking);
+
+            // Sustained voice
+            for _ in 0..5 {
+                assert_eq!(vad.process(&voice), VadState::Talking);
+            }
+
+            // Holdoff: frame 1 → Talking, frame 2 → StopTalking
+            assert_eq!(vad.process(&silence), VadState::Talking);
+            assert_eq!(vad.process(&silence), VadState::StopTalking);
+
+            // Auto-advance to None
+            assert_eq!(vad.process(&silence), VadState::None);
+        }
+    }
+
+    #[test]
+    fn test_vad_energy_tracks_correctly() {
+        let mut vad = VoiceActivityDetector::new(8000);
+
+        let loud = vec![5000i16; 160];
+        vad.process(&loud);
+        assert_eq!(vad.last_energy(), 5000);
+
+        let quiet = vec![50i16; 160];
+        vad.process(&quiet);
+        assert_eq!(vad.last_energy(), 50);
     }
 
     #[test]
     fn test_vad_pure_tone_440hz() {
-        let mut vad = VoiceActivityDetector::new();
+        let mut vad = VoiceActivityDetector::new(8000);
 
         // Generate 20ms of 440Hz sine wave at 8kHz, amplitude 5000
         let samples: Vec<i16> = (0..160)
@@ -560,115 +1165,214 @@ mod tests {
             })
             .collect();
 
-        assert!(vad.process(&samples));
-        assert_eq!(vad.state(), VadState::Voice);
+        vad.process(&samples);
 
-        // RMS of sine wave with amplitude A = A / sqrt(2) ≈ 3535
-        let expected_rms = 5000.0 / std::f64::consts::SQRT_2;
+        // Mean absolute value of sine with amplitude A = 2A/π ≈ 3183
+        let expected = (5000.0 * 2.0 / std::f64::consts::PI) as u32;
+        let actual = vad.last_energy();
         assert!(
-            (vad.last_energy() - expected_rms).abs() < 50.0,
-            "Expected RMS ~{:.0}, got {:.0}",
-            expected_rms,
-            vad.last_energy()
+            (actual as i64 - expected as i64).unsigned_abs() < 100,
+            "Expected energy ~{}, got {}",
+            expected,
+            actual
         );
     }
 
-    // ========== Reset test ==========
+    // ========== Full state machine step-by-step verification ==========
 
     #[test]
-    fn test_vad_reset() {
-        let mut vad = VoiceActivityDetector::new();
+    fn test_vad_state_machine_step_by_step() {
+        // sample_rate=8000, thresh=100, voice_thresh=1600, silence_thresh=4000
+        let mut vad = VoiceActivityDetector::new(8000);
+        let voice = vec![500i16; 160]; // energy=500, > 100
+        let silence = vec![0i16; 160]; // energy=0, not > 100
 
-        // Process some voice
-        let voice = vec![5000i16; 160];
-        vad.process(&voice);
-        assert_eq!(vad.state(), VadState::Voice);
-        assert!(vad.last_energy() > 0.0);
-
-        // Reset
-        vad.reset();
-        assert_eq!(vad.state(), VadState::Silence);
-        assert!(vad.is_silent());
-        assert_eq!(vad.last_energy(), 0.0);
-    }
-
-    // ========== Edge case tests ==========
-
-    #[test]
-    fn test_vad_single_sample_frame() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 0);
-
-        // Single loud sample
-        assert!(vad.process(&[10000]));
-        assert!((vad.last_energy() - 10000.0).abs() < 1.0);
-
-        // Single quiet sample
-        assert!(!vad.process(&[10]));
-    }
-
-    #[test]
-    fn test_vad_very_large_hangover() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 1000);
-
-        let voice = vec![1000i16; 160];
-        vad.process(&voice);
-
-        // Even after many silent frames, still in hangover
-        let silence = vec![0i16; 160];
-        for _ in 0..999 {
-            assert!(vad.process(&silence));
+        // --- Onset phase ---
+        // voice_samples accumulates, need > 1600
+        // Frame 1-10: voice_samples = 160..1600. 1600 NOT > 1600 → None
+        for _ in 0..10 {
+            assert_eq!(vad.process(&voice), VadState::None);
         }
-        // Still not silent
-        assert!(vad.process(&silence));
+        // Frame 11: voice_samples = 1760 > 1600 → START_TALKING
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
 
-        // Frame 1001 → silence
-        assert!(!vad.process(&silence));
-    }
-
-    #[test]
-    fn test_vad_silent_count_saturates() {
-        let mut vad = VoiceActivityDetector::with_config(250.0, 5);
-
-        // Process a huge number of silent frames — silent_count should not overflow
-        let silence = vec![0i16; 160];
-        for _ in 0..100_000 {
-            vad.process(&silence);
+        // --- Talking phase ---
+        // Frame 12: one-shot advance to TALKING
+        assert_eq!(vad.process(&voice), VadState::Talking);
+        // Frame 13-20: sustained voice
+        for _ in 0..8 {
+            assert_eq!(vad.process(&voice), VadState::Talking);
         }
-        assert!(vad.is_silent());
 
-        // Voice should still work after saturation
-        let voice = vec![1000i16; 160];
-        assert!(vad.process(&voice));
-        assert_eq!(vad.state(), VadState::Voice);
+        // --- Holdoff phase ---
+        // silence_samples accumulates, need > 4000
+        // Frames 1-25: silence_samples = 160..4000. 4000 NOT > 4000 → Talking
+        for _ in 0..25 {
+            assert_eq!(vad.process(&silence), VadState::Talking);
+        }
+        // Frame 26: silence_samples = 4160 > 4000 → STOP_TALKING
+        assert_eq!(vad.process(&silence), VadState::StopTalking);
+
+        // --- Back to silence ---
+        // One-shot advance to NONE
+        assert_eq!(vad.process(&silence), VadState::None);
+    }
+
+    // ========== Multi-channel VAD integration tests ==========
+
+    #[test]
+    fn test_vad_stereo_detects_voice_on_channel_0() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        vad.set_channels(2);
+
+        // 160 per-channel samples → 320 interleaved total
+        // Channel 0 = 1000 (voice), Channel 1 = 0
+        let mut voice_stereo = vec![0i16; 320];
+        for i in 0..160 {
+            voice_stereo[i * 2] = 1000;
+        }
+
+        // Need >160 per-channel → 2 frames for onset
+        assert_eq!(vad.process(&voice_stereo), VadState::None);
+        assert_eq!(vad.process(&voice_stereo), VadState::StartTalking);
     }
 
     #[test]
-    fn test_vad_threshold_zero() {
-        // Threshold of 0 means only true silence (all-zero) is classified as silence
-        let mut vad = VoiceActivityDetector::with_config(0.0, 0);
+    fn test_vad_stereo_silence_on_channel_0() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        vad.set_channels(2);
 
-        // Pure silence → RMS 0.0 which is not >= 0.0... wait, 0.0 >= 0.0 is true
-        // So with threshold 0, even silence is "voice"
+        // Channel 0 = 0 (silence), Channel 1 = 10000 (loud)
+        // VAD should treat as silence
+        let mut loud_ch1 = vec![0i16; 320];
+        for i in 0..160 {
+            loud_ch1[i * 2 + 1] = 10000;
+        }
+
+        for _ in 0..20 {
+            assert_eq!(vad.process(&loud_ch1), VadState::None);
+        }
+    }
+
+    #[test]
+    fn test_vad_stereo_full_lifecycle() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 40);
+        vad.set_channels(2);
+
+        // Voice on channel 0
+        let mut voice = vec![0i16; 320];
+        for i in 0..160 {
+            voice[i * 2] = 1000;
+        }
+        let silence = vec![0i16; 320];
+
+        // Onset: frame 1 → None, frame 2 → StartTalking
+        assert_eq!(vad.process(&voice), VadState::None);
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
+        assert_eq!(vad.process(&voice), VadState::Talking);
+
+        // Holdoff: 3 frames of silence (>320 per-channel)
+        assert_eq!(vad.process(&silence), VadState::Talking);
+        assert_eq!(vad.process(&silence), VadState::Talking);
+        assert_eq!(vad.process(&silence), VadState::StopTalking);
+        assert_eq!(vad.process(&silence), VadState::None);
+    }
+
+    // ========== VadMode tests ==========
+
+    #[test]
+    fn test_vad_mode_energy_default() {
+        let vad = VoiceActivityDetector::new(8000);
+        assert_eq!(vad.mode(), VadMode::Energy);
+        assert!(!vad.mode().is_webrtc_style());
+    }
+
+    #[test]
+    fn test_vad_mode_webrtc_style_flag() {
+        assert!(!VadMode::Energy.is_webrtc_style());
+        assert!(VadMode::Quality.is_webrtc_style());
+        assert!(VadMode::LowBitrate.is_webrtc_style());
+        assert!(VadMode::Aggressive.is_webrtc_style());
+        assert!(VadMode::VeryAggressive.is_webrtc_style());
+    }
+
+    #[test]
+    fn test_vad_mode_quality_detects_voice() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        vad.set_mode(VadMode::Quality);
+
+        let voice = vec![5000i16; 160]; // loud voice
+        // Onset: 2 frames needed (>160 per-channel)
+        assert_eq!(vad.process(&voice), VadState::None);
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
+        assert_eq!(vad.process(&voice), VadState::Talking);
+    }
+
+    #[test]
+    fn test_vad_mode_quality_detects_silence() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        vad.set_mode(VadMode::Quality);
+
         let silence = vec![0i16; 160];
-        // energy=0.0, threshold=0.0 → 0.0 >= 0.0 is true → voice
-        assert!(vad.process(&silence));
+        for _ in 0..20 {
+            assert_eq!(vad.process(&silence), VadState::None);
+        }
     }
 
     #[test]
-    fn test_vad_last_energy_updates_each_frame() {
-        let mut vad = VoiceActivityDetector::new();
+    fn test_vad_mode_aggressive_rejects_noise() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        vad.set_mode(VadMode::VeryAggressive);
 
-        let loud = vec![5000i16; 160];
-        vad.process(&loud);
-        let e1 = vad.last_energy();
-        assert!((e1 - 5000.0).abs() < 1.0);
+        // Low-level flat noise (equal energy in all frequencies)
+        // VeryAggressive mode requires strong spectral tilt → should reject
+        let noise: Vec<i16> = (0..160).map(|i| ((i * 137 + 42) % 100) as i16 - 50).collect();
+        for _ in 0..20 {
+            assert_eq!(vad.process(&noise), VadState::None,
+                "VeryAggressive should reject low-level flat noise");
+        }
+    }
 
-        let quiet = vec![50i16; 160];
-        vad.process(&quiet);
-        let e2 = vad.last_energy();
-        assert!((e2 - 50.0).abs() < 1.0);
+    #[test]
+    fn test_vad_mode_aggressive_detects_loud_voice() {
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        vad.set_mode(VadMode::VeryAggressive);
 
-        // Energy reflects the most recent frame
-        assert!(e1 > e2);
+        // Loud voice (high energy, concentrated in low frequencies)
+        let voice: Vec<i16> = (0..160)
+            .map(|i| {
+                let t = i as f64 / 8000.0;
+                (10000.0 * (2.0 * std::f64::consts::PI * 200.0 * t).sin()) as i16
+            })
+            .collect();
+
+        assert_eq!(vad.process(&voice), VadState::None); // onset accumulation
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
+    }
+
+    #[test]
+    fn test_vad_mode_index() {
+        assert_eq!(VadMode::Energy.mode_index(), -1);
+        assert_eq!(VadMode::Quality.mode_index(), 0);
+        assert_eq!(VadMode::LowBitrate.mode_index(), 1);
+        assert_eq!(VadMode::Aggressive.mode_index(), 2);
+        assert_eq!(VadMode::VeryAggressive.mode_index(), 3);
+    }
+
+    #[test]
+    fn test_vad_webrtc_mode_with_stereo() {
+        // Combine multi-channel + WebRTC mode
+        let mut vad = VoiceActivityDetector::with_config(8000, 100, 20, 20);
+        vad.set_channels(2);
+        vad.set_mode(VadMode::Quality);
+
+        // 320 interleaved samples, voice on ch0
+        let mut voice = vec![0i16; 320];
+        for i in 0..160 {
+            voice[i * 2] = 5000;
+        }
+
+        assert_eq!(vad.process(&voice), VadState::None);
+        assert_eq!(vad.process(&voice), VadState::StartTalking);
     }
 }

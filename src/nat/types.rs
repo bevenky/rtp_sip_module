@@ -53,8 +53,7 @@ impl TraversalStrategy {
     /// packets — this works for ALL NAT types. TURN is only needed when
     /// BOTH sides are behind Symmetric NAT (rare in telephony).
     ///
-    /// This matches FreeSWITCH's approach: AUTOADJ handles Symmetric NAT
-    /// without ever using TURN.
+    /// Symmetric RTP auto-adjust handles Symmetric NAT without TURN.
     pub fn for_nat_type(nat_type: NatType) -> Self {
         match nat_type {
             NatType::Open | NatType::FullCone => TraversalStrategy::Direct,

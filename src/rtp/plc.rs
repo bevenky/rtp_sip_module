@@ -15,7 +15,7 @@
 //! 6. On recovery, applies overlap-add blend between concealed and
 //!    real audio for a smooth transition.
 //!
-//! Reference: FreeSWITCH `switch_plc.c` and ITU-T G.711 Appendix I.
+//! Reference: ITU-T G.711 Appendix I.
 
 /// History buffer length: ~48.75ms at 8kHz = 390 samples.
 const HISTORY_LEN: usize = 390;
@@ -840,6 +840,58 @@ mod tests {
         // 60ms / 10ms = 6 frames.
         let plc2 = PacketLossConcealer::new(80);
         assert_eq!(plc2.max_conceal_frames, 6);
+    }
+
+    #[test]
+    fn test_consecutive_losses_silence_boundary() {
+        // Verify the exact frame at which concealment transitions to silence.
+        // For 160 samples/frame at 8kHz (20ms), max_conceal_frames = 3.
+        // Frames 1-3 should have energy; frame 4+ should be zero.
+        let mut plc = PacketLossConcealer::new(160);
+        assert_eq!(plc.max_conceal_frames, 3);
+
+        let tone = sine_tone(200.0, 8000.0, 600, 10000.0);
+        plc.update(&tone);
+
+        // Frames 1-3: should have non-zero energy
+        for i in 1..=3 {
+            let frame = plc.conceal();
+            assert!(
+                rms(&frame) > 100.0,
+                "Conceal frame {} should have energy, got RMS {}",
+                i,
+                rms(&frame)
+            );
+        }
+
+        // Frame 4: should be silence (past max_conceal_frames)
+        let frame4 = plc.conceal();
+        assert!(
+            rms(&frame4) < 1.0,
+            "Conceal frame 4 should be silence, got RMS {}",
+            rms(&frame4)
+        );
+
+        // Frame 5+: should remain silence
+        let frame5 = plc.conceal();
+        assert!(rms(&frame5) < 1.0);
+    }
+
+    #[test]
+    fn test_reset_clears_history() {
+        let mut plc = PacketLossConcealer::new(160);
+        let tone = sine_tone(200.0, 8000.0, 480, 10000.0);
+        plc.update(&tone);
+        assert!(plc.history_valid > 0);
+
+        plc.reset();
+        assert_eq!(plc.history_valid, 0);
+        assert_eq!(plc.conceal_count, 0);
+        assert_eq!(plc.gain, 1.0);
+
+        // After reset, concealment should produce silence (no history)
+        let frame = plc.conceal();
+        assert!(rms(&frame) < 1.0, "Post-reset conceal should be silence");
     }
 
     #[test]

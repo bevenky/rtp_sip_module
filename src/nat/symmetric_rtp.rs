@@ -4,9 +4,8 @@
 //! This is the PRIMARY mechanism for handling ALL NAT types (including
 //! Symmetric NAT) in SIP/RTP telephony where one side has a public IP.
 //!
-//! Modeled after FreeSWITCH's `SWITCH_RTP_FLAG_AUTOADJ` which has been
-//! battle-tested in production for 15+ years handling every NAT type
-//! without requiring TURN.
+//! Battle-tested approach for production RTP NAT traversal, handling
+//! every NAT type without requiring TURN.
 //!
 //! ## How it handles Symmetric NAT
 //!
@@ -22,7 +21,7 @@
 //! ## Security
 //!
 //! The consistency threshold prevents a single spoofed packet from
-//! redirecting media traffic. FreeSWITCH uses threshold=10 for RTP
+//! redirecting media traffic. Default threshold=10 for RTP
 //! and threshold=1 for RTCP (since RTCP is less frequent).
 
 use std::net::SocketAddr;
@@ -30,9 +29,9 @@ use std::net::SocketAddr;
 /// Symmetric RTP auto-adjust mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoAdjustMode {
-    /// Learn once, then lock to learned address (FreeSWITCH default)
+    /// Learn once, then lock to learned address (default)
     Once,
-    /// Continuously re-learn if address changes (FreeSWITCH `RTP_BUG_ALWAYS_AUTO_ADJUST`)
+    /// Continuously re-learn if address changes
     /// Use for endpoints that may change ports mid-call (e.g., mobile, call transfer)
     Always,
     /// Disabled — always use configured address
@@ -41,24 +40,16 @@ pub enum AutoAdjustMode {
 
 /// Symmetric RTP handler for a single stream (RTP or RTCP)
 ///
-/// FreeSWITCH equivalents:
-/// - `SWITCH_RTP_FLAG_AUTOADJ` → `mode != Disabled`
-/// - `autoadj_threshold` → `threshold`
-/// - `autoadj_window` → `window`
-/// - `autoadj_tally` → `tally`
-/// - `auto_adj_used` → `has_learned()`
-/// - `RTP_BUG_ALWAYS_AUTO_ADJUST` → `mode == Always`
 pub struct SymmetricRtp {
     /// The SDP-configured remote address
     configured_addr: Option<SocketAddr>,
     /// The address we're currently learning from incoming packets
     candidate_addr: Option<SocketAddr>,
-    /// Number of packets from candidate address (FreeSWITCH: autoadj_tally)
+    /// Number of packets from candidate address
     tally: u32,
-    /// Packets needed to accept candidate (FreeSWITCH: autoadj_threshold, default 10)
+    /// Packets needed to accept candidate (default 10)
     threshold: u32,
-    /// Learning window — max packets to observe before giving up
-    /// (FreeSWITCH: autoadj_window = threshold * 2)
+    /// Learning window — max packets to observe before giving up (default = threshold * 2)
     window: u32,
     /// Current window counter (counts down to 0)
     window_remaining: u32,
@@ -73,7 +64,7 @@ pub struct SymmetricRtp {
 impl SymmetricRtp {
     /// Create a new RTP auto-adjust handler.
     ///
-    /// Default matches FreeSWITCH: threshold=10, window=20, mode=Once.
+    /// Default: threshold=10, window=20, mode=Once.
     /// For RTCP, use `new_rtcp()` which has threshold=1 (RTCP is infrequent).
     pub fn new(threshold: u32) -> Self {
         let threshold = threshold.max(1);
@@ -90,12 +81,12 @@ impl SymmetricRtp {
         }
     }
 
-    /// Create with FreeSWITCH production defaults (threshold=10, window=20)
+    /// Create with production defaults (threshold=10, window=20)
     pub fn with_defaults() -> Self {
         Self::new(10)
     }
 
-    /// Create for RTCP auto-adjust (threshold=1, matches FreeSWITCH)
+    /// Create for RTCP auto-adjust (threshold=1).
     /// RTCP packets are infrequent so we learn from the first one.
     pub fn new_rtcp() -> Self {
         Self {
@@ -144,7 +135,7 @@ impl SymmetricRtp {
     ///
     /// Returns true if the learned address changed (caller must update send target).
     ///
-    /// Algorithm (matches FreeSWITCH `switch_rtp.c` lines 8686-8750):
+    /// Algorithm:
     ///
     /// 1. If disabled or window expired (in Once mode), skip
     /// 2. If source matches configured or already-learned addr, no action
@@ -337,13 +328,13 @@ mod tests {
     }
 
     #[test]
-    fn test_freeswitch_defaults() {
+    fn test_production_defaults() {
         let mut srtp = SymmetricRtp::with_defaults();
         srtp.set_configured("10.0.0.1:5000".parse().unwrap());
 
         let natted: SocketAddr = "203.0.113.5:12345".parse().unwrap();
 
-        // Need 10 packets to learn (FreeSWITCH default)
+        // Need 10 packets to learn (default threshold)
         for _ in 0..9 {
             assert!(!srtp.process_incoming(natted));
         }
@@ -538,7 +529,7 @@ mod tests {
     /// Server has public IP, client behind Symmetric NAT sends from random port
     #[test]
     fn test_symmetric_nat_scenario() {
-        // Server side: auto-adjust with FreeSWITCH defaults
+        // Server side: auto-adjust with production defaults
         let mut rtp_adj = SymmetricRtp::with_defaults();
         let mut rtcp_adj = SymmetricRtp::new_rtcp();
 
@@ -554,7 +545,7 @@ mod tests {
         assert!(rtcp_adj.process_incoming(nat_rtcp));
         assert_eq!(rtcp_adj.effective_remote(), Some(nat_rtcp));
 
-        // RTP needs 10 packets (FreeSWITCH default)
+        // RTP needs 10 packets (default threshold)
         for i in 0..10 {
             let changed = rtp_adj.process_incoming(nat_rtp);
             if i < 9 {

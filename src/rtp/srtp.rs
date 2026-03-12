@@ -20,7 +20,7 @@
 //!
 //! Master key = 16 bytes, master salt = 14 bytes → 30 bytes base64-encoded.
 //!
-//! # FreeSWITCH Compatibility
+//! # Features
 //!
 //! - Supports both 80-bit and 32-bit auth tags
 //! - Handles SSRC changes (re-derives session keys)
@@ -118,6 +118,10 @@ pub struct CryptoAttribute {
     pub master_key: [u8; SRTP_MASTER_KEY_LEN],
     /// Master salt (14 bytes)
     pub master_salt: [u8; SRTP_MASTER_SALT_LEN],
+    /// MKI value (Master Key Identifier), if present
+    pub mki: Option<Vec<u8>>,
+    /// MKI length in bytes as declared in the SDP attribute, if present
+    pub mki_length: Option<usize>,
 }
 
 impl CryptoAttribute {
@@ -149,9 +153,36 @@ impl CryptoAttribute {
             ));
         }
 
-        // Strip "inline:" and any trailing lifetime/mki params (separated by |)
-        let b64_key = &key_param[inline_prefix.len()..];
-        let b64_key = b64_key.split('|').next().unwrap_or(b64_key);
+        // Split on '|' to separate base64 key from optional lifetime and MKI params
+        let after_inline = &key_param[inline_prefix.len()..];
+        let parts_pipe: Vec<&str> = after_inline.split('|').collect();
+        let b64_key = parts_pipe[0];
+
+        // Parse optional MKI parameter (last pipe-separated field in format "mki_value:mki_length")
+        let mut mki: Option<Vec<u8>> = None;
+        let mut mki_length: Option<usize> = None;
+        for part in &parts_pipe[1..] {
+            if let Some((mki_val_str, mki_len_str)) = part.split_once(':') {
+                // This looks like an MKI field "value:length"
+                if let Ok(len) = mki_len_str.parse::<usize>() {
+                    // MKI value is a numeric string representing the MKI identifier
+                    if let Ok(mki_val_num) = mki_val_str.parse::<u128>() {
+                        if len > 0 && len <= 16 {
+                            let full_bytes = mki_val_num.to_be_bytes();
+                            // Take the last `len` bytes
+                            let start = if full_bytes.len() > len {
+                                full_bytes.len() - len
+                            } else {
+                                0
+                            };
+                            mki = Some(full_bytes[start..].to_vec());
+                            mki_length = Some(len);
+                        }
+                    }
+                }
+            }
+            // Otherwise it's a lifetime parameter (e.g., "2^31") — we ignore it
+        }
 
         let key_material = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
@@ -177,27 +208,29 @@ impl CryptoAttribute {
             suite,
             master_key,
             master_salt,
+            mki,
+            mki_length,
         })
     }
 
     /// Generate a new random crypto attribute
     pub fn generate(suite: SrtpCipherSuite) -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
         let mut master_key = [0u8; SRTP_MASTER_KEY_LEN];
         let mut master_salt = [0u8; SRTP_MASTER_SALT_LEN];
 
-        // Use rand to generate cryptographically random key material
-        for b in master_key.iter_mut() {
-            *b = rand::random();
-        }
-        for b in master_salt.iter_mut() {
-            *b = rand::random();
-        }
+        // Fill entire buffers in one call for efficiency and better randomness
+        rng.fill(&mut master_key[..]);
+        rng.fill(&mut master_salt[..]);
 
         Self {
             tag: 1,
             suite,
             master_key,
             master_salt,
+            mki: None,
+            mki_length: None,
         }
     }
 
@@ -209,7 +242,17 @@ impl CryptoAttribute {
         key_material.extend_from_slice(&self.master_salt);
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&key_material);
-        format!("{} {} inline:{}", self.tag, self.suite.as_str(), b64)
+        let inline_part = if let (Some(mki_val), Some(mki_len)) = (&self.mki, self.mki_length) {
+            // Convert MKI bytes to a numeric value for the SDP representation
+            let mut val: u128 = 0;
+            for &byte in mki_val.iter() {
+                val = (val << 8) | (byte as u128);
+            }
+            format!("inline:{}|{}:{}", b64, val, mki_len)
+        } else {
+            format!("inline:{}", b64)
+        };
+        format!("{} {} {}", self.tag, self.suite.as_str(), inline_part)
     }
 }
 
@@ -244,20 +287,34 @@ pub struct SrtpContext {
     rtp_keys: SessionKeys,
     /// Derived RTCP session keys
     rtcp_keys: SessionKeys,
-    /// Rollover counter (increments on seq wrap)
+    /// Rollover counter (increments on seq wrap) — used for receive direction
     roc: u32,
-    /// Highest sequence number seen (for ROC tracking)
+    /// Highest sequence number seen (for ROC tracking) — used for receive direction
     s_l: u16,
     /// Whether we've received any packet yet
     initialized: bool,
+    /// 48-bit send packet counter (seq = counter & 0xFFFF, ROC = counter >> 16)
+    send_counter: u64,
+    /// Whether we've sent any packet yet
+    send_initialized: bool,
     /// SRTCP index counter
     srtcp_index: u32,
-    /// Replay protection window (64-bit sliding window)
+    /// Replay protection window (64-bit sliding window) for RTP
     replay_window: u64,
-    /// Replay window base index
+    /// Replay window base index for RTP
     replay_window_base: u64,
+    /// SRTCP replay protection window (64-bit sliding window)
+    srtcp_replay_window: u64,
+    /// SRTCP replay window base index (31-bit SRTCP index)
+    srtcp_replay_window_base: u64,
+    /// Whether we've received any SRTCP packet yet (for replay init)
+    srtcp_replay_initialized: bool,
     /// Consecutive error count for error recovery
     error_count: u32,
+    /// MKI value to append when protecting, if configured
+    mki: Option<Vec<u8>>,
+    /// MKI length in bytes, for stripping on unprotect
+    mki_length: Option<usize>,
 }
 
 impl SrtpContext {
@@ -266,6 +323,17 @@ impl SrtpContext {
         suite: SrtpCipherSuite,
         master_key: [u8; SRTP_MASTER_KEY_LEN],
         master_salt: [u8; SRTP_MASTER_SALT_LEN],
+    ) -> Self {
+        Self::with_mki(suite, master_key, master_salt, None, None)
+    }
+
+    /// Create a new SRTP context with optional MKI
+    pub fn with_mki(
+        suite: SrtpCipherSuite,
+        master_key: [u8; SRTP_MASTER_KEY_LEN],
+        master_salt: [u8; SRTP_MASTER_SALT_LEN],
+        mki: Option<Vec<u8>>,
+        mki_length: Option<usize>,
     ) -> Self {
         let rtp_keys = derive_session_keys(&master_key, &master_salt, false);
         let rtcp_keys = derive_session_keys(&master_key, &master_salt, true);
@@ -279,22 +347,40 @@ impl SrtpContext {
             roc: 0,
             s_l: 0,
             initialized: false,
+            send_counter: 0,
+            send_initialized: false,
             srtcp_index: 0,
             replay_window: 0,
             replay_window_base: 0,
+            srtcp_replay_window: 0,
+            srtcp_replay_window_base: 0,
+            srtcp_replay_initialized: false,
             error_count: 0,
+            mki,
+            mki_length,
         }
     }
 
     /// Create from a parsed crypto attribute
     pub fn from_crypto(crypto: &CryptoAttribute) -> Self {
-        Self::new(crypto.suite, crypto.master_key, crypto.master_salt)
+        Self::with_mki(
+            crypto.suite,
+            crypto.master_key,
+            crypto.master_salt,
+            crypto.mki.clone(),
+            crypto.mki_length,
+        )
     }
 
     /// Protect (encrypt + authenticate) an RTP packet in-place
     ///
     /// Input: plaintext RTP packet (header + payload)
-    /// Output: SRTP packet (header + encrypted_payload + auth_tag)
+    /// Output: SRTP packet (header + encrypted_payload + [MKI] + auth_tag)
+    ///
+    /// Uses a 48-bit send counter to track the packet index. The sequence number
+    /// from the packet header is used alongside wraparound detection to properly
+    /// increment the ROC, avoiding the old bug where ROC only incremented on the
+    /// exact 0xFFFF->0 boundary.
     pub fn protect_rtp(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         if packet.len() < 12 {
             return Err(RtpSipError::Rtp("RTP packet too short".to_string()));
@@ -304,10 +390,27 @@ impl SrtpContext {
         let seq = u16::from_be_bytes([packet[2], packet[3]]);
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
-        // Update ROC for outgoing packets
-        self.update_roc_send(seq);
+        // For the sender, maintain a 48-bit counter.
+        // On first packet, initialize from the packet's seq number.
+        // On subsequent packets, detect wraparound from the seq gap.
+        if !self.send_initialized {
+            self.send_counter = seq as u64;
+            self.send_initialized = true;
+        } else {
+            let prev_seq = (self.send_counter & 0xFFFF) as u16;
+            if seq < prev_seq && (prev_seq - seq) > 0x8000 {
+                // Forward wrap detected: seq wrapped around 0xFFFF -> 0
+                // Increment the upper 32 bits (ROC portion)
+                self.send_counter = ((self.send_counter >> 16).wrapping_add(1) << 16)
+                    | (seq as u64);
+            } else {
+                // Normal progression or reorder within same ROC
+                self.send_counter = (self.send_counter & !0xFFFF) | (seq as u64);
+            }
+        }
 
-        let index = ((self.roc as u64) << 16) | (seq as u64);
+        let index = self.send_counter & 0xFFFF_FFFF_FFFF; // 48-bit mask
+        let roc = (index >> 16) as u32;
 
         // Encrypt payload in-place
         let mut output = packet.to_vec();
@@ -320,11 +423,16 @@ impl SrtpContext {
             payload,
         );
 
+        // Append MKI bytes if configured
+        if let Some(ref mki_bytes) = self.mki {
+            output.extend_from_slice(mki_bytes);
+        }
+
         // Compute and append authentication tag
         let auth_tag = compute_rtp_auth_tag(
             &self.rtp_keys.auth_key,
             &output,
-            self.roc,
+            roc,
             self.suite.rtp_auth_tag_len(),
         );
         output.extend_from_slice(&auth_tag);
@@ -334,7 +442,7 @@ impl SrtpContext {
 
     /// Unprotect (authenticate + decrypt) an SRTP packet
     ///
-    /// Input: SRTP packet (header + encrypted_payload + auth_tag)
+    /// Input: SRTP packet (header + encrypted_payload + [MKI] + auth_tag)
     /// Output: plaintext RTP packet (header + payload)
     ///
     /// Error recovery: tracks consecutive failures and re-derives session
@@ -342,7 +450,9 @@ impl SrtpContext {
     /// like far-end rekeying or transient corruption.
     pub fn unprotect_rtp(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         let auth_tag_len = self.suite.rtp_auth_tag_len();
-        if packet.len() < 12 + auth_tag_len {
+        let mki_len = self.mki_length.unwrap_or(0);
+        let trailer_len = auth_tag_len + mki_len;
+        if packet.len() < 12 + trailer_len {
             self.handle_unprotect_error();
             return Err(RtpSipError::Rtp("SRTP packet too short".to_string()));
         }
@@ -350,7 +460,7 @@ impl SrtpContext {
         let seq = u16::from_be_bytes([packet[2], packet[3]]);
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
-        // Estimate ROC for incoming packet
+        // Estimate ROC for incoming packet (RFC 3711 Section 3.3.1)
         let estimated_roc = self.estimate_roc(seq);
         let index = ((estimated_roc as u64) << 16) | (seq as u64);
 
@@ -360,12 +470,14 @@ impl SrtpContext {
             return Err(RtpSipError::Rtp("Replay detected".to_string()));
         }
 
-        // Split packet into authenticated portion and auth tag
-        let auth_data_len = packet.len() - auth_tag_len;
-        let auth_data = &packet[..auth_data_len];
-        let received_tag = &packet[auth_data_len..];
+        // Split packet: [authenticated_data | MKI | auth_tag]
+        // The authenticated portion includes header + encrypted_payload + MKI
+        // (MKI is between encrypted payload and auth tag)
+        let auth_tag_start = packet.len() - auth_tag_len;
+        let auth_data = &packet[..auth_tag_start];
+        let received_tag = &packet[auth_tag_start..];
 
-        // Verify authentication tag
+        // Verify authentication tag (auth is computed over header + encrypted_payload + MKI)
         let computed_tag = compute_rtp_auth_tag(
             &self.rtp_keys.auth_key,
             auth_data,
@@ -378,9 +490,12 @@ impl SrtpContext {
             return Err(RtpSipError::Rtp("Authentication failed".to_string()));
         }
 
+        // Strip MKI to get the encrypted RTP data (header + encrypted_payload)
+        let encrypted_data = &auth_data[..auth_data.len() - mki_len];
+
         // Decrypt payload
-        let header_len = rtp_header_len(auth_data)?;
-        let mut output = auth_data.to_vec();
+        let header_len = rtp_header_len(encrypted_data)?;
+        let mut output = encrypted_data.to_vec();
         let payload = &mut output[header_len..];
         aes_cm_encrypt(
             &self.rtp_keys.enc_key,
@@ -456,7 +571,12 @@ impl SrtpContext {
         let e_srtcp_index = 0x8000_0000u32 | (srtcp_index & 0x7FFF_FFFF);
         output.extend_from_slice(&e_srtcp_index.to_be_bytes());
 
-        // Compute and append authentication tag (over header + encrypted_payload + E||index)
+        // Append MKI bytes if configured
+        if let Some(ref mki_bytes) = self.mki {
+            output.extend_from_slice(mki_bytes);
+        }
+
+        // Compute and append authentication tag (over header + encrypted_payload + E||index + MKI)
         let mut mac =
             <HmacSha1 as Mac>::new_from_slice(&self.rtcp_keys.auth_key).expect("HMAC key size");
         mac.update(&output);
@@ -468,19 +588,20 @@ impl SrtpContext {
 
     /// Unprotect an SRTCP packet
     pub fn unprotect_rtcp(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        let min_len = 8 + SRTCP_INDEX_LEN + SRTCP_AUTH_TAG_LEN;
+        let mki_len = self.mki_length.unwrap_or(0);
+        let min_len = 8 + SRTCP_INDEX_LEN + mki_len + SRTCP_AUTH_TAG_LEN;
         if packet.len() < min_len {
             return Err(RtpSipError::Rtp("SRTCP packet too short".to_string()));
         }
 
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
-        // Split: [authenticated_data] [auth_tag]
+        // Split: [authenticated_data (includes MKI)] [auth_tag]
         let auth_tag_start = packet.len() - SRTCP_AUTH_TAG_LEN;
         let auth_data = &packet[..auth_tag_start];
         let received_tag = &packet[auth_tag_start..];
 
-        // Verify authentication
+        // Verify authentication (over everything before the auth tag, including MKI)
         let mut mac =
             <HmacSha1 as Mac>::new_from_slice(&self.rtcp_keys.auth_key).expect("HMAC key size");
         mac.update(auth_data);
@@ -491,19 +612,31 @@ impl SrtpContext {
             return Err(RtpSipError::Rtp("SRTCP authentication failed".to_string()));
         }
 
+        // Strip MKI to find the E||index field
+        // Layout: [rtcp_data | E||index | MKI]
+        let data_with_index = &auth_data[..auth_data.len() - mki_len];
+
         // Extract E-flag and SRTCP index
-        let index_start = auth_data.len() - SRTCP_INDEX_LEN;
+        let index_start = data_with_index.len() - SRTCP_INDEX_LEN;
         let e_index = u32::from_be_bytes([
-            auth_data[index_start],
-            auth_data[index_start + 1],
-            auth_data[index_start + 2],
-            auth_data[index_start + 3],
+            data_with_index[index_start],
+            data_with_index[index_start + 1],
+            data_with_index[index_start + 2],
+            data_with_index[index_start + 3],
         ]);
         let is_encrypted = (e_index & 0x8000_0000) != 0;
         let srtcp_index = e_index & 0x7FFF_FFFF;
 
+        // SRTCP replay protection (sliding window on the 31-bit SRTCP index)
+        let srtcp_idx_u64 = srtcp_index as u64;
+        if self.srtcp_replay_initialized {
+            if !self.check_srtcp_replay(srtcp_idx_u64) {
+                return Err(RtpSipError::Rtp("SRTCP replay detected".to_string()));
+            }
+        }
+
         // Decrypt if encrypted
-        let mut output = auth_data[..index_start].to_vec();
+        let mut output = data_with_index[..index_start].to_vec();
         if is_encrypted && output.len() > 8 {
             let payload = &mut output[8..];
             aes_cm_encrypt(
@@ -515,53 +648,88 @@ impl SrtpContext {
             );
         }
 
+        // Accept into SRTCP replay window after successful decryption
+        self.accept_srtcp_replay(srtcp_idx_u64);
+        self.srtcp_replay_initialized = true;
+
         Ok(output)
+    }
+
+    /// Check if SRTCP index passes replay protection (64-packet sliding window)
+    fn check_srtcp_replay(&self, index: u64) -> bool {
+        if index > self.srtcp_replay_window_base {
+            return true;
+        }
+        let delta = self.srtcp_replay_window_base - index;
+        if delta >= 64 {
+            return false;
+        }
+        (self.srtcp_replay_window & (1u64 << delta)) == 0
+    }
+
+    /// Mark SRTCP index as received in replay window
+    fn accept_srtcp_replay(&mut self, index: u64) {
+        if index > self.srtcp_replay_window_base {
+            let shift = index - self.srtcp_replay_window_base;
+            if shift >= 64 {
+                self.srtcp_replay_window = 0;
+            } else {
+                self.srtcp_replay_window <<= shift;
+            }
+            self.srtcp_replay_window_base = index;
+            self.srtcp_replay_window |= 1;
+        } else {
+            let delta = self.srtcp_replay_window_base - index;
+            if delta < 64 {
+                self.srtcp_replay_window |= 1u64 << delta;
+            }
+        }
     }
 
     /// Estimate ROC for incoming packet based on sequence number.
     ///
-    /// RFC 3711 Appendix A — uses signed arithmetic to correctly handle
-    /// out-of-order packets near sequence number boundaries.
+    /// Implements RFC 3711 Section 3.3.1 properly. Determines the ROC value
+    /// (v) to use when computing the packet index, based on the gap between
+    /// the received sequence number and the highest sequence number seen so far.
     fn estimate_roc(&self, seq: u16) -> u32 {
         if !self.initialized {
             return 0;
         }
 
-        let s_l = self.s_l as i32;
-        let seq_i = seq as i32;
         let roc = self.roc;
+        let s_l = self.s_l;
 
-        if (self.s_l) < 0x8000 {
-            if (seq_i - s_l) > 0x8000_i32 {
-                // Seq wrapped backward — late packet from previous ROC
-                roc.wrapping_sub(1)
+        if seq > s_l {
+            // seq is ahead of s_l
+            let diff = seq - s_l;
+            if diff < 0x8000 {
+                // Normal forward progression — same ROC
+                roc
             } else {
+                // Large forward gap means seq actually wrapped backward (late packet)
+                roc.wrapping_sub(1)
+            }
+        } else if seq < s_l {
+            // seq is behind s_l
+            let diff = s_l - seq;
+            if diff > 0x8000 {
+                // s_l is near the top and seq is near the bottom — forward wrap
+                roc.wrapping_add(1)
+            } else {
+                // Normal reordering — same ROC
                 roc
             }
-        } else if (s_l - 0x8000_i32) > seq_i {
-            // s_l is in upper half, seq is in lower half — forward wrap
-            roc.wrapping_add(1)
         } else {
+            // seq == s_l — same ROC
             roc
         }
     }
 
-    /// Update ROC state for outgoing packets
-    fn update_roc_send(&mut self, seq: u16) {
-        if !self.initialized {
-            self.s_l = seq;
-            self.initialized = true;
-            return;
-        }
-
-        // Detect sequence wrap for send direction
-        if seq == 0 && self.s_l == 0xFFFF {
-            self.roc = self.roc.wrapping_add(1);
-        }
-        self.s_l = seq;
-    }
-
-    /// Update ROC state after successful receive
+    /// Update ROC state after successful receive.
+    ///
+    /// RFC 3711 Section 3.3.1: update s_l and ROC based on the estimated ROC (v).
+    /// The 48-bit index = (v << 16) | seq. If this is greater than the current
+    /// highest index, update both s_l and ROC.
     fn update_roc_recv(&mut self, seq: u16, estimated_roc: u32) {
         if !self.initialized {
             self.s_l = seq;
@@ -1162,5 +1330,420 @@ mod tests {
 
         // Should fail authentication
         assert!(recv_ctx.unprotect_rtp(&srtp).is_err());
+    }
+
+    #[test]
+    fn test_roc_wraparound_without_exact_boundary() {
+        // Bug #2: ROC must increment even if the exact 0xFFFF->0 packet is lost.
+        // Simulate: send packets near the seq boundary, skip the exact boundary,
+        // and verify packets after the wrap still decrypt correctly.
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        // Send packets from seq 0xFFF0 up to 0xFFFE (skip 0xFFFF and 0x0000)
+        let mut packets = Vec::new();
+        for seq in 0xFFF0u16..=0xFFFE {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((seq as u32) * 160).to_be_bytes());
+            rtp.extend_from_slice(&12345u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xAA; 20]);
+            let srtp = send_ctx.protect_rtp(&rtp).unwrap();
+            packets.push((seq, rtp, srtp));
+        }
+
+        // Now send packets 0xFFFF and 0x0000 (the boundary)
+        for seq in [0xFFFFu16, 0x0000u16] {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((seq as u32) * 160).to_be_bytes());
+            rtp.extend_from_slice(&12345u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xAA; 20]);
+            let srtp = send_ctx.protect_rtp(&rtp).unwrap();
+            packets.push((seq, rtp, srtp));
+        }
+
+        // Send a few more after the wrap
+        for seq in 0x0001u16..=0x0005 {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((seq as u32) * 160).to_be_bytes());
+            rtp.extend_from_slice(&12345u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xAA; 20]);
+            let srtp = send_ctx.protect_rtp(&rtp).unwrap();
+            packets.push((seq, rtp, srtp));
+        }
+
+        // Receive all packets — receiver should handle the wrap gracefully
+        for (_seq, rtp_orig, srtp) in &packets {
+            let decrypted = recv_ctx.unprotect_rtp(srtp).unwrap();
+            assert_eq!(&decrypted, rtp_orig);
+        }
+
+        // Now test the case where the exact boundary packets (0xFFFF, 0x0000) are LOST.
+        // Re-create contexts.
+        let mut send_ctx2 = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx2 = SrtpContext::from_crypto(&crypto);
+
+        let mut all_packets = Vec::new();
+        // Send 0xFFF0..=0xFFFE, then 0xFFFF, 0x0000, 0x0001..=0x0005
+        for seq in (0xFFF0u16..=0xFFFF).chain(0x0000u16..=0x0005) {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((seq as u32) * 160).to_be_bytes());
+            rtp.extend_from_slice(&12345u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xBB; 20]);
+            let srtp = send_ctx2.protect_rtp(&rtp).unwrap();
+            all_packets.push((seq, rtp, srtp));
+        }
+
+        // Receive all except the boundary packets (0xFFFF and 0x0000, indices 16 and 17)
+        for (i, (_seq, rtp_orig, srtp)) in all_packets.iter().enumerate() {
+            if i == 15 || i == 16 {
+                continue; // Skip the boundary packets
+            }
+            let decrypted = recv_ctx2.unprotect_rtp(srtp).unwrap();
+            assert_eq!(&decrypted, rtp_orig);
+        }
+    }
+
+    #[test]
+    fn test_srtcp_replay_protection() {
+        // Bug #26: SRTCP should have replay protection
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        let rtcp_packet = vec![
+            0x80, 0xC8, 0x00, 0x06,
+            0x00, 0x00, 0x30, 0x39,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+            0x11, 0x22, 0x33, 0x44,
+        ];
+
+        let srtcp_packet = send_ctx.protect_rtcp(&rtcp_packet).unwrap();
+
+        // First unprotect — should succeed
+        let _ = recv_ctx.unprotect_rtcp(&srtcp_packet).unwrap();
+
+        // Replay the same SRTCP packet — should fail
+        assert!(recv_ctx.unprotect_rtcp(&srtcp_packet).is_err());
+    }
+
+    #[test]
+    fn test_srtcp_multiple_packets_with_replay() {
+        // Ensure multiple different SRTCP packets work, but replays don't
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        let mut srtcp_packets = Vec::new();
+        for i in 0u8..5 {
+            let mut rtcp = vec![
+                0x80, 0xC8, 0x00, 0x06,
+                0x00, 0x00, 0x30, 0x39,
+            ];
+            rtcp.extend_from_slice(&[i; 20]);
+            let srtcp = send_ctx.protect_rtcp(&rtcp).unwrap();
+            srtcp_packets.push((rtcp, srtcp));
+        }
+
+        // Receive all in order
+        for (rtcp_orig, srtcp) in &srtcp_packets {
+            let decrypted = recv_ctx.unprotect_rtcp(srtcp).unwrap();
+            assert_eq!(&decrypted, rtcp_orig);
+        }
+
+        // Replay any of them — should all fail
+        for (_rtcp_orig, srtcp) in &srtcp_packets {
+            assert!(recv_ctx.unprotect_rtcp(srtcp).is_err());
+        }
+    }
+
+    #[test]
+    fn test_crypto_attribute_parse_with_mki() {
+        // Bug #19: Parse MKI from a=crypto attribute
+        let value = "1 AES_CM_128_HMAC_SHA1_80 inline:YUJDZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0|1:4";
+        let crypto = CryptoAttribute::parse(value).unwrap();
+        assert_eq!(crypto.tag, 1);
+        assert!(crypto.mki.is_some());
+        assert_eq!(crypto.mki_length, Some(4));
+        let mki = crypto.mki.unwrap();
+        assert_eq!(mki.len(), 4);
+        // MKI value 1 = [0, 0, 0, 1] in 4 bytes
+        assert_eq!(mki, vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_crypto_attribute_parse_with_lifetime_and_mki() {
+        // lifetime followed by MKI
+        let value = "1 AES_CM_128_HMAC_SHA1_80 inline:YUJDZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0|2^31|1:4";
+        let crypto = CryptoAttribute::parse(value).unwrap();
+        assert_eq!(crypto.tag, 1);
+        assert!(crypto.mki.is_some());
+        assert_eq!(crypto.mki_length, Some(4));
+    }
+
+    #[test]
+    fn test_crypto_attribute_no_mki() {
+        let value = "1 AES_CM_128_HMAC_SHA1_80 inline:YUJDZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0";
+        let crypto = CryptoAttribute::parse(value).unwrap();
+        assert!(crypto.mki.is_none());
+        assert!(crypto.mki_length.is_none());
+    }
+
+    #[test]
+    fn test_mki_roundtrip_sdp() {
+        // Generate a crypto attribute, set MKI, serialize, re-parse
+        let mut crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        crypto.mki = Some(vec![0, 0, 0, 42]);
+        crypto.mki_length = Some(4);
+
+        let sdp = crypto.to_sdp_value();
+        assert!(sdp.contains("|42:4"));
+
+        let parsed = CryptoAttribute::parse(&sdp).unwrap();
+        assert_eq!(parsed.mki, Some(vec![0, 0, 0, 42]));
+        assert_eq!(parsed.mki_length, Some(4));
+    }
+
+    #[test]
+    fn test_srtp_with_mki_protect_unprotect() {
+        // Bug #19: MKI bytes are appended during protect and stripped during unprotect
+        let mut crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        crypto.mki = Some(vec![0x00, 0x01]);
+        crypto.mki_length = Some(2);
+
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        let mut rtp_packet = vec![0x80, 0x00, 0x00, 0x01];
+        rtp_packet.extend_from_slice(&160u32.to_be_bytes());
+        rtp_packet.extend_from_slice(&12345u32.to_be_bytes());
+        rtp_packet.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05]);
+
+        let srtp_packet = send_ctx.protect_rtp(&rtp_packet).unwrap();
+        // Should have: original_len + 2 (MKI) + 10 (auth_tag)
+        assert_eq!(srtp_packet.len(), rtp_packet.len() + 2 + 10);
+
+        let decrypted = recv_ctx.unprotect_rtp(&srtp_packet).unwrap();
+        assert_eq!(decrypted, rtp_packet);
+    }
+
+    #[test]
+    fn test_srtcp_with_mki_protect_unprotect() {
+        let mut crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        crypto.mki = Some(vec![0xAB, 0xCD]);
+        crypto.mki_length = Some(2);
+
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        let mut rtcp_packet = vec![
+            0x80, 0xC8, 0x00, 0x06,
+            0x00, 0x00, 0x30, 0x39,
+        ];
+        rtcp_packet.extend_from_slice(&[0x11; 20]);
+
+        let srtcp_packet = send_ctx.protect_rtcp(&rtcp_packet).unwrap();
+        // original_len + 4 (E||index) + 2 (MKI) + 10 (auth tag) = +16
+        assert_eq!(srtcp_packet.len(), rtcp_packet.len() + 16);
+
+        let decrypted = recv_ctx.unprotect_rtcp(&srtcp_packet).unwrap();
+        assert_eq!(decrypted, rtcp_packet);
+    }
+
+    #[test]
+    fn test_mki_mismatch_corrupts_payload() {
+        // Protect with MKI length 2, but receiver expects MKI length 4.
+        // The auth tag verification passes because it covers the same bytes
+        // (auth is computed over everything before the auth tag). However,
+        // the receiver strips 4 bytes as MKI instead of 2, eating 2 bytes of
+        // ciphertext and producing a corrupted (truncated) decrypted payload.
+        // This verifies the MKI length must match for correct operation.
+        let crypto_send = {
+            let mut c = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+            c.mki = Some(vec![0x00, 0x01]);
+            c.mki_length = Some(2);
+            c
+        };
+
+        // Receiver has the same key material but different MKI length
+        let crypto_recv = CryptoAttribute {
+            tag: crypto_send.tag,
+            suite: crypto_send.suite,
+            master_key: crypto_send.master_key,
+            master_salt: crypto_send.master_salt,
+            mki: Some(vec![0x00, 0x00, 0x00, 0x01]),
+            mki_length: Some(4),
+        };
+
+        let mut send_ctx = SrtpContext::from_crypto(&crypto_send);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto_recv);
+
+        let mut rtp_packet = vec![0x80, 0x00, 0x00, 0x01];
+        rtp_packet.extend_from_slice(&160u32.to_be_bytes());
+        rtp_packet.extend_from_slice(&12345u32.to_be_bytes());
+        rtp_packet.extend_from_slice(&[0xAA; 20]);
+
+        let srtp_packet = send_ctx.protect_rtp(&rtp_packet).unwrap();
+        // Auth passes but decrypted output is wrong — payload is truncated
+        // because receiver incorrectly strips 4 bytes as MKI instead of 2.
+        let decrypted = recv_ctx.unprotect_rtp(&srtp_packet).unwrap();
+        assert_ne!(decrypted, rtp_packet, "MKI length mismatch should produce wrong output");
+        // Output is shorter: 2 bytes of ciphertext were consumed as MKI
+        assert_eq!(decrypted.len(), rtp_packet.len() - 2);
+    }
+
+    #[test]
+    fn test_different_seq_produces_different_ciphertext() {
+        // Key derivation uses the same session keys, but AES-CM uses the packet
+        // index (which includes seq) in the IV, so different seq numbers must
+        // produce different ciphertext even for identical plaintext payloads.
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut ctx = SrtpContext::from_crypto(&crypto);
+
+        let payload = [0x42u8; 40];
+
+        let mut rtp1 = vec![0x80, 0x00, 0x00, 0x01]; // seq=1
+        rtp1.extend_from_slice(&160u32.to_be_bytes());
+        rtp1.extend_from_slice(&12345u32.to_be_bytes());
+        rtp1.extend_from_slice(&payload);
+
+        let mut rtp2 = vec![0x80, 0x00, 0x00, 0x02]; // seq=2
+        rtp2.extend_from_slice(&320u32.to_be_bytes());
+        rtp2.extend_from_slice(&12345u32.to_be_bytes());
+        rtp2.extend_from_slice(&payload);
+
+        let srtp1 = ctx.protect_rtp(&rtp1).unwrap();
+        let srtp2 = ctx.protect_rtp(&rtp2).unwrap();
+
+        // The encrypted payloads (bytes 12..52) must differ despite identical plaintext
+        assert_ne!(&srtp1[12..52], &srtp2[12..52]);
+    }
+
+    #[test]
+    fn test_large_payload_protect_unprotect() {
+        // Protect/unprotect a packet near typical MTU limits.
+        // RTP header (12) + payload (1400) + auth tag (10) = 1422, well within
+        // UDP MTU of 1500.
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        let mut rtp_packet = vec![0x80, 0x00, 0x00, 0x01];
+        rtp_packet.extend_from_slice(&160u32.to_be_bytes());
+        rtp_packet.extend_from_slice(&12345u32.to_be_bytes());
+        // 1400 bytes of payload — near max for a single UDP packet
+        let large_payload: Vec<u8> = (0..1400).map(|i| (i & 0xFF) as u8).collect();
+        rtp_packet.extend_from_slice(&large_payload);
+
+        let srtp_packet = send_ctx.protect_rtp(&rtp_packet).unwrap();
+        assert_eq!(srtp_packet.len(), rtp_packet.len() + 10);
+
+        let decrypted = recv_ctx.unprotect_rtp(&srtp_packet).unwrap();
+        assert_eq!(decrypted, rtp_packet);
+    }
+
+    #[test]
+    fn test_empty_payload_protect_unprotect() {
+        // An RTP packet with zero-length payload is valid (e.g., comfort noise,
+        // keepalive). The SRTP layer should handle it: encrypt nothing, but still
+        // authenticate the header.
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        // 12-byte RTP header, no payload
+        let mut rtp_packet = vec![0x80, 0x00, 0x00, 0x01];
+        rtp_packet.extend_from_slice(&160u32.to_be_bytes());
+        rtp_packet.extend_from_slice(&12345u32.to_be_bytes());
+        assert_eq!(rtp_packet.len(), 12);
+
+        let srtp_packet = send_ctx.protect_rtp(&rtp_packet).unwrap();
+        // No payload to encrypt, but auth tag is still appended
+        assert_eq!(srtp_packet.len(), 12 + 10);
+
+        let decrypted = recv_ctx.unprotect_rtp(&srtp_packet).unwrap();
+        assert_eq!(decrypted, rtp_packet);
+    }
+
+    #[test]
+    fn test_crypto_attribute_parse_edge_cases() {
+        // Empty string
+        assert!(CryptoAttribute::parse("").is_err());
+
+        // Only whitespace
+        assert!(CryptoAttribute::parse("   ").is_err());
+
+        // Non-numeric tag
+        assert!(CryptoAttribute::parse("abc AES_CM_128_HMAC_SHA1_80 inline:YUJDZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0").is_err());
+
+        // Invalid base64 in key material
+        assert!(CryptoAttribute::parse("1 AES_CM_128_HMAC_SHA1_80 inline:!!!invalid-base64!!!").is_err());
+
+        // Valid base64 but wrong decoded length (too short)
+        assert!(CryptoAttribute::parse("1 AES_CM_128_HMAC_SHA1_80 inline:AQID").is_err());
+
+        // Missing inline: prefix
+        assert!(CryptoAttribute::parse("1 AES_CM_128_HMAC_SHA1_80 notinline:YUJDZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0").is_err());
+
+        // MKI with length 0 should be ignored (treated as no MKI)
+        let value = "1 AES_CM_128_HMAC_SHA1_80 inline:YUJDZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0|1:0";
+        let crypto = CryptoAttribute::parse(value).unwrap();
+        assert!(crypto.mki.is_none());
+    }
+
+    #[test]
+    fn test_roc_wraparound_skip_to_seq_3() {
+        // Specific scenario: sender sends seq 65530..65535, then skips directly
+        // to seq 3 (packets 0, 1, 2 are lost in transit). The receiver must
+        // detect the forward wrap from the gap (65535 -> 3) and bump the ROC.
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        // Phase 1: send and receive seq 65530..65535 to establish state
+        for seq in 65530u16..=65535 {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((seq as u32) * 160).to_be_bytes());
+            rtp.extend_from_slice(&12345u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xAA; 20]);
+
+            let srtp = send_ctx.protect_rtp(&rtp).unwrap();
+            let decrypted = recv_ctx.unprotect_rtp(&srtp).unwrap();
+            assert_eq!(decrypted, rtp);
+        }
+
+        // Phase 2: sender sends seq 0, 1, 2 (which wraps ROC on the sender)
+        // but we do NOT deliver these to the receiver (simulating packet loss).
+        for seq in 0u16..=2 {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((65536u32 + seq as u32) * 160).to_be_bytes());
+            rtp.extend_from_slice(&12345u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xBB; 20]);
+            let _srtp = send_ctx.protect_rtp(&rtp).unwrap();
+            // intentionally not delivered
+        }
+
+        // Phase 3: receiver gets seq 3 — first packet it sees after 65535.
+        // The receiver's estimate_roc must detect the wrap from the gap.
+        for seq in 3u16..=5 {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((65536u32 + seq as u32) * 160).to_be_bytes());
+            rtp.extend_from_slice(&12345u32.to_be_bytes());
+            rtp.extend_from_slice(&[0xCC; 20]);
+
+            let srtp = send_ctx.protect_rtp(&rtp).unwrap();
+            let decrypted = recv_ctx
+                .unprotect_rtp(&srtp)
+                .expect(&format!("Failed to unprotect seq {} after ROC wrap with gap", seq));
+            assert_eq!(decrypted, rtp);
+        }
     }
 }

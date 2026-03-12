@@ -730,7 +730,16 @@ pub struct RtcpSession {
     pub rtt: Option<Duration>,
 
     // --- RTCP timing ---
-    /// RTCP send interval (default 5s, randomized)
+    /// RTCP send interval (default 5s, randomized per RFC 3550 Section 6.2).
+    ///
+    /// RFC 3550 Section 6.2 requires that RTCP use at most 5% of the session
+    /// bandwidth. For a typical G.711 session (64kbps), 5% = 3.2kbps. A
+    /// compound RTCP packet (SR + SDES) is ~100 bytes = 800 bits.
+    /// Minimum interval = 800 / 3200 = 0.25 seconds.
+    /// Our default 5-second base interval (randomized to 2.5s-7.5s) is well
+    /// above this minimum, so bandwidth compliance is satisfied for G.711 and
+    /// any higher-bitrate codec. For very low bitrate codecs (e.g., 8kbps),
+    /// the minimum would be 800 / 400 = 2 seconds, still below our 5s base.
     pub rtcp_interval: Duration,
     /// Last time we sent RTCP
     pub last_rtcp_sent: Instant,
@@ -868,7 +877,7 @@ impl RtcpSession {
         if rtt_us < 30_000_000 {
             // Sanity check: RTT < 30 seconds
             let rtt = Duration::from_micros(rtt_us);
-            // Exponential moving average: 0.7 * old + 0.3 * new (FreeSWITCH pattern)
+            // Exponential moving average: 0.7 * old + 0.3 * new
             self.rtt = Some(match self.rtt {
                 Some(old) => Duration::from_secs_f64(old.as_secs_f64() * 0.7 + rtt.as_secs_f64() * 0.3),
                 None => rtt,
@@ -1390,5 +1399,113 @@ mod tests {
         let session = RtcpSession::new(0x12345678, "test@host".to_string());
         let r = session.r_factor();
         assert!(r >= 0.0 && r <= 100.0, "R-factor must be 0-100, got {}", r);
+    }
+
+    #[test]
+    fn test_parse_empty_input() {
+        // parse_rtcp_compound must handle empty input without panic
+        let packets = parse_rtcp_compound(&[]);
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_truncated_packet() {
+        // 3 bytes is too short to even read the RTCP header (need 4)
+        let packets = parse_rtcp_compound(&[0x80, 0xC8, 0x00]);
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_malformed_length_exceeds_data() {
+        // Version 2, PT=200 (SR), but length field says 100 words (400 bytes)
+        // while we only provide 8 bytes total. Should not panic.
+        let mut buf = [0u8; 8];
+        buf[0] = 0x80; // V=2, P=0, RC=0
+        buf[1] = PT_SR;
+        buf[2..4].copy_from_slice(&100u16.to_be_bytes()); // bogus length
+        buf[4..8].copy_from_slice(&0x12345678u32.to_be_bytes());
+        let packets = parse_rtcp_compound(&buf);
+        assert!(packets.is_empty(), "Should skip packet with length exceeding data");
+    }
+
+    #[test]
+    fn test_parse_wrong_version_stops_parsing() {
+        // Version 3 (invalid) should cause parser to stop
+        let mut buf = [0u8; 8];
+        buf[0] = 0xC0; // V=3
+        buf[1] = PT_SR;
+        buf[2..4].copy_from_slice(&1u16.to_be_bytes());
+        let packets = parse_rtcp_compound(&buf);
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn test_xr_voip_metrics_roundtrip() {
+        let metrics = VoipMetrics {
+            loss_rate: 25,
+            discard_rate: 3,
+            burst_density: 10,
+            gap_density: 200,
+            burst_duration: 500,
+            gap_duration: 2000,
+            round_trip_delay: 45,
+            end_system_delay: 20,
+            signal_level: 80,
+            noise_level: 40,
+            rerl: 12,
+            gmin: 16,
+            r_factor: 85,
+            ext_r_factor: 127,
+            mos_lq: 42,
+            mos_cq: 41,
+            rx_config: 0,
+            jb_nominal: 30,
+            jb_maximum: 60,
+            jb_abs_max: 1000,
+        };
+
+        let mut buf = [0u8; 48];
+        let len = build_xr_voip_metrics(&mut buf, 0x11111111, 0x22222222, &metrics);
+        assert_eq!(len, 44);
+
+        // Verify the XR header
+        assert_eq!(buf[1], PT_XR); // packet type 207
+        // Verify sender SSRC
+        assert_eq!(
+            u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            0x11111111
+        );
+        // Verify block type
+        assert_eq!(buf[8], VoipMetrics::BLOCK_TYPE); // BT=7
+        // Verify source SSRC
+        assert_eq!(
+            u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            0x22222222
+        );
+
+        // Parse the metrics back from the body (starts at offset 16)
+        let parsed = VoipMetrics::parse(&buf[16..44]).unwrap();
+        assert_eq!(parsed.loss_rate, 25);
+        assert_eq!(parsed.round_trip_delay, 45);
+        assert_eq!(parsed.r_factor, 85);
+        assert_eq!(parsed.mos_lq, 42);
+        assert_eq!(parsed.jb_abs_max, 1000);
+    }
+
+    #[test]
+    fn test_receiver_report_no_blocks() {
+        // RR with zero report blocks (receiver hasn't gotten any RTP yet)
+        let mut buf = [0u8; 64];
+        let len = build_receiver_report(&mut buf, 0xAAAAAAAA, &[]);
+        assert_eq!(len, 8); // just header + SSRC
+
+        let packets = parse_rtcp_compound(&buf[..len]);
+        assert_eq!(packets.len(), 1);
+        if let RtcpPacket::ReceiverReport(rr) = &packets[0] {
+            assert_eq!(rr.ssrc, 0xAAAAAAAA);
+            assert!(rr.report_blocks.is_empty());
+        } else {
+            panic!("Expected ReceiverReport");
+        }
     }
 }
