@@ -119,16 +119,22 @@ impl StunMessage {
 
         while offset + 4 <= end {
             let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            let attr_len =
+                u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
 
+            // Bug #53: If the attribute's declared length extends beyond the
+            // message boundary, return a parse error instead of silently
+            // accepting a truncated message.
             if offset + attr_len > end {
-                break;
+                return Err(StunError::TruncatedAttribute);
             }
 
-            if let Some(attr) =
-                StunAttribute::decode(attr_type, &data[offset..offset + attr_len], &transaction_id)
-            {
+            if let Some(attr) = StunAttribute::decode(
+                attr_type,
+                &data[offset..offset + attr_len],
+                &transaction_id,
+            ) {
                 attributes.push(attr);
             }
 
@@ -199,7 +205,8 @@ impl StunMessage {
     pub fn changed_address(&self) -> Option<std::net::SocketAddr> {
         for attr in &self.attributes {
             match attr {
-                StunAttribute::ChangedAddress(addr) | StunAttribute::OtherAddress(addr) => {
+                StunAttribute::ChangedAddress(addr)
+                | StunAttribute::OtherAddress(addr) => {
                     return Some(*addr);
                 }
                 _ => {}
@@ -251,14 +258,21 @@ pub enum StunError {
     TooShort,
     InvalidHeader,
     InvalidMagicCookie,
+    /// An attribute's declared length extends beyond the message boundary
+    TruncatedAttribute,
 }
 
 impl std::fmt::Display for StunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StunError::TooShort => write!(f, "message too short"),
-            StunError::InvalidHeader => write!(f, "invalid STUN header (top 2 bits not 00)"),
+            StunError::InvalidHeader => {
+                write!(f, "invalid STUN header (top 2 bits not 00)")
+            }
             StunError::InvalidMagicCookie => write!(f, "invalid magic cookie"),
+            StunError::TruncatedAttribute => {
+                write!(f, "attribute length extends beyond message boundary")
+            }
         }
     }
 }
@@ -305,7 +319,8 @@ mod tests {
 
     #[test]
     fn test_binding_success_with_xor_mapped() {
-        let txn_id: TransactionId = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let txn_id: TransactionId =
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let addr: SocketAddr = "203.0.113.50:32853".parse().unwrap();
 
         let msg = StunMessage {
@@ -329,7 +344,10 @@ mod tests {
         assert!(StunMessage::is_stun(&data));
 
         // RTP packet (version 2 = top 2 bits are 10)
-        let rtp = [0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let rtp = [
+            0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
         assert!(!StunMessage::is_stun(&rtp));
 
         // Too short
@@ -426,5 +444,135 @@ mod tests {
         assert_eq!(parsed.attributes.len(), 3);
         assert_eq!(parsed.xor_mapped_address(), Some(addr1));
         assert_eq!(parsed.changed_address(), Some(addr2));
+    }
+
+    // --- Bug #53 tests: truncated attribute must return error ---
+
+    #[test]
+    fn test_truncated_attribute_returns_error() {
+        // Bug #53: An attribute whose declared length extends beyond the
+        // message boundary must produce TruncatedAttribute, not silently
+        // succeed with a partial attribute list.
+        //
+        // Setup: msg_len declares only 10 bytes of attribute payload,
+        // but the attribute TLV header claims attr_len = 20 (value bytes).
+        // After consuming the 4-byte TLV header, offset = 24, attr_len = 20,
+        // but end = 20 + 10 = 30, so 24 + 20 = 44 > 30 => truncated.
+        let txn_id: TransactionId = [0xDD; 12];
+        let attr_type: u16 = 0x8022; // SOFTWARE
+        let attr_len: u16 = 20; // claims 20 bytes of value
+
+        // msg_len is smaller than what the attribute needs:
+        // 4 (attr header) + 6 (partial value) = 10
+        let msg_len: u16 = 10;
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        data.extend_from_slice(&msg_len.to_be_bytes());
+        data.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        data.extend_from_slice(&txn_id);
+        // Attribute TLV header
+        data.extend_from_slice(&attr_type.to_be_bytes());
+        data.extend_from_slice(&attr_len.to_be_bytes());
+        // Only 6 bytes of value (partial)
+        data.extend_from_slice(b"short!");
+
+        // Total data: 20 + 10 = 30 bytes (matches HEADER_SIZE + msg_len)
+        // so the outer length check passes.
+        assert_eq!(data.len(), HEADER_SIZE + msg_len as usize);
+
+        let result = StunMessage::unmarshal(&data);
+        assert_eq!(result.unwrap_err(), StunError::TruncatedAttribute);
+    }
+
+    #[test]
+    fn test_truncated_second_attribute_returns_error() {
+        // A valid first attribute followed by a truncated second attribute
+        // must return TruncatedAttribute.
+        //
+        // Setup: msg_len covers the first attribute plus the second
+        // attribute's TLV header, but NOT the second attribute's claimed
+        // value length.
+        let txn_id: TransactionId = [0xEE; 12];
+
+        // First attribute: SOFTWARE "ok" (2 bytes, padded to 4)
+        let attr1_type: u16 = 0x8022;
+        let attr1_value = b"ok";
+        let attr1_padded_total = 4 + 4; // TLV header (4) + padded value (4)
+
+        // Second attribute: SOFTWARE, claims 50 bytes of value
+        let attr2_type: u16 = 0x8022;
+        let attr2_claimed_len: u16 = 50;
+
+        // msg_len covers first attr (8) + second attr header (4) + only
+        // 2 bytes of the second attr's value (not the full 50).
+        let msg_len: u16 = (attr1_padded_total + 4 + 2) as u16; // = 14
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        data.extend_from_slice(&msg_len.to_be_bytes());
+        data.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        data.extend_from_slice(&txn_id);
+
+        // First attribute (valid)
+        data.extend_from_slice(&attr1_type.to_be_bytes());
+        data.extend_from_slice(&(attr1_value.len() as u16).to_be_bytes());
+        data.extend_from_slice(attr1_value);
+        data.extend_from_slice(&[0x00, 0x00]); // padding to 4 bytes
+
+        // Second attribute header
+        data.extend_from_slice(&attr2_type.to_be_bytes());
+        data.extend_from_slice(&attr2_claimed_len.to_be_bytes());
+        // Only 2 bytes of value (not the claimed 50)
+        data.extend_from_slice(b"hi");
+
+        // Total data = HEADER_SIZE + msg_len = 20 + 14 = 34
+        assert_eq!(data.len(), HEADER_SIZE + msg_len as usize);
+
+        // After parsing first attr, offset advances to 32 (header 20 +
+        // first attr padded 8 + second attr header 4).
+        // attr_len = 50, end = 34, so 32 + 50 = 82 > 34 => TruncatedAttribute
+        let result = StunMessage::unmarshal(&data);
+        assert_eq!(result.unwrap_err(), StunError::TruncatedAttribute);
+    }
+
+    #[test]
+    fn test_valid_attribute_still_parses() {
+        // Ensure the fix doesn't break valid messages.
+        let txn_id: TransactionId = [0xFF; 12];
+        let addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let msg = StunMessage {
+            msg_type: BINDING_SUCCESS,
+            transaction_id: txn_id,
+            attributes: vec![StunAttribute::XorMappedAddress(addr)],
+        };
+        let data = msg.marshal();
+        let parsed = StunMessage::unmarshal(&data).unwrap();
+        assert_eq!(parsed.xor_mapped_address(), Some(addr));
+    }
+
+    #[test]
+    fn test_truncated_buffer_returns_too_short() {
+        // msg_len says 12 bytes of attributes, but buffer only has 6
+        let txn_id: TransactionId = [0xCC; 12];
+        let attr_type: u16 = 0x8022; // SOFTWARE
+        let attr_value = b"hi"; // 2 bytes
+
+        let msg_len: u16 = 12; // claim 12 bytes
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        data.extend_from_slice(&msg_len.to_be_bytes());
+        data.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        data.extend_from_slice(&txn_id);
+        data.extend_from_slice(&attr_type.to_be_bytes());
+        data.extend_from_slice(&(attr_value.len() as u16).to_be_bytes());
+        data.extend_from_slice(attr_value);
+        // Total: 20 + 6 = 26 bytes, but msg_len claims 12 so end = 32
+
+        // HEADER_SIZE + msg_len > data.len() -> TooShort
+        let result = StunMessage::unmarshal(&data);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StunError::TooShort);
     }
 }

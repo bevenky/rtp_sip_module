@@ -89,6 +89,29 @@ impl G711Codec {
             CodecType::Pcma => data.iter().map(|&b| decode_alaw(b)).collect(),
         }
     }
+
+    /// Check if a G.711 frame is silence.
+    /// For mu-law, silence is 0xFF (positive zero) or 0x7F (negative zero).
+    /// For A-law, silence is 0xD5 (positive zero) or 0x55 (negative zero).
+    /// Bug #65: Uses 95% threshold for better alignment with energy-based VAD.
+    pub fn is_silence_frame(&self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        let silence_count = match self.codec_type {
+            CodecType::Pcmu => data.iter().filter(|&&b| b == 0xFF || b == 0x7F).count(),
+            CodecType::Pcma => data.iter().filter(|&&b| b == 0xD5 || b == 0x55).count(),
+        };
+        silence_count * 100 / data.len() >= 95
+    }
+
+    /// Get the silence byte value for this codec.
+    pub fn silence_byte(&self) -> u8 {
+        match self.codec_type {
+            CodecType::Pcmu => 0xFF, // mu-law positive zero
+            CodecType::Pcma => 0xD5, // A-law positive zero
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +179,89 @@ mod tests {
     fn test_payload_type() {
         assert_eq!(CodecType::Pcmu.payload_type(), 0);
         assert_eq!(CodecType::Pcma.payload_type(), 8);
+    }
+
+    // === Bug #65: Silence detection threshold at 95% ===
+
+    #[test]
+    fn test_is_silence_frame_all_silence() {
+        let ulaw = G711Codec::new(CodecType::Pcmu);
+        let alaw = G711Codec::new(CodecType::Pcma);
+
+        // All mu-law silence
+        let ulaw_silence = vec![0xFFu8; 160];
+        assert!(ulaw.is_silence_frame(&ulaw_silence));
+
+        // All A-law silence
+        let alaw_silence = vec![0xD5u8; 160];
+        assert!(alaw.is_silence_frame(&alaw_silence));
+
+        // Negative zero variants
+        let ulaw_neg_silence = vec![0x7Fu8; 160];
+        assert!(ulaw.is_silence_frame(&ulaw_neg_silence));
+
+        let alaw_neg_silence = vec![0x55u8; 160];
+        assert!(alaw.is_silence_frame(&alaw_neg_silence));
+    }
+
+    #[test]
+    fn test_is_silence_frame_not_silence() {
+        let ulaw = G711Codec::new(CodecType::Pcmu);
+
+        // Random non-silence data
+        let data: Vec<u8> = (0..160).map(|i| (i % 128) as u8).collect();
+        assert!(!ulaw.is_silence_frame(&data));
+    }
+
+    #[test]
+    fn test_is_silence_frame_threshold_95() {
+        let ulaw = G711Codec::new(CodecType::Pcmu);
+
+        // 94% silence -- should NOT be detected (threshold is >=95%)
+        let mut data = vec![0xFFu8; 94];
+        data.extend(vec![0x00u8; 6]);
+        assert_eq!(data.len(), 100);
+        assert!(
+            !ulaw.is_silence_frame(&data),
+            "94% silence should NOT trigger detection at 95% threshold"
+        );
+
+        // 95% silence -- should be detected
+        let mut data = vec![0xFFu8; 95];
+        data.extend(vec![0x00u8; 5]);
+        assert_eq!(data.len(), 100);
+        assert!(
+            ulaw.is_silence_frame(&data),
+            "95% silence should trigger detection at 95% threshold"
+        );
+    }
+
+    #[test]
+    fn test_is_silence_frame_90_percent_not_enough() {
+        // Bug #65 regression: 90% was the old threshold, now it's 95%
+        let ulaw = G711Codec::new(CodecType::Pcmu);
+
+        let mut data = vec![0xFFu8; 90];
+        data.extend(vec![0x00u8; 10]);
+        assert_eq!(data.len(), 100);
+        assert!(
+            !ulaw.is_silence_frame(&data),
+            "90% silence should NOT trigger detection at 95% threshold"
+        );
+    }
+
+    #[test]
+    fn test_is_silence_frame_empty() {
+        let codec = G711Codec::new(CodecType::Pcmu);
+        assert!(codec.is_silence_frame(&[]));
+    }
+
+    #[test]
+    fn test_silence_byte() {
+        let ulaw = G711Codec::new(CodecType::Pcmu);
+        assert_eq!(ulaw.silence_byte(), 0xFF);
+
+        let alaw = G711Codec::new(CodecType::Pcma);
+        assert_eq!(alaw.silence_byte(), 0xD5);
     }
 }

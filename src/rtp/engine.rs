@@ -10,6 +10,10 @@
 //! - Fix 10: Marker bit on stream restart (hold/resume)
 //! - Fix 27: Port exhaustion / recycling — global port pool
 //! - Fix 31: CN noise level parsing (RFC 3389 dBov byte)
+//! - Bug #47: Audio codec payload type validation
+//! - Bug #48: Complete SSRC collision recovery (reset all stream state)
+//! - Bug #49: Timestamp normalizer uses configured ptime instead of hardcoded 20ms
+//! - Bug #50: hold_media_timeout_ms config verified working (same root cause as Bug #2)
 
 use crate::error::{Result, RtpSipError};
 use crate::rtp::codec::{CodecType, G711Codec};
@@ -78,6 +82,9 @@ struct TimestampNormalizer {
     last_remote_ts: Option<u32>,
     /// Sample rate used to decide what counts as a "large" jump.
     sample_rate: u32,
+    /// Ptime in milliseconds (Bug #49: used for discontinuity recovery instead
+    /// of hardcoded 20ms).
+    ptime_ms: u32,
 }
 
 impl TimestampNormalizer {
@@ -88,7 +95,29 @@ impl TimestampNormalizer {
             ts_offset: 0,
             last_remote_ts: None,
             sample_rate,
+            ptime_ms: 20,
         }
+    }
+
+    fn with_ptime(sample_rate: u32, ptime_ms: u32) -> Self {
+        Self {
+            local_base_ts: 0,
+            remote_base_ts: None,
+            ts_offset: 0,
+            last_remote_ts: None,
+            sample_rate,
+            ptime_ms,
+        }
+    }
+
+    /// Get the number of samples per packet based on configured ptime.
+    fn samples_per_packet(&self) -> u32 {
+        self.sample_rate * self.ptime_ms / 1000
+    }
+
+    /// Update the ptime (e.g. after SDP renegotiation).
+    fn set_ptime(&mut self, ptime_ms: u32) {
+        self.ptime_ms = ptime_ms;
     }
 
     /// Feed a remote timestamp and return the normalized timestamp.
@@ -115,8 +144,9 @@ impl TimestampNormalizer {
                         // Large jump detected — reset the mapping.
                         // local_base_ts is where we "would have been" had the stream
                         // continued seamlessly (i.e. last normalised ts + one ptime).
+                        // Bug #49: Use configured ptime instead of hardcoded 20ms
                         self.local_base_ts = last.wrapping_add(self.ts_offset as u32)
-                            .wrapping_add(self.sample_rate / 50); // assume 20ms ptime
+                            .wrapping_add(self.samples_per_packet());
                         self.ts_offset = self.local_base_ts as i64 - remote_ts as i64;
                         self.remote_base_ts = Some(remote_ts);
                     }
@@ -181,6 +211,13 @@ pub struct RtpEngineConfig {
     /// Send silence RTP packets when idle (Fix 14, default false)
     /// Prevents carriers/Sonus from timing out and dropping the call
     pub send_silence_when_idle: bool,
+    /// Media timeout during hold in milliseconds (Bug #50, default 1800000 = 30 minutes)
+    pub hold_media_timeout_ms: u64,
+    /// Audio payload type for receive validation (Bug #47).
+    /// When set to `Some(pt)`, non-DTMF/CN packets whose PT does not match
+    /// are silently dropped (with a warning logged on the first mismatch).
+    /// `None` means no filtering — accept any audio PT.
+    pub audio_payload_type: Option<u8>,
 }
 
 impl Default for RtpEngineConfig {
@@ -198,6 +235,8 @@ impl Default for RtpEngineConfig {
             recv_codec: None,
             ptime_ms: 20,
             send_silence_when_idle: false,
+            hold_media_timeout_ms: 1_800_000,
+            audio_payload_type: None,
         }
     }
 }
@@ -289,6 +328,18 @@ pub struct RtpEngine {
     /// When this is true and voice resumes, the marker bit must be set on the
     /// first audio packet (per RFC 3389 §4.1).
     in_cn_silence: AtomicBool,
+
+    // === Bug #47: Audio payload type validation ===
+    /// Negotiated audio payload type for receive filtering (None = accept any)
+    audio_payload_type: Option<u8>,
+    /// Whether we have already warned about an audio PT mismatch
+    audio_pt_mismatch_warned: AtomicBool,
+
+    // === Bug #50: Hold-specific media timeout ===
+    /// Media timeout during hold (ms, default 1800000 = 30 minutes)
+    hold_media_timeout_ms: u64,
+    /// Whether currently in hold state (from SDP a=sendonly/a=inactive)
+    is_on_hold: AtomicBool,
 }
 
 impl RtpEngine {
@@ -312,9 +363,11 @@ impl RtpEngine {
         let dtmf_detector = Arc::new(DtmfDetector::with_payload_type(config.dtmf_payload_type));
 
         let media_timeout_ms = config.media_timeout_ms;
+        let hold_media_timeout_ms = config.hold_media_timeout_ms;
         let rtcp_mux = config.rtcp_mux;
         let ptime_ms = config.ptime_ms;
         let send_silence_when_idle = config.send_silence_when_idle;
+        let audio_payload_type = config.audio_payload_type;
         let sample_rate = config.codec.sample_rate();
 
         Ok(Self {
@@ -345,12 +398,16 @@ impl RtpEngine {
             remote_ssrc: Mutex::new(None),
             force_marker: AtomicBool::new(false),
             ptime_ms: AtomicU32::new(ptime_ms),
-            timestamp_normalizer: Mutex::new(TimestampNormalizer::new(sample_rate)),
+            timestamp_normalizer: Mutex::new(TimestampNormalizer::with_ptime(sample_rate, ptime_ms)),
             send_silence_when_idle,
             last_audio_sent: Mutex::new(None),
             allocated_port: std::sync::Mutex::new(None),
             last_cn_level: std::sync::Mutex::new(None),
             in_cn_silence: AtomicBool::new(false),
+            audio_payload_type,
+            audio_pt_mismatch_warned: AtomicBool::new(false),
+            hold_media_timeout_ms,
+            is_on_hold: AtomicBool::new(false),
         })
     }
 
@@ -478,6 +535,8 @@ impl RtpEngine {
     /// Set the ptime in milliseconds
     pub fn set_ptime(&self, ptime_ms: u32) {
         self.ptime_ms.store(ptime_ms, Ordering::Relaxed);
+        // Bug #49: Keep timestamp normalizer in sync with current ptime
+        self.timestamp_normalizer.lock().set_ptime(ptime_ms);
     }
 
     /// Get samples per packet based on current ptime and codec sample rate
@@ -486,11 +545,54 @@ impl RtpEngine {
         self.config.codec.sample_rate() * ptime / 1000
     }
 
+    // ========== Bug #50: Hold-Specific Media Timeout ==========
+
+    /// Set hold state (from SDP a=sendonly/a=inactive detection)
+    pub fn set_hold_state(&self, on_hold: bool) {
+        self.is_on_hold.store(on_hold, Ordering::Relaxed);
+        tracing::debug!(on_hold, "RTP hold state changed");
+    }
+
+    /// Get current hold state
+    pub fn is_on_hold(&self) -> bool {
+        self.is_on_hold.load(Ordering::Relaxed)
+    }
+
+    /// Get effective media timeout based on hold state.
+    /// Returns the hold timeout (default 30 min) when on hold,
+    /// otherwise the normal media timeout (default 30s).
+    pub fn effective_media_timeout(&self) -> Duration {
+        if self.is_on_hold.load(Ordering::Relaxed) {
+            Duration::from_millis(self.hold_media_timeout_ms)
+        } else {
+            Duration::from_millis(self.media_timeout_ms)
+        }
+    }
+
     // ========== Fix 9: SSRC Collision ==========
 
     /// Get the currently tracked remote SSRC
     pub fn remote_ssrc(&self) -> Option<u32> {
         *self.remote_ssrc.lock()
+    }
+
+    // ========== Bug #48: Full stream state reset ==========
+
+    /// Reset all stream-processing state.
+    ///
+    /// This must be called whenever the remote SSRC changes (SSRC collision
+    /// recovery). Previously only the jitter buffer was reset; this method
+    /// also resets the DTMF detector, PLC, timestamp normalizer, and the
+    /// audio PT mismatch warning flag so they don't carry stale state from
+    /// the old stream.
+    pub fn reset_stream_state(&self) {
+        self.jitter_buffer.lock().reset();
+        self.dtmf_detector.reset();
+        self.plc.lock().reset();
+        self.timestamp_normalizer.lock().reset();
+        // Reset the audio PT mismatch warning so it fires again for the new stream
+        self.audio_pt_mismatch_warned.store(false, Ordering::Relaxed);
+        tracing::debug!("Full stream state reset (jitter buffer, DTMF detector, PLC, timestamp normalizer)");
     }
 
     // ========== Fix 10: Marker Bit Restart ==========
@@ -516,16 +618,18 @@ impl RtpEngine {
         let dtmf_pt = self.config.dtmf_payload_type;
 
         // === Fix 4: Spawn media timeout check task ===
+        // === Bug #2/#50 fix: dynamically read the effective timeout
+        // based on current hold state instead of using a captured value. ===
         {
             let engine_timeout = self.clone();
-            let timeout_ms = self.media_timeout_ms;
             let timeout_tx = self.timeout_tx.clone();
             tokio::spawn(async move {
                 let check_interval = Duration::from_secs(5);
                 while engine_timeout.running.load(Ordering::Relaxed) {
                     tokio::time::sleep(check_interval).await;
+                    let effective_timeout = engine_timeout.effective_media_timeout();
                     if let Some(last) = *engine_timeout.last_rtp_received.lock() {
-                        if last.elapsed().as_millis() as u64 >= timeout_ms {
+                        if last.elapsed() >= effective_timeout {
                             let _ = timeout_tx.send(());
                         }
                     }
@@ -594,19 +698,23 @@ impl RtpEngine {
                             // === Fix 4: Update last RTP received timestamp ===
                             *engine.last_rtp_received.lock() = Some(Instant::now());
 
-                            // === Fix 9: SSRC collision detection ===
+                            // === Fix 9 + Bug #48: SSRC collision detection ===
                             {
                                 let mut remote = engine.remote_ssrc.lock();
                                 if let Some(prev_ssrc) = *remote {
                                     if pkt_ssrc != prev_ssrc {
                                         tracing::warn!(
-                                            "SSRC collision: {} -> {}, resetting jitter buffer",
+                                            "SSRC change: {} -> {}, resetting stream state",
                                             prev_ssrc,
                                             pkt_ssrc,
                                         );
-                                        engine.jitter_buffer.lock().reset();
-                                        engine.timestamp_normalizer.lock().reset();
+                                        // Bug #48: Reset ALL stream state, not just the
+                                        // jitter buffer. Drop the remote_ssrc lock first
+                                        // to avoid deadlock since reset_stream_state
+                                        // acquires other locks.
                                         *remote = Some(pkt_ssrc);
+                                        drop(remote);
+                                        engine.reset_stream_state();
                                     }
                                 } else {
                                     *remote = Some(pkt_ssrc);
@@ -625,6 +733,23 @@ impl RtpEngine {
                                     let _ = dtmf_tx.try_send(detected);
                                 }
                                 continue; // Don't process as audio
+                            }
+
+                            // === Bug #47: Audio payload type validation ===
+                            // After DTMF has been handled, check if the PT
+                            // matches the negotiated audio codec PT. Skip
+                            // CN packets (handled below) and unrecognized PTs.
+                            if let Some(expected_audio_pt) = engine.audio_payload_type {
+                                if pt != expected_audio_pt && pt != CN_PAYLOAD_TYPE {
+                                    if !engine.audio_pt_mismatch_warned.swap(true, Ordering::Relaxed) {
+                                        tracing::warn!(
+                                            expected = expected_audio_pt,
+                                            actual = pt,
+                                            "Dropping packet with unexpected audio payload type"
+                                        );
+                                    }
+                                    continue;
+                                }
                             }
 
                             // === Fix 5 + Fix 31: Handle incoming Comfort Noise (PT 13) ===
@@ -1475,5 +1600,339 @@ mod tests {
         };
         let engine2 = RtpEngine::new(addr2, config).await.unwrap();
         assert!(engine2.send_silence_when_idle);
+    }
+
+    // === Bug #47: Audio payload type validation ===
+
+    #[tokio::test]
+    async fn test_audio_payload_type_default_none() {
+        // Bug #47: Default config should not filter audio PTs
+        let config = RtpEngineConfig::default();
+        assert!(config.audio_payload_type.is_none());
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let engine = RtpEngine::with_defaults(addr).await.unwrap();
+        assert!(engine.audio_payload_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_audio_payload_type_configured() {
+        // Bug #47: When audio_payload_type is set, the engine stores it
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let config = RtpEngineConfig {
+            audio_payload_type: Some(0), // PCMU
+            ..Default::default()
+        };
+        let engine = RtpEngine::new(addr, config).await.unwrap();
+        assert_eq!(engine.audio_payload_type, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_audio_payload_type_validation_drops_mismatch() {
+        // Bug #47: Loopback test — engine with audio_payload_type=0 (PCMU)
+        // should drop packets from a sender using PT=8 (PCMA)
+        let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        // Sender uses PCMA (PT=8)
+        let sender_config = RtpEngineConfig {
+            codec: CodecType::Pcma,
+            ..Default::default()
+        };
+        // Receiver expects PCMU (PT=0)
+        let receiver_config = RtpEngineConfig {
+            audio_payload_type: Some(0),
+            jitter_config: crate::rtp::jitter::JitterConfig {
+                target_delay_ms: 20,
+                min_delay_ms: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sender = Arc::new(RtpEngine::new(addr1, sender_config).await.unwrap());
+        let receiver = Arc::new(RtpEngine::new(addr2, receiver_config).await.unwrap());
+
+        sender.set_remote(receiver.local_addr());
+        receiver.set_remote(sender.local_addr());
+
+        sender.start().unwrap();
+        receiver.start().unwrap();
+
+        // Send packets with PT=8 (PCMA)
+        let samples: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
+        for _ in 0..5 {
+            sender.send_audio(&samples).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Receiver should NOT have any audio — all dropped due to PT mismatch
+        let received = receiver.recv_audio_try().unwrap();
+        assert!(received.is_none(),
+            "Packets with mismatched audio PT should be dropped");
+
+        sender.stop();
+        receiver.stop();
+    }
+
+    #[tokio::test]
+    async fn test_audio_payload_type_validation_accepts_match() {
+        // Bug #47: When audio_payload_type matches the sender's codec PT,
+        // packets should be accepted normally
+        let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let config = RtpEngineConfig {
+            codec: CodecType::Pcmu,
+            audio_payload_type: Some(0), // matches PCMU PT
+            jitter_config: crate::rtp::jitter::JitterConfig {
+                target_delay_ms: 20,
+                min_delay_ms: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sender = Arc::new(RtpEngine::new(addr1, config.clone()).await.unwrap());
+        let receiver = Arc::new(RtpEngine::new(addr2, config).await.unwrap());
+
+        sender.set_remote(receiver.local_addr());
+        receiver.set_remote(sender.local_addr());
+
+        sender.start().unwrap();
+        receiver.start().unwrap();
+
+        let samples: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
+        for _ in 0..5 {
+            sender.send_audio(&samples).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Receiver should have audio — PT matches
+        let received = receiver.recv_audio_blocking(Duration::from_millis(500)).unwrap();
+        assert!(received.is_some(),
+            "Packets with matching audio PT should be accepted");
+
+        sender.stop();
+        receiver.stop();
+    }
+
+    // === Bug #48: SSRC collision full stream reset ===
+
+    #[tokio::test]
+    async fn test_reset_stream_state() {
+        // Bug #48: reset_stream_state() should reset jitter buffer, DTMF
+        // detector, PLC, and timestamp normalizer without panicking
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let engine = RtpEngine::with_defaults(addr).await.unwrap();
+
+        // Populate some state
+        engine.plc.lock().update(&vec![1000i16; 160]);
+        engine.timestamp_normalizer.lock().normalize(5000);
+        engine.timestamp_normalizer.lock().normalize(5160);
+        engine.audio_pt_mismatch_warned.store(true, Ordering::Relaxed);
+
+        // Reset should not panic and should clear the PT warning flag
+        engine.reset_stream_state();
+
+        assert!(!engine.audio_pt_mismatch_warned.load(Ordering::Relaxed),
+            "audio_pt_mismatch_warned should be reset");
+
+        // After reset, normalizer should re-establish mapping from scratch
+        let n1 = engine.timestamp_normalizer.lock().normalize(90000);
+        let n2 = engine.timestamp_normalizer.lock().normalize(90160);
+        assert_eq!(n2.wrapping_sub(n1), 160,
+            "After reset, normalizer should produce smooth timestamps");
+    }
+
+    #[tokio::test]
+    async fn test_reset_stream_state_resets_plc() {
+        // Bug #48: PLC state must be cleared on SSRC change so concealment
+        // from the old stream doesn't bleed into the new one
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let engine = RtpEngine::with_defaults(addr).await.unwrap();
+
+        // Feed loud audio into PLC
+        let loud: Vec<i16> = vec![10000; 160];
+        engine.plc.lock().update(&loud);
+
+        // Concealment before reset should produce non-zero samples
+        let concealed_before = engine.plc.lock().conceal();
+        let has_nonzero_before = concealed_before.iter().any(|&s| s != 0);
+        assert!(has_nonzero_before,
+            "PLC concealment before reset should have non-zero samples");
+
+        // Reset stream state
+        engine.reset_stream_state();
+
+        // After reset, PLC has no history — concealment should be silent
+        let concealed_after = engine.plc.lock().conceal();
+        let all_zero_after = concealed_after.iter().all(|&s| s == 0);
+        assert!(all_zero_after,
+            "PLC concealment after reset should be all zeros (no history)");
+    }
+
+    // === Bug #49: Timestamp normalizer uses configured ptime ===
+
+    #[test]
+    fn test_timestamp_normalizer_with_ptime_30ms() {
+        // Bug #49: When ptime=30ms, discontinuity recovery should step by
+        // 240 samples (8000 * 30 / 1000), not 160 (20ms)
+        let mut norm = TimestampNormalizer::with_ptime(8000, 30);
+
+        let n1 = norm.normalize(1000);
+        let n2 = norm.normalize(1240); // 30ms at 8kHz = 240 samples
+        assert_eq!(n2.wrapping_sub(n1), 240);
+
+        // Simulate a large discontinuity (>5 sec)
+        let jump_ts = 1240 + 80_000;
+        let n3 = norm.normalize(jump_ts);
+
+        // After discontinuity, the gap should be one ptime (240 samples for 30ms)
+        assert_eq!(n3.wrapping_sub(n2), 240,
+            "Bug #49: discontinuity recovery should use 30ms ptime (240 samples), not 20ms (160)");
+
+        // Continue normally
+        let n4 = norm.normalize(jump_ts + 240);
+        assert_eq!(n4.wrapping_sub(n3), 240);
+    }
+
+    #[test]
+    fn test_timestamp_normalizer_with_ptime_10ms() {
+        // Bug #49: When ptime=10ms, discontinuity recovery should step by
+        // 80 samples (8000 * 10 / 1000)
+        let mut norm = TimestampNormalizer::with_ptime(8000, 10);
+
+        let n1 = norm.normalize(2000);
+        let n2 = norm.normalize(2080); // 10ms = 80 samples
+        assert_eq!(n2.wrapping_sub(n1), 80);
+
+        // Large jump
+        let jump_ts = 2080 + 80_000;
+        let n3 = norm.normalize(jump_ts);
+        assert_eq!(n3.wrapping_sub(n2), 80,
+            "Bug #49: discontinuity recovery should use 10ms ptime (80 samples)");
+    }
+
+    #[test]
+    fn test_timestamp_normalizer_set_ptime_mid_stream() {
+        // Bug #49: Changing ptime mid-stream via set_ptime() should affect
+        // subsequent discontinuity recovery
+        let mut norm = TimestampNormalizer::with_ptime(8000, 20);
+
+        let n1 = norm.normalize(1000);
+        let n2 = norm.normalize(1160);
+        assert_eq!(n2.wrapping_sub(n1), 160);
+
+        // Change ptime to 30ms
+        norm.set_ptime(30);
+
+        // Next discontinuity should use 30ms step (240 samples)
+        let jump_ts = 1160 + 80_000;
+        let n3 = norm.normalize(jump_ts);
+        assert_eq!(n3.wrapping_sub(n2), 240,
+            "After set_ptime(30), discontinuity recovery should use 240 samples");
+    }
+
+    #[tokio::test]
+    async fn test_set_ptime_propagates_to_normalizer() {
+        // Bug #49: RtpEngine::set_ptime() must propagate to the
+        // TimestampNormalizer's internal ptime
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let engine = RtpEngine::with_defaults(addr).await.unwrap();
+
+        // Default ptime should be 20ms
+        assert_eq!(engine.timestamp_normalizer.lock().ptime_ms, 20);
+
+        engine.set_ptime(30);
+        assert_eq!(engine.timestamp_normalizer.lock().ptime_ms, 30);
+    }
+
+    // === Bug #50: hold_media_timeout_ms config is respected ===
+
+    #[tokio::test]
+    async fn test_hold_media_timeout_config_respected() {
+        // Bug #50 (same root cause as Bug #2, now fixed): Verify that the
+        // hold_media_timeout_ms config value is actually used by the engine.
+        // The fix was to read effective_media_timeout() dynamically in the
+        // timeout check task instead of capturing a static value.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let config = RtpEngineConfig {
+            media_timeout_ms: 1_000,
+            hold_media_timeout_ms: 300_000, // 5 minutes
+            ..Default::default()
+        };
+        let engine = RtpEngine::new(addr, config).await.unwrap();
+
+        // Verify the config values are stored
+        assert_eq!(engine.media_timeout_ms, 1_000);
+        assert_eq!(engine.hold_media_timeout_ms, 300_000);
+
+        // Normal mode uses media_timeout_ms
+        assert_eq!(engine.effective_media_timeout(), Duration::from_millis(1_000));
+
+        // Hold mode uses hold_media_timeout_ms
+        engine.set_hold_state(true);
+        assert_eq!(engine.effective_media_timeout(), Duration::from_millis(300_000));
+
+        // Simulate: last RTP packet was 2 seconds ago.
+        // In normal mode this exceeds 1s timeout.
+        // In hold mode this is well within the 5 min timeout.
+        *engine.last_rtp_received.lock() = Some(Instant::now() - Duration::from_secs(2));
+
+        // On hold: 2s < 300s => not timed out
+        let effective = engine.effective_media_timeout();
+        let elapsed = engine.last_rtp_received.lock().unwrap().elapsed();
+        assert!(elapsed < effective,
+            "On hold: 2s elapsed should be less than 300s hold timeout");
+
+        // Off hold: 2s > 1s => timed out
+        engine.set_hold_state(false);
+        let effective_normal = engine.effective_media_timeout();
+        assert!(elapsed >= effective_normal,
+            "Off hold: 2s elapsed should exceed 1s normal timeout");
+    }
+
+    #[tokio::test]
+    async fn test_hold_state_management() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let engine = RtpEngine::with_defaults(addr).await.unwrap();
+
+        // Initially not on hold
+        assert!(!engine.is_on_hold());
+
+        // Set hold
+        engine.set_hold_state(true);
+        assert!(engine.is_on_hold());
+
+        // Unset hold
+        engine.set_hold_state(false);
+        assert!(!engine.is_on_hold());
+    }
+
+    #[tokio::test]
+    async fn test_effective_media_timeout_normal_vs_hold() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let config = RtpEngineConfig {
+            media_timeout_ms: 30_000,
+            hold_media_timeout_ms: 1_800_000,
+            ..Default::default()
+        };
+        let engine = RtpEngine::new(addr, config).await.unwrap();
+
+        // Normal: 30 seconds
+        assert_eq!(engine.effective_media_timeout(), Duration::from_millis(30_000));
+
+        // On hold: 30 minutes
+        engine.set_hold_state(true);
+        assert_eq!(engine.effective_media_timeout(), Duration::from_millis(1_800_000));
+
+        // Back to normal
+        engine.set_hold_state(false);
+        assert_eq!(engine.effective_media_timeout(), Duration::from_millis(30_000));
     }
 }

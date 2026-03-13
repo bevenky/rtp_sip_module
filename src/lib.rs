@@ -37,6 +37,7 @@ use pyo3::prelude::*;
 
 pub mod config;
 pub mod error;
+pub mod nat;
 pub mod provider;
 pub mod rtp;
 pub mod session;

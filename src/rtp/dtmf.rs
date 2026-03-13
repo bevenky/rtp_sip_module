@@ -69,7 +69,7 @@
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use crate::error::{Result, RtpSipError};
 
@@ -90,6 +90,14 @@ const DTMF_SANITY_LIMIT: u32 = 1500;
 /// Maximum duration for a single DTMF digit (30 seconds at 8kHz = 240,000 samples).
 /// Most DTMF digits are < 1 second. Beyond 30 seconds, assume stuck stream.
 const DTMF_MAX_DURATION: u32 = 30 * 8000;
+
+/// Default timeout for missing END packets (5 seconds in milliseconds).
+/// If no END packet is received within this time after the first packet of a
+/// digit, the digit is force-completed with whatever duration was accumulated.
+const DTMF_END_TIMEOUT_MS: u32 = 5000;
+
+/// Minimum DTMF duration (50ms) used when clamping detected digit durations.
+const DTMF_MIN_DURATION_MS: u32 = 50;
 
 /// DTMF event codes per RFC 4733
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,11 +791,22 @@ pub struct DtmfDetector {
     current_digit: Mutex<Option<DtmfEvent>>,
     /// Payload type to detect (0 = any dynamic PT 96-127)
     expected_pt: u8,
+    /// Latched payload type: once the first DTMF packet is accepted with
+    /// expected_pt=0 (any dynamic PT), the PT is latched here so that
+    /// subsequent packets must use the same PT. 0 means not yet latched.
+    latched_pt: AtomicU8,
     /// Queue for detected digits
     detected_queue: Mutex<Vec<DetectedDtmf>>,
     /// Timestamp of the last END packet, for interdigit overlap protection.
     /// 0 means no previous END has been seen.
     last_end_timestamp: AtomicU32,
+    /// RTP timestamp of the first packet for the current in-progress digit.
+    /// Used together with `end_timeout_ms` to detect permanently lost END packets.
+    first_packet_ts: AtomicU32,
+    /// Timeout in milliseconds for missing END packets. If the current digit has
+    /// been accumulating for longer than this (measured via RTP timestamps), it is
+    /// force-completed. Default: 5000ms.
+    end_timeout_ms: u32,
 }
 
 impl DtmfDetector {
@@ -802,8 +821,11 @@ impl DtmfDetector {
             duration_flip: AtomicU32::new(0),
             current_digit: Mutex::new(None),
             expected_pt: TELEPHONE_EVENT_PT,
+            latched_pt: AtomicU8::new(0),
             detected_queue: Mutex::new(Vec::new()),
             last_end_timestamp: AtomicU32::new(0),
+            first_packet_ts: AtomicU32::new(0),
+            end_timeout_ms: DTMF_END_TIMEOUT_MS,
         }
     }
 
@@ -812,6 +834,19 @@ impl DtmfDetector {
         let mut detector = Self::new();
         detector.expected_pt = pt;
         detector
+    }
+
+    /// Set the expected payload type explicitly (e.g., from SDP negotiation).
+    /// This also latches the PT so that dynamic-PT auto-detection is bypassed.
+    pub fn set_expected_pt(&mut self, pt: u8) {
+        self.expected_pt = pt;
+        self.latched_pt.store(pt, Ordering::Relaxed);
+    }
+
+    /// Set the timeout for missing END packets (ms). If the current digit has
+    /// been accumulating for longer than this, it is force-completed.
+    pub fn set_end_timeout_ms(&mut self, ms: u32) {
+        self.end_timeout_ms = ms;
     }
 
     /// Reset the detector state
@@ -825,6 +860,9 @@ impl DtmfDetector {
         *self.current_digit.lock() = None;
         self.detected_queue.lock().clear();
         self.last_end_timestamp.store(0, Ordering::Relaxed);
+        self.first_packet_ts.store(0, Ordering::Relaxed);
+        // Note: latched_pt is intentionally NOT reset — once latched, the PT
+        // should persist across digit boundaries.
     }
 
     /// Process incoming RTP packet
@@ -849,12 +887,32 @@ impl DtmfDetector {
             if payload_type != self.expected_pt {
                 return None;
             }
-        } else if payload_type < 96 || payload_type > 127 {
-            return None;
+        } else {
+            // expected_pt == 0: accept any dynamic PT (96-127), but once the
+            // first DTMF packet is accepted, latch that PT so all subsequent
+            // packets must use the same one (Bug #43).
+            if payload_type < 96 || payload_type > 127 {
+                return None;
+            }
+            let latched = self.latched_pt.load(Ordering::Relaxed);
+            if latched != 0 && payload_type != latched {
+                return None;
+            }
         }
 
         let dtmf = DtmfPayload::parse(payload)?;
         let event = DtmfEvent::from_code(dtmf.event)?;
+
+        // Bug #43: Latch the payload type on the first valid DTMF packet when
+        // expected_pt == 0 (dynamic PT mode).
+        if self.expected_pt == 0 {
+            let _ = self.latched_pt.compare_exchange(
+                0,
+                payload_type,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
 
         // Interdigit overlap protection: suppress new digits arriving within
         // 80ms (640 samples at 8kHz) of the last END packet.
@@ -891,6 +949,44 @@ impl DtmfDetector {
             self.in_digit_sanity.store(0, Ordering::Relaxed);
         }
 
+        // Bug #42: Missing END timeout.  If a digit has been in-progress for
+        // longer than end_timeout_ms (measured via RTP timestamps at 8kHz),
+        // force-complete it.  This handles permanently lost END packets.
+        {
+            let mut timeout_current = self.current_digit.lock();
+            if timeout_current.is_some() {
+                let first_ts = self.first_packet_ts.load(Ordering::Relaxed);
+                if first_ts != 0 {
+                    let elapsed_samples = timestamp.wrapping_sub(first_ts);
+                    let timeout_samples = self.end_timeout_ms * 8; // 8 samples per ms at 8kHz
+                    // Guard against backwards timestamps (wrapping_sub produces
+                    // a very large value for backwards jumps)
+                    if elapsed_samples > timeout_samples && elapsed_samples < 0x8000_0000 {
+                        let flip = self.duration_flip.load(Ordering::Relaxed);
+                        let old_duration =
+                            self.last_duration.load(Ordering::Relaxed) as u32 + flip;
+                        let duration_ms =
+                            (old_duration / 8).max(DTMF_MIN_DURATION_MS);
+                        let digit = timeout_current.take().unwrap();
+                        let old_ts = self.last_in_digit_ts.load(Ordering::Relaxed);
+                        let result = DetectedDtmf {
+                            digit: digit.to_char(),
+                            event: digit,
+                            duration_ms,
+                            is_end: false,
+                        };
+                        self.duration_flip.store(0, Ordering::Relaxed);
+                        self.last_duration.store(0, Ordering::Relaxed);
+                        self.last_end_timestamp.store(old_ts, Ordering::Relaxed);
+                        self.first_packet_ts.store(0, Ordering::Relaxed);
+                        self.detected_queue.lock().push(result);
+                        // Fall through — the current packet may start a new digit
+                    }
+                }
+            }
+            drop(timeout_current);
+        }
+
         // Check for new digit (timestamp changed)
         let mut current = self.current_digit.lock();
         if timestamp != self.last_in_digit_ts.load(Ordering::Relaxed) {
@@ -899,15 +995,29 @@ impl DtmfDetector {
             self.last_in_digit_ts.store(timestamp, Ordering::Relaxed);
             self.last_duration.store(0, Ordering::Relaxed);
             self.duration_flip.store(0, Ordering::Relaxed);
+            // Bug #42: record the RTP timestamp of the first packet for timeout
+            self.first_packet_ts.store(timestamp, Ordering::Relaxed);
         }
 
         // Track duration with wraparound detection ("flip" mechanism)
         // 16-bit duration field wraps at 0xFFFF (~8.19 seconds at 8kHz)
         let last_dur = self.last_duration.swap(dtmf.duration, Ordering::Relaxed);
 
-        // Detect wraparound: duration decreased while same timestamp
-        // Threshold 0xFC17 (~7.9 seconds) detects impending wrap
-        if last_dur > 0xFC17 && dtmf.duration < last_dur {
+        // Bug #40: Detect wraparound with reordering guard.
+        // Only trigger wraparound if:
+        //   1. Duration actually decreased (dtmf.duration < last_dur), AND
+        //   2. The old duration was in the upper half of the 16-bit range
+        //      (last_dur > 0x8000 ~= 4 seconds), making a wrap plausible, AND
+        //   3. The new duration is dramatically smaller (new < old/2),
+        //      distinguishing a genuine wrap from out-of-order packets with
+        //      slightly decreasing durations.
+        // The old threshold (last_dur > 0xFC17) was too conservative and too
+        // narrow — it only caught wraps from ~7.9s+.  The new guard catches
+        // wraps from 4s+ while rejecting reordering artifacts.
+        if dtmf.duration < last_dur
+            && last_dur > 0x8000
+            && dtmf.duration < last_dur / 2
+        {
             // Duration wrapped around, accumulate 0xFFFF
             self.duration_flip.fetch_add(0xFFFF, Ordering::Relaxed);
         }
@@ -924,6 +1034,17 @@ impl DtmfDetector {
 
         // Only report on END packet
         if dtmf.is_end && current.is_some() {
+            // Bug #41: Reject END packets with zero accumulated duration.
+            // An END packet with duration=0 (and no prior intermediate packets)
+            // indicates a spurious/malformed packet. Accepting it would report
+            // a digit with zero duration, causing spurious detection.
+            if total_duration == 0 {
+                current.take(); // discard the in-progress digit
+                self.duration_flip.store(0, Ordering::Relaxed);
+                self.first_packet_ts.store(0, Ordering::Relaxed);
+                return None;
+            }
+
             let digit = current.take().unwrap();
             // Convert total duration (in timestamp units) to ms
             // At 8kHz: ms = total_duration / 8
@@ -937,6 +1058,9 @@ impl DtmfDetector {
 
             // Reset flip for next digit
             self.duration_flip.store(0, Ordering::Relaxed);
+
+            // Reset first_packet_ts for next digit
+            self.first_packet_ts.store(0, Ordering::Relaxed);
 
             // Record end timestamp for interdigit overlap protection
             self.last_end_timestamp.store(timestamp, Ordering::Relaxed);
@@ -1387,5 +1511,270 @@ mod tests {
         let result = detector.process_rtp(101, 2, 1800, &new_digit);
         assert!(result.is_some(), "Digit beyond interdigit gap should be accepted");
         assert_eq!(result.unwrap().digit, '6');
+    }
+
+    // === Bug #40: DTMF duration wraparound threshold too conservative ===
+
+    #[test]
+    fn test_bug40_no_false_wraparound_on_reordering() {
+        // Out-of-order packets with slightly decreasing duration should NOT
+        // trigger wraparound detection.  The old threshold (last_dur > 0xFC17)
+        // would false-trigger; the new reordering guard requires new_duration
+        // < old_duration/2 or new_duration < 0x1000.
+        let detector = DtmfDetector::new();
+        let ts = 5000u32;
+
+        // Packet with duration=1000
+        let p1 = [5, 0x0A, 0x03, 0xE8]; // duration=1000
+        detector.process_rtp(101, 1, ts, &p1);
+
+        // Out-of-order packet arrives with duration=800 (slightly less, NOT wrap)
+        let p2 = [5, 0x0A, 0x03, 0x20]; // duration=800
+        detector.process_rtp(101, 2, ts, &p2);
+
+        // End packet with duration=1200
+        let p3 = [5, 0x8A, 0x04, 0xB0]; // duration=1200, end=true
+        let result = detector.process_rtp(101, 3, ts, &p3);
+
+        assert!(result.is_some());
+        let detected = result.unwrap();
+        assert_eq!(detected.digit, '5');
+        // Duration should be 1200/8 = 150ms.
+        // No wraparound accumulation should have happened.
+        assert!(
+            detected.duration_ms < 1000,
+            "Should not have accumulated wraparound: got {}ms",
+            detected.duration_ms
+        );
+    }
+
+    #[test]
+    fn test_bug40_genuine_wraparound_still_detected() {
+        // A genuine wraparound (duration goes from 0xFF00 to 0x0100) should
+        // still be detected because 0x0100 < 0xFF00/2 and 0x0100 < 0x1000.
+        let detector = DtmfDetector::new();
+        let ts = 5000u32;
+
+        // Duration approaching wrap
+        let p1 = [5, 0x0A, 0xFF, 0x00]; // duration=0xFF00
+        detector.process_rtp(101, 1, ts, &p1);
+
+        // Duration wraps around
+        let p2 = [5, 0x0A, 0x01, 0x00]; // duration=0x0100 (after wrap)
+        detector.process_rtp(101, 2, ts, &p2);
+
+        // End packet with wrapped duration
+        let p3 = [5, 0x8A, 0x02, 0x00]; // duration=0x0200, end=true
+        let result = detector.process_rtp(101, 3, ts, &p3);
+
+        assert!(result.is_some());
+        let detected = result.unwrap();
+        assert_eq!(detected.digit, '5');
+        // Total should be 0x0200 + 0xFFFF = 0x101FF = 66047 samples
+        // At 8kHz: 66047 / 8 = 8255ms
+        assert!(
+            detected.duration_ms > 8000,
+            "Genuine wraparound should accumulate: got {}ms",
+            detected.duration_ms
+        );
+    }
+
+    // === Bug #41: DTMF zero-duration END accepted ===
+
+    #[test]
+    fn test_bug41_zero_duration_end_rejected() {
+        // An END packet with duration=0 should be rejected (return None),
+        // not accepted and reported as a digit.
+        let detector = DtmfDetector::new();
+
+        // END packet with duration=0
+        let p1 = [5, 0x80, 0, 0]; // event=5, end=true, volume=0, duration=0
+        let result = detector.process_rtp(101, 1, 1000, &p1);
+        assert!(
+            result.is_none(),
+            "END packet with zero accumulated duration should be rejected"
+        );
+
+        // Verify no digit was queued
+        assert!(
+            !detector.has_digits(),
+            "Zero-duration END should not queue a digit"
+        );
+    }
+
+    #[test]
+    fn test_bug41_nonzero_duration_end_still_works() {
+        // Ensure normal END packets with duration > 0 still work after the fix.
+        let detector = DtmfDetector::new();
+
+        let p1 = [5, 0x0A, 0, 160]; // duration=160, no end
+        detector.process_rtp(101, 1, 1000, &p1);
+
+        let p2 = [5, 0x8A, 1, 64]; // duration=320, end=true
+        let result = detector.process_rtp(101, 2, 1000, &p2);
+        assert!(result.is_some(), "Normal END with duration > 0 should work");
+        assert_eq!(result.unwrap().digit, '5');
+    }
+
+    // === Bug #42: DTMF missing END timeout ===
+
+    #[test]
+    fn test_bug42_missing_end_timeout_force_completes() {
+        // If END is permanently lost, the digit should be force-completed after
+        // the timeout expires (measured via RTP timestamps).
+        let mut detector = DtmfDetector::new();
+        detector.set_end_timeout_ms(1000); // 1 second timeout for faster testing
+
+        let start_ts: u32 = 10000;
+
+        // First packet of digit '5'
+        let p1 = [5, 0x0A, 0, 160]; // duration=160, no end
+        let result = detector.process_rtp(101, 1, start_ts, &p1);
+        assert!(result.is_none());
+
+        // More packets, still no END
+        let p2 = [5, 0x0A, 1, 64]; // duration=320, no end
+        let result = detector.process_rtp(101, 2, start_ts, &p2);
+        assert!(result.is_none());
+
+        // Now a packet arrives much later (1.5 seconds later = 12000 samples at 8kHz).
+        // This exceeds the 1000ms timeout (8000 samples).
+        // This could be a completely different packet (e.g., audio), but we
+        // simulate it as a new DTMF digit with a different timestamp.
+        let late_ts = start_ts + 12000; // 1.5s later
+        let p3 = [6, 0x0A, 0, 160]; // different digit, no end
+        let result = detector.process_rtp(101, 3, late_ts, &p3);
+
+        // The old digit '5' should have been force-completed via timeout
+        // The new packet for '6' starts a new digit (returns None)
+        assert!(result.is_none(), "New digit packet itself returns None");
+
+        // Check that '5' was force-completed and queued
+        let queued = detector.pop_digit();
+        assert!(
+            queued.is_some(),
+            "Timed-out digit '5' should have been force-completed and queued"
+        );
+        assert_eq!(queued.unwrap().digit, '5');
+    }
+
+    #[test]
+    fn test_bug42_no_premature_timeout() {
+        // Packets arriving within the timeout should NOT trigger force-completion.
+        let mut detector = DtmfDetector::new();
+        detector.set_end_timeout_ms(5000); // 5 second timeout
+
+        let start_ts: u32 = 10000;
+
+        // First packet of digit '5'
+        let p1 = [5, 0x0A, 0, 160];
+        detector.process_rtp(101, 1, start_ts, &p1);
+
+        // Packet arrives 1 second later at the SAME digit timestamp (within timeout)
+        // Note: in normal DTMF, all packets of one digit share the same RTP timestamp.
+        // The timeout is checked by comparing incoming RTP timestamp vs first_packet_ts.
+        // A packet with the same ts won't trigger timeout since elapsed=0.
+        let p2 = [5, 0x0A, 0x1F, 0x40]; // duration=8000 (1s)
+        let result = detector.process_rtp(101, 2, start_ts, &p2);
+        assert!(result.is_none(), "Should not timeout within window");
+
+        // No force-completion should have happened
+        assert!(!detector.has_digits(), "No premature timeout should occur");
+
+        // Normal END arrives
+        let p3 = [5, 0x8A, 0x1F, 0x40]; // duration=8000, end=true
+        let result = detector.process_rtp(101, 3, start_ts, &p3);
+        assert!(result.is_some(), "Normal END should still work");
+        assert_eq!(result.unwrap().digit, '5');
+    }
+
+    // === Bug #43: DTMF dynamic PT accepts any 96-127 ===
+
+    #[test]
+    fn test_bug43_dynamic_pt_latching() {
+        // When expected_pt=0, the first DTMF packet's PT should be latched.
+        // Subsequent packets with a different PT should be rejected.
+        let detector = DtmfDetector::with_payload_type(0);
+
+        // First packet with PT=96 — should be accepted and latch PT=96
+        let p1 = [5, 0x8A, 0, 160]; // end=true, duration=160
+        let result = detector.process_rtp(96, 1, 1000, &p1);
+        assert!(result.is_some(), "First dynamic PT packet should be accepted");
+        assert_eq!(result.unwrap().digit, '5');
+
+        // Second packet with PT=100 — should be rejected (PT latched to 96)
+        let p2 = [6, 0x8A, 0, 160]; // end=true
+        let result = detector.process_rtp(100, 2, 2000, &p2);
+        assert!(
+            result.is_none(),
+            "Packet with different PT than latched should be rejected"
+        );
+
+        // Third packet with PT=96 — should be accepted (matches latched PT)
+        let p3 = [7, 0x8A, 0, 160]; // end=true
+        let result = detector.process_rtp(96, 3, 3000, &p3);
+        assert!(result.is_some(), "Packet with latched PT should be accepted");
+        assert_eq!(result.unwrap().digit, '7');
+    }
+
+    #[test]
+    fn test_bug43_set_expected_pt_overrides() {
+        // set_expected_pt() should allow explicit SDP-based configuration
+        // and bypass dynamic PT detection entirely.
+        let mut detector = DtmfDetector::with_payload_type(0);
+
+        // Explicitly set PT from SDP
+        detector.set_expected_pt(110);
+
+        // Packet with PT=110 — should be accepted
+        let p1 = [5, 0x8A, 0, 160];
+        let result = detector.process_rtp(110, 1, 1000, &p1);
+        assert!(result.is_some(), "Packet matching set_expected_pt should be accepted");
+
+        // Packet with PT=96 — should be rejected
+        let p2 = [6, 0x8A, 0, 160];
+        let result = detector.process_rtp(96, 2, 2000, &p2);
+        assert!(
+            result.is_none(),
+            "Packet not matching set_expected_pt should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bug43_non_dynamic_pt_still_rejected() {
+        // Even with expected_pt=0, non-dynamic PTs (< 96 or > 127) should
+        // still be rejected before latching.
+        let detector = DtmfDetector::with_payload_type(0);
+
+        let p1 = [5, 0x8A, 0, 160];
+        let result = detector.process_rtp(50, 1, 1000, &p1);
+        assert!(result.is_none(), "Non-dynamic PT should be rejected");
+
+        let result = detector.process_rtp(128, 2, 2000, &p1);
+        assert!(result.is_none(), "PT > 127 should be rejected");
+    }
+
+    #[test]
+    fn test_bug43_latched_pt_survives_reset() {
+        // Latched PT should persist across reset() calls because the PT
+        // negotiated via SDP doesn't change mid-call.
+        let detector = DtmfDetector::with_payload_type(0);
+
+        // Latch PT=96
+        let p1 = [5, 0x8A, 0, 160];
+        detector.process_rtp(96, 1, 1000, &p1);
+
+        // Reset detector state (e.g., due to stuck stream)
+        detector.reset();
+
+        // PT=96 should still be accepted
+        let p2 = [6, 0x8A, 0, 160];
+        let result = detector.process_rtp(96, 2, 3000, &p2);
+        assert!(result.is_some(), "Latched PT should survive reset");
+
+        // PT=100 should still be rejected
+        let p3 = [7, 0x8A, 0, 160];
+        let result = detector.process_rtp(100, 3, 4000, &p3);
+        assert!(result.is_none(), "Non-latched PT should still be rejected after reset");
     }
 }

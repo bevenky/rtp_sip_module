@@ -10,6 +10,22 @@
 
 use std::time::{Duration, Instant};
 
+/// Result of handling a 422 (Session Interval Too Small) response (Bug #62).
+///
+/// Returns a struct instead of just the values, so the caller knows whether
+/// to include the `Min-SE` header in the retry INVITE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handle422Result {
+    /// The adjusted Session-Expires value for the retry
+    pub session_expires: u32,
+    /// The adjusted Min-SE value for the retry
+    pub min_se: u32,
+    /// Whether the retry INVITE must include a `Min-SE` header.
+    /// This is `true` when the remote's Min-SE was higher than ours
+    /// and forced an update.
+    pub should_include_min_se_header: bool,
+}
+
 /// Session timer role (who refreshes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshRole {
@@ -222,6 +238,88 @@ impl SessionTimer {
         let header = header.trim();
         let value_str = header.split(';').next()?.trim();
         value_str.parse().ok()
+    }
+
+    /// Handle a 422 (Session Interval Too Small) response (Bug #62).
+    ///
+    /// When the remote side rejects our INVITE with 422, it includes a `Min-SE`
+    /// header indicating the minimum acceptable session interval. We must:
+    /// 1. Update our `min_se` to be at least the remote's value
+    /// 2. Ensure `session_expires` is >= the new `min_se`
+    /// 3. Retry the INVITE with the updated values
+    ///
+    /// Returns a [`Handle422Result`] struct that includes
+    /// `should_include_min_se_header` so the caller knows whether to add
+    /// a `Min-SE` header to the retried INVITE.
+    pub fn handle_422_response(&mut self, remote_min_se: u32) -> Handle422Result {
+        // Track whether the remote forced an increase
+        let should_include_min_se_header = remote_min_se > self.min_se;
+
+        // Update min_se to be at least the remote's requirement
+        if remote_min_se > self.min_se {
+            self.min_se = remote_min_se;
+        }
+
+        // Ensure session_expires is at least min_se
+        if self.session_expires < self.min_se {
+            self.session_expires = self.min_se;
+        }
+
+        Handle422Result {
+            session_expires: self.session_expires,
+            min_se: self.min_se,
+            should_include_min_se_header,
+        }
+    }
+
+    /// Process a 200 OK response to an INVITE that requested session timers (Bug #63).
+    ///
+    /// If the remote omits the `Session-Expires` header from the 200 OK even though
+    /// we requested session timers, we fall back to the default of 1800 seconds
+    /// (RFC 4028 Section 5) and start the timer as the local refresher.
+    ///
+    /// # Arguments
+    /// * `session_expires_header` - The raw `Session-Expires` header value from
+    ///   the 200 OK, or `None` if the header was absent.
+    ///
+    /// # Returns
+    /// The negotiated `(session_expires, RefreshRole)` that was applied to the timer.
+    pub fn process_response(
+        &mut self,
+        session_expires_header: Option<&str>,
+    ) -> (u32, RefreshRole) {
+        const DEFAULT_SESSION_EXPIRES: u32 = 1800;
+
+        match session_expires_header {
+            Some(header) => {
+                if let Some((seconds, role_opt)) = Self::parse_session_expires(header) {
+                    let role = role_opt.unwrap_or(self.config.preferred_role);
+                    self.start(seconds, role);
+                    (seconds.max(self.min_se), role)
+                } else {
+                    // Header present but unparseable -- fall back to default
+                    tracing::warn!(
+                        header = header,
+                        "Could not parse Session-Expires from 200 OK, using default {}s",
+                        DEFAULT_SESSION_EXPIRES
+                    );
+                    let role = RefreshRole::Local;
+                    self.start(DEFAULT_SESSION_EXPIRES, role);
+                    (DEFAULT_SESSION_EXPIRES, role)
+                }
+            }
+            None => {
+                // Bug #63: Remote omitted Session-Expires entirely.
+                // Fall back to 1800s per RFC 4028 Section 5.
+                tracing::warn!(
+                    "Remote omitted Session-Expires in 200 OK, defaulting to {}s",
+                    DEFAULT_SESSION_EXPIRES
+                );
+                let role = RefreshRole::Local;
+                self.start(DEFAULT_SESSION_EXPIRES, role);
+                (DEFAULT_SESSION_EXPIRES, role)
+            }
+        }
     }
 
     /// Is the timer active?
@@ -486,5 +584,115 @@ mod tests {
         // An unknown refresher value should yield None for the role.
         let result = SessionTimer::parse_session_expires("1800;refresher=unknown");
         assert_eq!(result, Some((1800, None)));
+    }
+
+    // === Bug #62: handle_422_response returns Handle422Result ===
+
+    #[test]
+    fn test_handle_422_response_increases_min_se() {
+        let config = SessionTimerConfig {
+            session_expires: 1800,
+            min_se: 90,
+            ..Default::default()
+        };
+        let mut timer = SessionTimer::new(config);
+
+        let result = timer.handle_422_response(180);
+        assert_eq!(result.min_se, 180);
+        assert_eq!(result.session_expires, 1800);
+        assert!(result.should_include_min_se_header);
+    }
+
+    #[test]
+    fn test_handle_422_response_bumps_session_expires() {
+        let config = SessionTimerConfig {
+            session_expires: 120,
+            min_se: 90,
+            ..Default::default()
+        };
+        let mut timer = SessionTimer::new(config);
+
+        let result = timer.handle_422_response(300);
+        assert_eq!(result.min_se, 300);
+        assert_eq!(result.session_expires, 300);
+        assert!(result.should_include_min_se_header);
+    }
+
+    #[test]
+    fn test_handle_422_response_no_change_when_lower() {
+        let config = SessionTimerConfig {
+            session_expires: 1800,
+            min_se: 200,
+            ..Default::default()
+        };
+        let mut timer = SessionTimer::new(config);
+
+        let result = timer.handle_422_response(90);
+        assert_eq!(result.min_se, 200);
+        assert_eq!(result.session_expires, 1800);
+        assert!(!result.should_include_min_se_header);
+    }
+
+    #[test]
+    fn test_handle_422_result_should_include_min_se_header() {
+        let config = SessionTimerConfig {
+            session_expires: 1800,
+            min_se: 90,
+            ..Default::default()
+        };
+        let mut timer = SessionTimer::new(config);
+
+        // Remote requires higher Min-SE -> should_include_min_se_header = true
+        let result = timer.handle_422_response(180);
+        assert!(result.should_include_min_se_header);
+
+        // Remote requires same or lower -> should_include_min_se_header = false
+        let result = timer.handle_422_response(180);
+        assert!(!result.should_include_min_se_header);
+    }
+
+    // === Bug #63: process_response handles missing Session-Expires ===
+
+    #[test]
+    fn test_process_response_with_valid_header() {
+        let mut timer = SessionTimer::new(SessionTimerConfig::default());
+
+        let (se, role) = timer.process_response(Some("900;refresher=uac"));
+        assert_eq!(se, 900);
+        assert_eq!(role, RefreshRole::Local);
+        assert!(timer.is_active());
+    }
+
+    #[test]
+    fn test_process_response_missing_header_defaults() {
+        let mut timer = SessionTimer::new(SessionTimerConfig::default());
+
+        // Bug #63: Remote omits Session-Expires -> default 1800s, Local refresher
+        let (se, role) = timer.process_response(None);
+        assert_eq!(se, 1800);
+        assert_eq!(role, RefreshRole::Local);
+        assert!(timer.is_active());
+    }
+
+    #[test]
+    fn test_process_response_unparseable_header_defaults() {
+        let mut timer = SessionTimer::new(SessionTimerConfig::default());
+
+        // Malformed header -> fall back to 1800s
+        let (se, role) = timer.process_response(Some("invalid"));
+        assert_eq!(se, 1800);
+        assert_eq!(role, RefreshRole::Local);
+        assert!(timer.is_active());
+    }
+
+    #[test]
+    fn test_process_response_without_refresher() {
+        let mut timer = SessionTimer::new(SessionTimerConfig::default());
+
+        // No refresher specified -> use preferred_role from config (Local)
+        let (se, role) = timer.process_response(Some("600"));
+        assert_eq!(se, 600);
+        assert_eq!(role, RefreshRole::Local);
+        assert!(timer.is_active());
     }
 }

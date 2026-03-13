@@ -390,22 +390,25 @@ impl From<RustCallEvent> for PyCallEvent {
 #[pyclass(name = "CallState", eq, eq_int)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PyCallState {
+    /// INVITE sent, waiting for response (Bug #54)
+    Trying = 0,
     /// 180 Ringing - call is ringing, no media yet
-    Ringing = 0,
+    Ringing = 1,
     /// 183 Session Progress with SDP - early media available
-    EarlyMedia = 1,
+    EarlyMedia = 2,
     /// 200 OK - call answered and connected
-    Active = 2,
+    Active = 3,
     /// On hold (local or remote)
-    Hold = 3,
+    Hold = 4,
     /// Call ended
-    Ended = 4,
+    Ended = 5,
 }
 
 impl From<crate::sip::engine::CallState> for PyCallState {
     fn from(state: crate::sip::engine::CallState) -> Self {
         use crate::sip::engine::CallState;
         match state {
+            CallState::Trying => PyCallState::Trying,
             CallState::Ringing => PyCallState::Ringing,
             CallState::EarlyMedia => PyCallState::EarlyMedia,
             CallState::Active => PyCallState::Active,

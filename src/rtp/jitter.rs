@@ -165,8 +165,9 @@ impl JitterBuffer {
             if let Some(expected) = self.next_sequence {
                 if Self::sequence_after(seq, expected) {
                     // Calculate gap size, capped at 100 to avoid flooding
+                    // Bug #64: use <= 100 so a gap of exactly 100 is not silently ignored
                     let gap = seq.wrapping_sub(expected);
-                    if gap > 0 && gap < 100 {
+                    if gap > 0 && gap <= 100 {
                         for i in 0..gap {
                             let missing = expected.wrapping_add(i);
                             if !self.packets.contains_key(&missing) {
@@ -435,6 +436,13 @@ impl PacketLossConcealer {
         self.attenuation = 1.0;
     }
 
+    /// Reset PLC state (Bug #48: called on SSRC change to avoid
+    /// stale concealment from the previous stream).
+    pub fn reset(&mut self) {
+        self.last_samples = vec![0; self.samples_per_packet];
+        self.attenuation = 1.0;
+    }
+
     /// Generate concealment samples for a lost packet
     pub fn conceal(&mut self) -> Vec<i16> {
         // Simple decay-based concealment
@@ -550,5 +558,76 @@ mod tests {
         // Multiple losses should decay further
         let concealed2 = plc.conceal();
         assert!(concealed2[100].abs() < concealed1[100].abs());
+    }
+
+    // === Bug #64: NACK gap of exactly 100 should NOT be dropped ===
+
+    #[test]
+    fn test_nack_gap_exactly_100_not_dropped() {
+        let mut config = JitterConfig::default();
+        config.nack_enabled = true;
+        let mut jb = JitterBuffer::with_config(config);
+
+        // Push seq 0 -> next_sequence becomes 1
+        // Push seq 101 -> gap = 101.wrapping_sub(1) = 100, exactly the max
+        jb.push(make_packet(0, 0));
+        jb.push(make_packet(101, 101 * 160));
+
+        let nacks = jb.pending_nacks();
+        // Bug #64: gap of exactly 100 should generate NACKs for seq 1..=100
+        assert_eq!(
+            nacks.len(),
+            100,
+            "sequence gap of exactly 100 should generate 100 NACKs (seq 1..=100), got {}",
+            nacks.len()
+        );
+        for expected in 1u16..=100 {
+            assert!(
+                nacks.contains(&expected),
+                "NACK list should contain seq={}",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_nack_gap_101_is_dropped() {
+        let mut config = JitterConfig::default();
+        config.nack_enabled = true;
+        let mut jb = JitterBuffer::with_config(config);
+
+        // Push seq 0 -> next_sequence becomes 1
+        // Push seq 102 -> gap = 102.wrapping_sub(1) = 101, exceeds max 100
+        jb.push(make_packet(0, 0));
+        jb.push(make_packet(102, 102 * 160));
+
+        let nacks = jb.pending_nacks();
+        // Sequence gap of 101 > 100 should be silently dropped
+        assert_eq!(
+            nacks.len(),
+            0,
+            "sequence gap of 101 should generate 0 NACKs, got {}",
+            nacks.len()
+        );
+    }
+
+    #[test]
+    fn test_nack_gap_99_still_works() {
+        let mut config = JitterConfig::default();
+        config.nack_enabled = true;
+        let mut jb = JitterBuffer::with_config(config);
+
+        // Push seq 0 -> next_sequence becomes 1
+        // Push seq 100 -> gap = 100.wrapping_sub(1) = 99 (below max 100)
+        jb.push(make_packet(0, 0));
+        jb.push(make_packet(100, 100 * 160));
+
+        let nacks = jb.pending_nacks();
+        assert_eq!(
+            nacks.len(),
+            99,
+            "sequence gap of 99 should generate 99 NACKs (seq 1..=99), got {}",
+            nacks.len()
+        );
     }
 }

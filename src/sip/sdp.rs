@@ -29,8 +29,8 @@
 //! ## Telephone-Event (RFC 2833/4733)
 //! - **Variable PT**: Usually 101, but can be any dynamic PT (96-127). We detect
 //!   from rtpmap, not hardcoded.
-//! - **fmtp line**: `a=fmtp:101 0-16` specifies supported events. We advertise 0-16
-//!   (digits + ABCD) but currently only use 0-15.
+//! - **fmtp line**: `a=fmtp:101 0-15` specifies supported events (16 DTMF digits,
+//!   events 0-15). We now parse remote fmtp and generate the correct range.
 //!
 //! ## SDP Variations Between Responses
 //! - **Different SDP in 183 vs 200 OK**: Common with mobile carriers and some
@@ -143,6 +143,9 @@ pub struct MediaDescription {
     pub connection: Option<IpAddr>,
     /// RTP map entries (payload_type -> codec info)
     pub rtpmap: Vec<RtpMapEntry>,
+    /// fmtp entries (payload_type -> format parameters string)
+    /// Bug #57: Parse fmtp lines from remote SDP (e.g., `a=fmtp:101 0-15`)
+    pub fmtp: Vec<(u8, String)>,
     /// Attributes
     pub attributes: Vec<String>,
     /// Media direction (sendrecv/sendonly/recvonly/inactive)
@@ -239,6 +242,10 @@ impl Sdp {
         let mut media: Vec<MediaDescription> = Vec::new();
         let mut session_attributes: Vec<String> = Vec::new();
         let mut current_media: Option<MediaDescription> = None;
+        // Bug #58: Track which mandatory fields are present
+        let mut has_version = false;
+        let mut has_origin = false;
+        let mut has_session_name = false;
 
         for line in sdp_str.lines() {
             let line = line.trim();
@@ -256,12 +263,15 @@ impl Sdp {
             match type_char {
                 'v' => {
                     version = value.parse().unwrap_or(0);
+                    has_version = true;
                 }
                 'o' => {
                     origin = Self::parse_origin(value)?;
+                    has_origin = true;
                 }
                 's' => {
                     session_name = value.to_string();
+                    has_session_name = true;
                 }
                 'c' => {
                     let addr = Self::parse_connection(value)?;
@@ -284,6 +294,14 @@ impl Sdp {
                             if let Ok(entry) = Self::parse_rtpmap(&value[7..]) {
                                 m.rtpmap.push(entry);
                             }
+                        } else if value.starts_with("fmtp:") {
+                            // Bug #57: Parse fmtp lines (e.g., "fmtp:101 0-15")
+                            if let Some((pt_str, params)) = value[5..].split_once(' ') {
+                                if let Ok(pt) = pt_str.parse::<u8>() {
+                                    m.fmtp.push((pt, params.to_string()));
+                                }
+                            }
+                            m.attributes.push(value.to_string());
                         } else if let Some(dir) = MediaDirection::from_str(value) {
                             // Parse direction attribute (sendrecv/sendonly/recvonly/inactive)
                             m.direction = dir;
@@ -302,6 +320,23 @@ impl Sdp {
         // Save last media if exists
         if let Some(m) = current_media {
             media.push(m);
+        }
+
+        // Bug #58: Validate mandatory SDP fields (v=, o=, s=) are present
+        if !has_version {
+            return Err(RtpSipError::Sdp(
+                "Missing mandatory SDP field: v= (version)".to_string(),
+            ));
+        }
+        if !has_origin {
+            return Err(RtpSipError::Sdp(
+                "Missing mandatory SDP field: o= (origin)".to_string(),
+            ));
+        }
+        if !has_session_name {
+            return Err(RtpSipError::Sdp(
+                "Missing mandatory SDP field: s= (session name)".to_string(),
+            ));
         }
 
         Ok(Self {
@@ -337,9 +372,33 @@ impl Sdp {
             return Err(RtpSipError::Sdp("Invalid connection line".to_string()));
         }
 
-        parts[2]
+        let addr_type = parts[1];
+        let addr: IpAddr = parts[2]
             .parse()
-            .map_err(|_| RtpSipError::Sdp(format!("Invalid IP address: {}", parts[2])))
+            .map_err(|_| RtpSipError::Sdp(format!("Invalid IP address: {}", parts[2])))?;
+
+        // Bug #59: Validate that address type matches the actual address
+        match addr_type {
+            "IP4" => {
+                if !addr.is_ipv4() {
+                    return Err(RtpSipError::Sdp(format!(
+                        "Address type is IP4 but address '{}' is not IPv4",
+                        parts[2]
+                    )));
+                }
+            }
+            "IP6" => {
+                if !addr.is_ipv6() {
+                    return Err(RtpSipError::Sdp(format!(
+                        "Address type is IP6 but address '{}' is not IPv6",
+                        parts[2]
+                    )));
+                }
+            }
+            _ => {} // Unknown address type - don't validate
+        }
+
+        Ok(addr)
     }
 
     fn parse_media_line(value: &str) -> Result<MediaDescription> {
@@ -350,12 +409,18 @@ impl Sdp {
         }
 
         let media_type = parts[0].to_string();
-        let port: u16 = parts[1]
-            .split('/')
-            .next()
-            .unwrap_or("0")
+        // Bug #55: Parse port as u32 first, validate 0-65535 range to avoid silent wrapping
+        let port_str = parts[1].split('/').next().unwrap_or("0");
+        let port_u32: u32 = port_str
             .parse()
-            .unwrap_or(0);
+            .map_err(|_| RtpSipError::Sdp(format!("Invalid port number: {}", port_str)))?;
+        if port_u32 > 65535 {
+            return Err(RtpSipError::Sdp(format!(
+                "Port {} out of range (0-65535)",
+                port_u32
+            )));
+        }
+        let port = port_u32 as u16;
         let protocol = parts[2].to_string();
         let payload_types: Vec<u8> = parts[3..]
             .iter()
@@ -369,6 +434,7 @@ impl Sdp {
             payload_types,
             connection: None,
             rtpmap: Vec::new(),
+            fmtp: Vec::new(),
             attributes: Vec::new(),
             direction: MediaDirection::SendRecv, // Default per RFC 3264
         })
@@ -387,10 +453,20 @@ impl Sdp {
 
         let codec_parts: Vec<&str> = parts[1].split('/').collect();
         let encoding_name = codec_parts[0].to_string();
-        let clock_rate: u32 = codec_parts
-            .get(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8000);
+        // Bug #56: For dynamic payload types (96-127), clock rate is mandatory in rtpmap.
+        // Only default to 8000 for static payload types where rtpmap is optional per RFC 3551.
+        let clock_rate: u32 = match codec_parts.get(1).and_then(|s| s.parse().ok()) {
+            Some(rate) => rate,
+            None => {
+                if payload_type >= 96 && payload_type <= 127 {
+                    return Err(RtpSipError::Sdp(format!(
+                        "Missing clock rate for dynamic payload type {}",
+                        payload_type
+                    )));
+                }
+                8000 // Default for static payload types (PCMU=0, PCMA=8, etc.)
+            }
+        };
         let channels: Option<u8> = codec_parts.get(2).and_then(|s| s.parse().ok());
 
         Ok(RtpMapEntry {
@@ -500,6 +576,20 @@ impl Sdp {
     /// Check if remote supports RFC 2833 DTMF
     pub fn supports_rfc2833(&self) -> bool {
         self.telephone_event_pt().is_some()
+    }
+
+    /// Bug #57: Get the telephone-event fmtp parameters string from remote SDP.
+    ///
+    /// Returns the event range string (e.g., "0-15") if an fmtp line exists for
+    /// the telephone-event payload type, None otherwise.
+    pub fn telephone_event_fmtp(&self) -> Option<String> {
+        let audio = self.audio()?;
+        let te_pt = self.telephone_event_pt()?;
+        audio
+            .fmtp
+            .iter()
+            .find(|(pt, _)| *pt == te_pt)
+            .map(|(_, params)| params.clone())
     }
 
     /// Get media direction for audio stream
@@ -709,9 +799,10 @@ impl SdpBuilder {
         }
 
         // Add telephone-event for RFC 2833 DTMF
+        // Bug #57: Fix event range from 0-16 to 0-15 (16 DTMF digits, events 0-15)
         if self.include_telephone_event {
             sdp.push_str("a=rtpmap:101 telephone-event/8000\r\n");
-            sdp.push_str("a=fmtp:101 0-16\r\n");
+            sdp.push_str("a=fmtp:101 0-15\r\n");
         }
 
         // Add ptime (20ms frames)
@@ -1031,5 +1122,274 @@ a=rtpmap:101 telephone-event/8000
         assert_eq!(codecs.len(), 2); // PCMA, PCMU (101 is not a codec)
         assert_eq!(codecs[0], CodecType::Pcma);
         assert_eq!(codecs[1], CodecType::Pcmu);
+    }
+
+    // ===== Bug #55: SDP port range validation tests =====
+
+    #[test]
+    fn test_bug55_port_exceeding_u16_rejected() {
+        // Port 70000 exceeds u16 max (65535) and should be rejected
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 70000 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_err(), "Port 70000 should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("out of range"),
+            "Expected 'out of range' error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_bug55_port_at_boundary_accepted() {
+        // Port 65535 is the maximum valid port
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 65535 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok(), "Port 65535 should be valid");
+        let sdp = result.unwrap();
+        assert_eq!(sdp.audio().unwrap().port, 65535);
+    }
+
+    #[test]
+    fn test_bug55_port_zero_accepted() {
+        // Port 0 means stream disabled - valid per RFC 3264
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 0 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok(), "Port 0 should be valid");
+        assert!(result.unwrap().audio().unwrap().is_disabled());
+    }
+
+    #[test]
+    fn test_bug55_port_with_count_validated() {
+        // Port range like "70000/2" should still reject the base port
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 70000/2 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_err(), "Port 70000/2 should be rejected");
+    }
+
+    // ===== Bug #56: Clock rate validation for dynamic PTs =====
+
+    #[test]
+    fn test_bug56_dynamic_pt_missing_clock_rate_rejected() {
+        // Dynamic payload type 101 without clock rate should fail
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 101\r\na=rtpmap:101 telephone-event\r\n";
+        let result = Sdp::parse(sdp_str);
+        // The rtpmap parse should fail and the entry won't be added
+        // (parse_rtpmap returns Err, which is silently ignored in the if let Ok block)
+        assert!(result.is_ok()); // SDP itself parses, but rtpmap entry is skipped
+        let sdp = result.unwrap();
+        let audio = sdp.audio().unwrap();
+        assert!(
+            audio.rtpmap.is_empty(),
+            "Dynamic PT without clock rate should not produce rtpmap entry"
+        );
+    }
+
+    #[test]
+    fn test_bug56_static_pt_missing_clock_rate_defaults() {
+        // Static payload type 0 (PCMU) without clock rate should default to 8000
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok());
+        let sdp = result.unwrap();
+        let audio = sdp.audio().unwrap();
+        assert_eq!(audio.rtpmap.len(), 1);
+        assert_eq!(audio.rtpmap[0].clock_rate, 8000);
+    }
+
+    #[test]
+    fn test_bug56_dynamic_pt_with_clock_rate_accepted() {
+        // Dynamic PT 96 with explicit clock rate should work fine
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 96\r\na=rtpmap:96 opus/48000/2\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok());
+        let sdp = result.unwrap();
+        let audio = sdp.audio().unwrap();
+        assert_eq!(audio.rtpmap.len(), 1);
+        assert_eq!(audio.rtpmap[0].clock_rate, 48000);
+    }
+
+    // ===== Bug #57: fmtp parsing and generation tests =====
+
+    #[test]
+    fn test_bug57_fmtp_parsed_from_remote_sdp() {
+        let sdp_str = r#"v=0
+o=- 123 1 IN IP4 10.0.0.1
+s=-
+c=IN IP4 10.0.0.1
+t=0 0
+m=audio 5004 RTP/AVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+"#;
+        let sdp = Sdp::parse(sdp_str).unwrap();
+        assert_eq!(sdp.telephone_event_fmtp(), Some("0-15".to_string()));
+    }
+
+    #[test]
+    fn test_bug57_fmtp_not_present() {
+        let sdp_str = r#"v=0
+o=- 123 1 IN IP4 10.0.0.1
+s=-
+c=IN IP4 10.0.0.1
+t=0 0
+m=audio 5004 RTP/AVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+"#;
+        let sdp = Sdp::parse(sdp_str).unwrap();
+        assert_eq!(sdp.telephone_event_fmtp(), None);
+    }
+
+    #[test]
+    fn test_bug57_fmtp_with_old_0_16_from_remote() {
+        // Remote sends 0-16 (their range) - we should parse it correctly
+        let sdp_str = r#"v=0
+o=- 123 1 IN IP4 10.0.0.1
+s=-
+c=IN IP4 10.0.0.1
+t=0 0
+m=audio 5004 RTP/AVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-16
+"#;
+        let sdp = Sdp::parse(sdp_str).unwrap();
+        assert_eq!(sdp.telephone_event_fmtp(), Some("0-16".to_string()));
+    }
+
+    #[test]
+    fn test_bug57_sdp_builder_generates_0_15() {
+        // Verify that generated SDP uses 0-15, not 0-16
+        let addr: SocketAddr = "10.0.0.1:5004".parse().unwrap();
+        let builder = SdpBuilder::new(addr).telephone_event(true);
+        let sdp_str = builder.build();
+        assert!(
+            sdp_str.contains("a=fmtp:101 0-15"),
+            "SDP builder should generate 0-15, got: {}",
+            sdp_str
+        );
+        assert!(
+            !sdp_str.contains("0-16"),
+            "SDP builder should NOT contain 0-16, got: {}",
+            sdp_str
+        );
+    }
+
+    // ===== Bug #58: Mandatory SDP field validation tests =====
+
+    #[test]
+    fn test_bug58_empty_sdp_rejected() {
+        let result = Sdp::parse("");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Missing mandatory SDP field"),
+            "Expected mandatory field error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_bug58_missing_version_rejected() {
+        // SDP with o= and s= but no v=
+        let sdp_str = "o=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("v="),
+            "Expected version field error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_bug58_missing_origin_rejected() {
+        // SDP with v= and s= but no o=
+        let sdp_str = "v=0\r\ns=-\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("o="),
+            "Expected origin field error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_bug58_missing_session_name_rejected() {
+        // SDP with v= and o= but no s=
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("s="),
+            "Expected session name field error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_bug58_all_mandatory_fields_present() {
+        // Minimal valid SDP
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok(), "SDP with all mandatory fields should parse");
+    }
+
+    // ===== Bug #59: Connection address type validation tests =====
+
+    #[test]
+    fn test_bug59_ip4_with_ipv6_address_rejected() {
+        // c=IN IP4 ::1 should fail: address type says IP4 but address is IPv6
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 ::1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_err(), "IP4 with IPv6 address should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("IP4") && err_msg.contains("not IPv4"),
+            "Expected address type mismatch error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_bug59_ip6_with_ipv4_address_rejected() {
+        // c=IN IP6 10.0.0.1 should fail: address type says IP6 but address is IPv4
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP6 10.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_err(), "IP6 with IPv4 address should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("IP6") && err_msg.contains("not IPv6"),
+            "Expected address type mismatch error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_bug59_ip4_with_ipv4_address_accepted() {
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok(), "IP4 with IPv4 address should be accepted");
+    }
+
+    #[test]
+    fn test_bug59_ip6_with_ipv6_address_accepted() {
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP6 ::1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok(), "IP6 with IPv6 address should be accepted");
+    }
+
+    #[test]
+    fn test_bug59_ip4_with_zero_address_accepted() {
+        // c=IN IP4 0.0.0.0 is valid (legacy hold)
+        let sdp_str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+        let result = Sdp::parse(sdp_str);
+        assert!(result.is_ok(), "IP4 with 0.0.0.0 should be accepted");
     }
 }
