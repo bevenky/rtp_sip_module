@@ -132,7 +132,13 @@ impl StunServerPool {
     /// Tries the best (fastest healthy) server first. If it fails or times out
     /// after 500ms, tries the next server, and so on.
     pub async fn binding_request(&self) -> Result<SocketAddr> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        // Bug #3 fix: Check if the best server is IPv6 and bind accordingly.
+        // Binding to "0.0.0.0:0" would fail when sending to an IPv6 server.
+        let bind_addr = match self.best_server() {
+            Some(addr) if addr.is_ipv6() => "[::]:0",
+            _ => "0.0.0.0:0",
+        };
+        let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(RtpSipError::Io)?;
         self.binding_request_on(&socket).await
@@ -189,7 +195,7 @@ impl StunServerPool {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            RtpSipError::Timeout("All STUN servers failed".to_string())
+            RtpSipError::Timeout("All STUN servers failed or unreachable".to_string())
         }))
     }
 

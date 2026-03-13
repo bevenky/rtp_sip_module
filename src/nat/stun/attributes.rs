@@ -85,9 +85,10 @@ impl StunAttribute {
                 let padded_len = (value_len + 3) & !3;
                 let mut buf = Vec::with_capacity(4 + padded_len);
                 buf.extend_from_slice(&ATTR_ERROR_CODE.to_be_bytes());
-                buf.extend_from_slice(&(padded_len as u16).to_be_bytes());
+                buf.extend_from_slice(&(value_len as u16).to_be_bytes());
                 buf.extend_from_slice(&[0, 0]); // reserved
-                buf.push((code / 100) as u8); // class
+                // Bug #34: Mask class to 3 bits to prevent overflow for codes >= 800
+                buf.push(((code / 100) as u8) & 0x07); // class
                 buf.push((code % 100) as u8); // number
                 buf.extend_from_slice(reason_bytes);
                 // Pad to 4-byte boundary
@@ -166,7 +167,21 @@ impl StunAttribute {
             ATTR_SOFTWARE => {
                 Some(StunAttribute::Software(String::from_utf8_lossy(data).to_string()))
             }
-            _ => Some(StunAttribute::Unknown(attr_type, data.to_vec())),
+            _ => {
+                // RFC 5389 Section 15: Attributes with type 0x0000-0x7FFF are
+                // comprehension-required. If we don't recognize one, the message
+                // cannot be processed correctly — return None so the caller
+                // knows to reject or ignore this attribute.
+                if attr_type < 0x8000 {
+                    tracing::warn!(
+                        attr_type = format!("0x{:04X}", attr_type),
+                        "Unknown comprehension-required STUN attribute, ignoring"
+                    );
+                    return None;
+                }
+                // Comprehension-optional (>= 0x8000): safe to ignore
+                Some(StunAttribute::Unknown(attr_type, data.to_vec()))
+            }
         }
     }
 }

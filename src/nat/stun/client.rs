@@ -25,10 +25,19 @@ impl StunClient {
 
     /// Perform a STUN Binding Request and return the reflexive address.
     /// Uses its own dedicated socket.
+    ///
+    /// Bug #48: Binds to the correct address family (IPv4 or IPv6) based on the
+    /// STUN server address. Previously always bound to `0.0.0.0:0` which would
+    /// fail when communicating with an IPv6 STUN server.
     pub async fn binding_request(&self) -> Result<SocketAddr> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        let bind_addr = if self.server.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = UdpSocket::bind(bind_addr)
             .await
-            .map_err(|e| RtpSipError::Io(e))?;
+            .map_err(RtpSipError::Io)?;
         self.binding_request_on(&socket, self.server).await
     }
 

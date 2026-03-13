@@ -14,7 +14,9 @@ const ROW_FREQS: [f64; 4] = [697.0, 770.0, 852.0, 941.0];
 /// DTMF column frequencies (Hz)
 const COL_FREQS: [f64; 4] = [1209.0, 1336.0, 1477.0, 1633.0];
 
-/// Minimum power threshold for tone detection (relative to total signal energy)
+/// Minimum power threshold for tone detection (relative to total signal energy).
+/// This threshold is for unnormalized power; it is scaled by block_size^2
+/// at construction time (Bug #73).
 const POWER_THRESHOLD: f64 = 4.0e5;
 /// Maximum allowed twist (difference between row and column power in dB)
 /// Normal twist: row > col allowed up to 8dB, reverse twist: col > row up to 4dB
@@ -33,9 +35,13 @@ struct GoertzelBin {
 }
 
 impl GoertzelBin {
-    fn new(freq: f64, sample_rate: u32, block_size: usize) -> Self {
-        let k = (0.5 + (block_size as f64 * freq / sample_rate as f64)) as usize;
-        let w = 2.0 * PI * k as f64 / block_size as f64;
+    fn new(freq: f64, sample_rate: u32, _block_size: usize) -> Self {
+        // Bug #21: Use exact target frequency instead of bin-rounded frequency.
+        // The old code rounded to the nearest DFT bin (`k = round(N*freq/fs)`)
+        // and then used `w = 2*pi*k/N`, which introduced a frequency error
+        // especially at small block sizes. The Goertzel algorithm works at any
+        // frequency, not just bin centers.
+        let w = 2.0 * PI * freq / sample_rate as f64;
         Self {
             coeff: 2.0 * w.cos(),
             s1: 0.0,
@@ -116,6 +122,10 @@ impl GoertzelDtmfDetector {
             GoertzelBin::new(COL_FREQS[3], sample_rate, block_size),
         ];
 
+        // Bug #73: Scale the power threshold by block_size^2 so it matches
+        // the normalized power values computed in analyze_block.
+        let scaled_threshold = POWER_THRESHOLD / (block_size * block_size) as f64;
+
         Self {
             row_bins,
             col_bins,
@@ -128,7 +138,7 @@ impl GoertzelDtmfDetector {
             last_reported: None,
             digit_reported: false,
             detected: Vec::new(),
-            power_threshold: POWER_THRESHOLD,
+            power_threshold: scaled_threshold,
         }
     }
 
@@ -173,11 +183,14 @@ impl GoertzelDtmfDetector {
 
     /// Analyze a complete block of samples
     fn analyze_block(&mut self) {
+        // Bug #73: Normalize power by block_size^2 for consistent threshold comparison
+        let norm = (self.block_size * self.block_size) as f64;
+
         // Find strongest row and column
         let mut max_row_power = 0.0f64;
         let mut max_row_idx = 0;
         for (i, bin) in self.row_bins.iter().enumerate() {
-            let p = bin.power();
+            let p = bin.power() / norm;
             if p > max_row_power {
                 max_row_power = p;
                 max_row_idx = i;
@@ -187,7 +200,7 @@ impl GoertzelDtmfDetector {
         let mut max_col_power = 0.0f64;
         let mut max_col_idx = 0;
         for (i, bin) in self.col_bins.iter().enumerate() {
-            let p = bin.power();
+            let p = bin.power() / norm;
             if p > max_col_power {
                 max_col_power = p;
                 max_col_idx = i;
@@ -212,18 +225,21 @@ impl GoertzelDtmfDetector {
                 let mut second_row = 0.0f64;
                 for (i, bin) in self.row_bins.iter().enumerate() {
                     if i != max_row_idx {
-                        second_row = second_row.max(bin.power());
+                        second_row = second_row.max(bin.power() / norm);
                     }
                 }
                 let mut second_col = 0.0f64;
                 for (i, bin) in self.col_bins.iter().enumerate() {
                     if i != max_col_idx {
-                        second_col = second_col.max(bin.power());
+                        second_col = second_col.max(bin.power() / norm);
                     }
                 }
 
                 // Primary must be at least 6dB above second
                 if max_row_power > second_row * 4.0 && max_col_power > second_col * 4.0 {
+                    // TODO: Add second-harmonic Goertzel bins for row frequencies
+                    // (1394, 1540, 1710, 1882 Hz) and reject when harmonic energy
+                    // exceeds 50% of fundamental per ITU-T Q.24
                     Some(dtmf_char(max_row_idx, max_col_idx))
                 } else {
                     None
@@ -260,7 +276,7 @@ impl GoertzelDtmfDetector {
                         if self.digit_reported {
                             if let Some(digit) = self.current_digit {
                                 let duration_blocks =
-                                    self.detection_count + self.silence_count;
+                                    self.detection_count;
                                 let duration_ms = (duration_blocks as u64
                                     * self.block_size as u64
                                     * 1000
@@ -282,8 +298,12 @@ impl GoertzelDtmfDetector {
     }
 
     /// Set custom power threshold
+    ///
+    /// Note: the threshold is specified as an unnormalized power value (same
+    /// scale as `POWER_THRESHOLD`). It is internally divided by `block_size²`
+    /// to match the normalized power values used in `analyze_block`.
     pub fn set_power_threshold(&mut self, threshold: f64) {
-        self.power_threshold = threshold;
+        self.power_threshold = threshold / (self.block_size * self.block_size) as f64;
     }
 
     /// Clear all state (e.g., after call transfer)

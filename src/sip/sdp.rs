@@ -242,6 +242,9 @@ impl Sdp {
         let mut media: Vec<MediaDescription> = Vec::new();
         let mut session_attributes: Vec<String> = Vec::new();
         let mut current_media: Option<MediaDescription> = None;
+        // Bug #79: Track which media descriptions have explicit direction attributes
+        let mut media_has_direction: Vec<bool> = Vec::new();
+        let mut current_has_direction = false;
         // Bug #58: Track which mandatory fields are present
         let mut has_version = false;
         let mut has_origin = false;
@@ -262,7 +265,19 @@ impl Sdp {
 
             match type_char {
                 'v' => {
-                    version = value.parse().unwrap_or(0);
+                    // Bug #106: Warn when version parsing fails instead of
+                    // silently defaulting to 0.
+                    version = match value.parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::warn!(
+                                "SDP version line 'v={}' is not a valid integer, \
+                                 defaulting to 0",
+                                value
+                            );
+                            0
+                        }
+                    };
                     has_version = true;
                 }
                 'o' => {
@@ -285,8 +300,10 @@ impl Sdp {
                     // Save previous media if exists
                     if let Some(m) = current_media.take() {
                         media.push(m);
+                        media_has_direction.push(current_has_direction);
                     }
                     current_media = Some(Self::parse_media_line(value)?);
+                    current_has_direction = false;
                 }
                 'a' => {
                     if let Some(ref mut m) = current_media {
@@ -305,6 +322,7 @@ impl Sdp {
                         } else if let Some(dir) = MediaDirection::from_str(value) {
                             // Parse direction attribute (sendrecv/sendonly/recvonly/inactive)
                             m.direction = dir;
+                            current_has_direction = true;
                         } else {
                             m.attributes.push(value.to_string());
                         }
@@ -320,6 +338,20 @@ impl Sdp {
         // Save last media if exists
         if let Some(m) = current_media {
             media.push(m);
+            media_has_direction.push(current_has_direction);
+        }
+
+        // Bug #79: Propagate session-level direction to media descriptions
+        // that don't have their own direction attribute.
+        let session_direction = session_attributes.iter().find_map(|attr| {
+            MediaDirection::from_str(attr)
+        });
+        if let Some(dir) = session_direction {
+            for (i, m) in media.iter_mut().enumerate() {
+                if !media_has_direction.get(i).copied().unwrap_or(false) {
+                    m.direction = dir;
+                }
+            }
         }
 
         // Bug #58: Validate mandatory SDP fields (v=, o=, s=) are present
@@ -355,10 +387,26 @@ impl Sdp {
             return Err(RtpSipError::Sdp("Invalid origin line".to_string()));
         }
 
+        let session_id = parts[1].parse().unwrap_or_else(|e| {
+            // Bug #13 fix: Log a warning instead of silently defaulting
+            tracing::warn!(
+                "Failed to parse SDP origin session_id '{}': {}, defaulting to 0",
+                parts[1], e
+            );
+            0
+        });
+        let session_version = parts[2].parse().unwrap_or_else(|e| {
+            tracing::warn!(
+                "Failed to parse SDP origin session_version '{}': {}, defaulting to 1",
+                parts[2], e
+            );
+            1
+        });
+
         Ok(SdpOrigin {
             username: parts[0].to_string(),
-            session_id: parts[1].parse().unwrap_or(0),
-            session_version: parts[2].parse().unwrap_or(1),
+            session_id,
+            session_version,
             net_type: parts[3].to_string(),
             addr_type: parts[4].to_string(),
             address: parts[5].to_string(),
@@ -395,7 +443,15 @@ impl Sdp {
                     )));
                 }
             }
-            _ => {} // Unknown address type - don't validate
+            _ => {
+                // Bug #R12-4: Reject unknown address types per RFC 4566.
+                // Only IP4 and IP6 are valid. Accepting unknown types could
+                // mask malformed SDP from broken endpoints.
+                return Err(RtpSipError::Sdp(format!(
+                    "Unknown address type '{}' in SDP connection line (expected IP4 or IP6)",
+                    addr_type
+                )));
+            }
         }
 
         Ok(addr)
@@ -745,7 +801,12 @@ impl SdpBuilder {
     }
 
     /// Build the SDP string
-    pub fn build(&self) -> String {
+    ///
+    /// Bug #20 fix: Each call to build() increments session_version so that
+    /// re-INVITEs carry a higher o= version than the initial INVITE, as
+    /// required by RFC 3264 Section 8.
+    pub fn build(&mut self) -> String {
+        self.origin.session_version += 1;
         let addr_type = if self.connection.is_ipv6() {
             "IP6"
         } else {
@@ -874,7 +935,7 @@ m=audio 5004 RTP/AVP 8 0
     #[test]
     fn test_sdp_builder() {
         let addr: SocketAddr = "192.168.1.50:5060".parse().unwrap();
-        let builder = SdpBuilder::new(addr).codecs(vec![CodecType::Pcmu]);
+        let mut builder = SdpBuilder::new(addr).codecs(vec![CodecType::Pcmu]);
 
         let sdp_str = builder.build();
         assert!(sdp_str.contains("v=0"));
@@ -886,7 +947,7 @@ m=audio 5004 RTP/AVP 8 0
     #[test]
     fn test_sdp_roundtrip() {
         let addr: SocketAddr = "10.0.0.5:49170".parse().unwrap();
-        let builder = SdpBuilder::new(addr);
+        let mut builder = SdpBuilder::new(addr);
         let sdp_str = builder.build();
 
         let parsed = Sdp::parse(&sdp_str).unwrap();
@@ -1263,7 +1324,7 @@ a=fmtp:101 0-16
     fn test_bug57_sdp_builder_generates_0_15() {
         // Verify that generated SDP uses 0-15, not 0-16
         let addr: SocketAddr = "10.0.0.1:5004".parse().unwrap();
-        let builder = SdpBuilder::new(addr).telephone_event(true);
+        let mut builder = SdpBuilder::new(addr).telephone_event(true);
         let sdp_str = builder.build();
         assert!(
             sdp_str.contains("a=fmtp:101 0-15"),

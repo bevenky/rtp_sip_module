@@ -28,6 +28,8 @@ pub enum DemuxResult<'a> {
     TurnChannelData(&'a [u8]),
     /// Packet too short to classify
     TooShort,
+    /// Packet with top bits 00 that is not valid STUN (e.g., DTLS or other data)
+    Unknown(&'a [u8]),
 }
 
 /// Demultiplex an incoming packet on a shared RTP/STUN/TURN socket.
@@ -49,8 +51,8 @@ pub fn demux_packet(data: &[u8]) -> DemuxResult<'_> {
                     return DemuxResult::Stun(data);
                 }
             }
-            // Not STUN — unusual but treat as opaque data (could be DTLS in WebRTC)
-            DemuxResult::TooShort
+            // Not STUN — could be DTLS or other legitimate non-STUN data
+            DemuxResult::Unknown(data)
         }
         0b01 => {
             // TURN ChannelData — validate channel number is in range 0x4000-0x7FFE
@@ -58,8 +60,9 @@ pub fn demux_packet(data: &[u8]) -> DemuxResult<'_> {
             if is_valid_channel(channel) {
                 DemuxResult::TurnChannelData(data)
             } else {
-                // Top bits = 01 but invalid channel range — treat as unknown
-                DemuxResult::Rtp(data)
+                // Bug #5 fix: Top bits = 01 but invalid channel range — not a valid
+                // TURN ChannelData and not RTP (RTP requires top bits 10 or 11).
+                DemuxResult::Unknown(data)
             }
         }
         0b10 | 0b11 => {
@@ -138,7 +141,7 @@ mod tests {
     fn test_demux_invalid_turn_channel() {
         // Top bits = 01 but channel 0x7FFF is out of TURN range (max 0x7FFE)
         let data = [0x7F, 0xFF, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04];
-        assert!(matches!(demux_packet(&data), DemuxResult::Rtp(_)));
+        assert!(matches!(demux_packet(&data), DemuxResult::Unknown(_)));
 
         // Channel 0x3FFF — below TURN range but top bits still 00 (handled by STUN path)
         // Channel 0x41FF — valid TURN range
@@ -152,5 +155,13 @@ mod tests {
         let data = [0x80, 0xE0, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0];
         // PT = 0xE0 & 0x7F = 96 (dynamic)
         assert!(matches!(demux_packet(&data), DemuxResult::Rtp(_)));
+    }
+
+    #[test]
+    fn test_demux_non_stun_top_bits_00() {
+        // Top bits = 00, has enough bytes, but no STUN magic cookie.
+        // This could be DTLS or other legitimate data — should be Unknown, not TooShort.
+        let data = [0x14, 0xFE, 0xFD, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(matches!(demux_packet(&data), DemuxResult::Unknown(_)));
     }
 }

@@ -107,12 +107,18 @@ impl PacketLossConcealer {
             // so we can crossfade its beginning with the real frame.
             let tail = self.generate_pitch_repeat(OLA_WINDOW, self.gain);
             self.overlap_buf = tail;
-        } else {
-            self.overlap_buf.clear();
         }
 
         // Write incoming samples into the circular history buffer.
         self.append_history(samples);
+
+        // Always save the tail of the input frame for crossfading with
+        // the first concealment frame if a loss occurs next. This ensures
+        // overlap_buf has valid data even when no concealment preceded.
+        if self.conceal_count == 0 {
+            let tail_len = OLA_WINDOW.min(samples.len());
+            self.overlap_buf = samples[samples.len() - tail_len..].to_vec();
+        }
 
         // Reset concealment state.
         self.conceal_count = 0;
@@ -159,14 +165,9 @@ impl PacketLossConcealer {
             return vec![0i16; n];
         }
 
-        // On the first lost frame, (re-)detect pitch from history.
-        if self.conceal_count == 1 {
-            self.pitch_period = self.detect_pitch();
-            // Gain starts at 1.0 (already set by last `update`).
-        } else {
-            // Decay gain for successive concealed frames.
-            self.gain *= DECAY_PER_FRAME;
-        }
+        // Bug #54: Apply decay from first concealment frame per G.711 Appendix I.
+        // Bug #55: Skip redundant detect_pitch — already called in update().
+        self.gain *= DECAY_PER_FRAME;
 
         // Generate pitch-repeated signal with overlap-add.
         let mut frame = self.generate_pitch_repeat(n, self.gain);
@@ -253,32 +254,35 @@ impl PacketLossConcealer {
 
         for lag in PITCH_MIN..=PITCH_MAX {
             let ref_start = window_start.saturating_sub(lag);
-            if ref_start + PITCH_MAX > buf.len() {
+            if ref_start + lag > buf.len() {
                 continue;
             }
 
             let mut cross: f64 = 0.0;
             let mut energy_ref: f64 = 0.0;
-            for i in 0..PITCH_MAX {
+            let mut energy_win: f64 = 0.0;
+            for i in 0..lag {
                 let a = buf[window_start + i] as f64;
                 let b = buf[ref_start + i] as f64;
                 cross += a * b;
                 energy_ref += b * b;
+                energy_win += a * a;
             }
 
-            if energy_ref < 1.0 {
+            if energy_ref < 1.0 || energy_win < 1.0 {
                 continue;
             }
 
-            let norm = cross / (energy_window.sqrt() * energy_ref.sqrt());
+            let norm = cross / (energy_win.sqrt() * energy_ref.sqrt());
             if norm > best_corr {
                 best_corr = norm;
                 best_period = lag;
             }
         }
 
-        // If correlation is very low, pitch detection failed; use default.
-        if best_corr < 0.3 {
+        // Bug #89: Raise pitch correlation threshold from 0.3 to 0.5 to
+        // reject weak/noisy correlations that produce poor concealment.
+        if best_corr < 0.5 {
             return self.samples_per_packet.min(PITCH_MAX).max(PITCH_MIN);
         }
 
@@ -312,18 +316,34 @@ impl PacketLossConcealer {
             last_period.clone()
         };
 
-        // Build a single "template" period with overlap-add crossfade
-        // between prev_period's end and last_period's start.
-        let template = build_ola_period(&prev_period, &last_period, OLA_WINDOW);
+        // Bug #11: When history < 2 periods, prev_period and last_period are
+        // identical, making OLA blending useless (crossfading a signal with itself
+        // just wastes CPU). Skip OLA and use last_period directly in that case.
+        let template = if prev_period == last_period {
+            last_period.clone()
+        } else {
+            build_ola_period(&prev_period, &last_period, OLA_WINDOW)
+        };
 
         // Tile the template to fill `n` samples, with gain applied.
+        // Apply crossfade at each pitch period boundary to avoid clicks.
         let mut out = Vec::with_capacity(n);
         let tlen = template.len();
         if tlen == 0 {
             return vec![0i16; n];
         }
+        let ola = OLA_WINDOW.min(tlen);
         for i in 0..n {
-            let s = template[i % tlen] as f32 * gain;
+            let pos = i % tlen;
+            let mut s = template[pos] as f32 * gain;
+            // At period boundaries, crossfade between end of previous
+            // period and start of next period to avoid discontinuities.
+            if pos < ola && i >= tlen {
+                let w = hann_weight(pos, ola);
+                let prev_pos = tlen - ola + pos;
+                let prev_s = template[prev_pos] as f32 * gain;
+                s = prev_s * (1.0 - w) + s * w;
+            }
             out.push(clamp_i16(s));
         }
 
@@ -379,7 +399,9 @@ fn hann_weight(i: usize, len: usize) -> f32 {
     if len <= 1 {
         return 1.0;
     }
-    0.5 * (1.0 - (std::f32::consts::PI * i as f32 / len as f32).cos())
+    // Bug #90: Use (len - 1) in denominator to get proper Hann window that
+    // reaches 1.0 at the last sample. Clamp to max(1) to avoid division by zero.
+    0.5 * (1.0 - (std::f32::consts::PI * i as f32 / (len - 1).max(1) as f32).cos())
 }
 
 /// Clamp an f32 to the i16 range and round.

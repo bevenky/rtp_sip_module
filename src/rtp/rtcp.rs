@@ -348,7 +348,8 @@ fn parse_bye(data: &[u8], sc: usize) -> Option<Goodbye> {
     }
 
     // Optional reason string
-    let reason = if offset + 1 < data.len() {
+    // Bug #51: Changed from `offset + 1 < data.len()` to allow empty reason (length byte=0)
+    let reason = if offset < data.len() {
         let reason_len = data[offset] as usize;
         if offset + 1 + reason_len <= data.len() {
             String::from_utf8(data[offset + 1..offset + 1 + reason_len].to_vec()).ok()
@@ -567,9 +568,12 @@ impl VoipMetrics {
     pub const BLOCK_TYPE: u8 = 7;
 
     /// Size of the VoIP Metrics block (excluding block header)
-    pub const BLOCK_SIZE: usize = 32;
+    /// Bug #16: VoIP Metrics body is 28 bytes, not 32.
+    pub const BLOCK_SIZE: usize = 28;
 
-    /// Write the VoIP Metrics block body (32 bytes) to a buffer.
+    /// Write the VoIP Metrics block body (28 bytes) to a buffer.
+    /// Bug #16: Removed spurious 4-byte zero padding that caused overflow
+    /// when called with a correctly-sized 28-byte slice.
     pub fn write_to(&self, buf: &mut [u8]) {
         buf[0] = self.loss_rate;
         buf[1] = self.discard_rate;
@@ -592,11 +596,9 @@ impl VoipMetrics {
         buf[22..24].copy_from_slice(&self.jb_nominal.to_be_bytes());
         buf[24..26].copy_from_slice(&self.jb_maximum.to_be_bytes());
         buf[26..28].copy_from_slice(&self.jb_abs_max.to_be_bytes());
-        // Pad to 32 bytes
-        buf[28..32].fill(0);
     }
 
-    /// Parse a VoIP Metrics block body (32 bytes).
+    /// Parse a VoIP Metrics block body (28 bytes).
     pub fn parse(buf: &[u8]) -> Option<Self> {
         if buf.len() < 28 {
             return None;
@@ -633,7 +635,8 @@ impl VoipMetrics {
 /// Build an RTCP XR packet with a VoIP Metrics report block (RFC 3611).
 ///
 /// Returns the number of bytes written. Buffer must be at least
-/// `8 + 4 + 4 + 32 = 48` bytes (header + SSRC + block header + block body).
+/// `8 + 4 + 4 + 28 = 44` bytes (header + SSRC + block header + block body).
+/// Bug #16: VoIP Metrics body is 28 bytes, not 32.
 pub fn build_xr_voip_metrics(
     buf: &mut [u8],
     ssrc: u32,
@@ -643,7 +646,7 @@ pub fn build_xr_voip_metrics(
     // XR packet:
     // - 4 bytes common header (V=2, PT=207)
     // - 4 bytes SSRC of packet sender
-    // - 4 bytes block header (BT=7, type-specific=0, block_length=8)
+    // - 4 bytes block header (BT=7, type-specific=0, block_length=7)
     // - 4 bytes SSRC of source being reported
     // - 28 bytes VoIP Metrics data
     // Total = 44 bytes = 11 32-bit words, length field = 10
@@ -653,7 +656,10 @@ pub fn build_xr_voip_metrics(
     write_header(buf, 2, false, 0, PT_XR, length_words);
     buf[4..8].copy_from_slice(&ssrc.to_be_bytes());
 
-    // Block header: BT=7, type-specific=0, block_length=8 (32 bytes / 4)
+    // Block header: BT=7, type-specific=0, block_length=8
+    // Bug #R11-5: RFC 3611 §3 defines block_length as "including the header, in
+    // 32-bit words minus one". Total = 36 bytes (4 header + 4 SSRC + 28 metrics)
+    // = 9 words, so block_length = 9 - 1 = 8. Was incorrectly 7 (body only).
     buf[8] = VoipMetrics::BLOCK_TYPE;
     buf[9] = 0; // type-specific
     buf[10..12].copy_from_slice(&8u16.to_be_bytes()); // block_length in 32-bit words
@@ -661,8 +667,8 @@ pub fn build_xr_voip_metrics(
     // SSRC of source
     buf[12..16].copy_from_slice(&remote_ssrc.to_be_bytes());
 
-    // VoIP Metrics data (28 bytes starting at offset 16)
-    metrics.write_to(&mut buf[16..48]);
+    // Bug #16: Fixed slice to [16..44] (28 bytes) instead of [16..48] (32 bytes)
+    metrics.write_to(&mut buf[16..44]);
 
     total_len
 }
@@ -699,7 +705,7 @@ pub struct RtcpSession {
     /// Highest extended sequence number received
     pub highest_ext_seq: u32,
     /// Sequence number cycles (wraparound counter)
-    pub seq_cycles: u16,
+    pub seq_cycles: u32,
     /// Highest sequence number received (16-bit)
     pub highest_seq: u16,
     /// Whether we've received our first packet
@@ -729,6 +735,10 @@ pub struct RtcpSession {
     /// Calculated round-trip time
     pub rtt: Option<Duration>,
 
+    // --- Clock rate (for jitter calculation) ---
+    /// RTP clock rate in Hz (e.g. 8000, 16000, 48000). Defaults to 8000.
+    pub clock_rate: u32,
+
     // --- RTCP timing ---
     /// RTCP send interval (default 5s, randomized per RFC 3550 Section 6.2).
     ///
@@ -746,8 +756,13 @@ pub struct RtcpSession {
 }
 
 impl RtcpSession {
-    /// Create a new RTCP session
+    /// Create a new RTCP session with default clock rate (8000 Hz).
     pub fn new(local_ssrc: u32, cname: String) -> Self {
+        Self::with_clock_rate(local_ssrc, cname, 8000)
+    }
+
+    /// Create a new RTCP session with a specific clock rate.
+    pub fn with_clock_rate(local_ssrc: u32, cname: String, clock_rate: u32) -> Self {
         Self {
             local_ssrc,
             cname,
@@ -770,12 +785,19 @@ impl RtcpSession {
             last_sr_ntp_compact: 0,
             last_sr_received_at: None,
             rtt: None,
+            clock_rate,
             rtcp_interval: Self::randomized_interval(Duration::from_secs(5)),
             last_rtcp_sent: Instant::now(),
         }
     }
 
     /// Randomize RTCP interval per RFC 3550 Section 6.2 (0.5x to 1.5x)
+    ///
+    /// Bug #108: Note that `rand::random::<f64>()` produces values in the
+    /// half-open range [0.0, 1.0), so the resulting factor is in [0.5, 1.5)
+    /// rather than the RFC's closed range [0.5, 1.5]. The difference is
+    /// negligible in practice since 1.5 is never exactly produced by any
+    /// finite-precision RNG, and the timer variance is purely cosmetic.
     fn randomized_interval(base: Duration) -> Duration {
         let factor = 0.5 + rand::random::<f64>();
         Duration::from_secs_f64(base.as_secs_f64() * factor)
@@ -822,14 +844,17 @@ impl RtcpSession {
         }
 
         self.highest_ext_seq = ((self.seq_cycles as u32) << 16) | (self.highest_seq as u32);
-        self.expected_packets = self.highest_ext_seq - self.base_seq as u32 + 1;
+        self.expected_packets = self.highest_ext_seq.saturating_sub(self.base_seq as u32) + 1;
 
         // Jitter calculation (RFC 3550 Appendix A.8)
         if let Some(last_time) = self.last_recv_time {
             let arrival_diff_us = now.duration_since(last_time).as_micros() as i64;
-            // Convert to timestamp units (8000 Hz = 8 samples per ms)
-            let arrival_diff_ts = (arrival_diff_us * 8) / 1000;
-            let rtp_diff_ts = rtp_timestamp.wrapping_sub(self.last_recv_rtp_ts) as i64;
+            // Convert to timestamp units using the actual clock rate
+            let arrival_diff_ts = (arrival_diff_us * self.clock_rate as i64) / 1_000_000;
+            // Bug #17: Cast via i32 first to get correct sign extension.
+            // wrapping_sub on u32 returns u32; `as i64` zero-extends, which is
+            // wrong for negative differences. `as i32 as i64` sign-extends.
+            let rtp_diff_ts = rtp_timestamp.wrapping_sub(self.last_recv_rtp_ts) as i32 as i64;
             let d = (arrival_diff_ts - rtp_diff_ts).abs() as f64;
             self.jitter += (d - self.jitter) / 16.0;
         }
@@ -1009,13 +1034,14 @@ impl RtcpSession {
         let received = self.packets_received;
         let cumulative_lost = (expected as i32 - received as i32).max(-0x7F_FFFF).min(0x7F_FFFF);
 
-        let expected_interval = expected - self.last_rr_expected_packets;
-        let received_interval = received - self.last_rr_packets_received;
+        let expected_interval = expected.saturating_sub(self.last_rr_expected_packets);
+        let received_interval = received.saturating_sub(self.last_rr_packets_received);
         let lost_interval = expected_interval as i32 - received_interval as i32;
         let fraction_lost = if expected_interval == 0 || lost_interval <= 0 {
             0u8
         } else {
-            ((lost_interval as u32 * 256) / expected_interval).min(255) as u8
+            // Bug #10: Use u64 intermediate to prevent u32 overflow on lost * 256
+            ((lost_interval as u64 * 256) / expected_interval as u64).min(255) as u8
         };
 
         // DLSR calculation
@@ -1023,7 +1049,8 @@ impl RtcpSession {
             Some(t) => {
                 let elapsed = t.elapsed();
                 // Convert to 1/65536 seconds
-                ((elapsed.as_secs() << 16) | ((elapsed.subsec_micros() as u64 * 65536) / 1_000_000)) as u32
+                // Bug #9: Clamp fractional part to 65535 to prevent overflow
+                ((elapsed.as_secs().min(65535) as u64) << 16 | ((elapsed.subsec_micros() as u64 * 65536) / 1_000_000).min(65535)) as u32
             }
             None => 0,
         };
@@ -1066,7 +1093,7 @@ impl RtcpSession {
 
     /// Get current jitter in milliseconds
     pub fn jitter_ms(&self) -> f64 {
-        self.jitter / 8.0 // 8000 Hz = 8 timestamp units per ms
+        self.jitter / (self.clock_rate as f64 / 1000.0)
     }
 
     /// Get packet loss percentage
@@ -1125,7 +1152,8 @@ impl RtcpSession {
         if r > 100.0 {
             return 4.5;
         }
-        1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7.0e-6
+        // Bug #52: Clamp to [1.0, 4.5] — cubic can slightly exceed 4.5 near R≈93
+        (1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7.0e-6).clamp(1.0, 4.5)
     }
 }
 

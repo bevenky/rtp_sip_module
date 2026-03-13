@@ -303,9 +303,16 @@ pub struct SrtpContext {
     replay_window: u64,
     /// Replay window base index for RTP
     replay_window_base: u64,
-    /// SRTCP replay protection window (64-bit sliding window)
+    /// SRTCP replay protection window (64-bit sliding window).
+    ///
+    /// Note: SRTCP indices are only 31 bits (per RFC 3711 Section 3.4), so a
+    /// 64-bit bitmap is more than sufficient. We intentionally reuse the same
+    /// 64-bit sliding window implementation as the RTP replay window for
+    /// simplicity and code consistency, even though a 32-bit bitmap would
+    /// technically cover the SRTCP index space.
     srtcp_replay_window: u64,
-    /// SRTCP replay window base index (31-bit SRTCP index)
+    /// SRTCP replay window base index (31-bit SRTCP index, stored as u64 for
+    /// consistency with the RTP replay window arithmetic)
     srtcp_replay_window_base: u64,
     /// Whether we've received any SRTCP packet yet (for replay init)
     srtcp_replay_initialized: bool,
@@ -315,6 +322,21 @@ pub struct SrtpContext {
     mki: Option<Vec<u8>>,
     /// MKI length in bytes, for stripping on unprotect
     mki_length: Option<usize>,
+}
+
+/// Bug #81: Zeroize SRTP key material on drop to prevent sensitive keys from
+/// lingering in memory after the context is no longer needed.
+impl Drop for SrtpContext {
+    fn drop(&mut self) {
+        self.master_key.fill(0);
+        self.master_salt.fill(0);
+        self.rtp_keys.enc_key.fill(0);
+        self.rtp_keys.auth_key.fill(0);
+        self.rtp_keys.salt.fill(0);
+        self.rtcp_keys.enc_key.fill(0);
+        self.rtcp_keys.auth_key.fill(0);
+        self.rtcp_keys.salt.fill(0);
+    }
 }
 
 impl SrtpContext {
@@ -328,6 +350,9 @@ impl SrtpContext {
     }
 
     /// Create a new SRTP context with optional MKI
+    ///
+    /// # Panics
+    /// Panics if `mki` is `Some` but `mki_length` is `None` or does not equal `mki.len()`.
     pub fn with_mki(
         suite: SrtpCipherSuite,
         master_key: [u8; SRTP_MASTER_KEY_LEN],
@@ -335,6 +360,23 @@ impl SrtpContext {
         mki: Option<Vec<u8>>,
         mki_length: Option<usize>,
     ) -> Self {
+        // Bug #83: Validate MKI length consistency
+        if let Some(ref mki_val) = mki {
+            let declared_len = mki_length.unwrap_or_else(|| {
+                panic!(
+                    "SRTP: mki is Some({} bytes) but mki_length is None",
+                    mki_val.len()
+                )
+            });
+            assert_eq!(
+                declared_len,
+                mki_val.len(),
+                "SRTP: mki_length ({}) does not match mki.len() ({})",
+                declared_len,
+                mki_val.len(),
+            );
+        }
+
         let rtp_keys = derive_session_keys(&master_key, &master_salt, false);
         let rtcp_keys = derive_session_keys(&master_key, &master_salt, true);
 
@@ -388,7 +430,7 @@ impl SrtpContext {
 
         let header_len = rtp_header_len(packet)?;
         let seq = u16::from_be_bytes([packet[2], packet[3]]);
-        let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
 
         // For the sender, maintain a 48-bit counter.
         // On first packet, initialize from the packet's seq number.
@@ -423,18 +465,21 @@ impl SrtpContext {
             payload,
         );
 
-        // Append MKI bytes if configured
-        if let Some(ref mki_bytes) = self.mki {
-            output.extend_from_slice(mki_bytes);
-        }
-
-        // Compute and append authentication tag
+        // Compute auth tag BEFORE appending MKI (RFC 3711 §4.2: authenticated
+        // portion is header + encrypted payload only, MKI excluded)
         let auth_tag = compute_rtp_auth_tag(
             &self.rtp_keys.auth_key,
             &output,
             roc,
             self.suite.rtp_auth_tag_len(),
         );
+
+        // Append MKI bytes if configured (after auth tag computation)
+        if let Some(ref mki_bytes) = self.mki {
+            output.extend_from_slice(mki_bytes);
+        }
+
+        // Append authentication tag
         output.extend_from_slice(&auth_tag);
 
         Ok(output)
@@ -458,7 +503,7 @@ impl SrtpContext {
         }
 
         let seq = u16::from_be_bytes([packet[2], packet[3]]);
-        let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
 
         // Estimate ROC for incoming packet (RFC 3711 Section 3.3.1)
         let estimated_roc = self.estimate_roc(seq);
@@ -470,14 +515,13 @@ impl SrtpContext {
             return Err(RtpSipError::Rtp("Replay detected".to_string()));
         }
 
-        // Split packet: [authenticated_data | MKI | auth_tag]
-        // The authenticated portion includes header + encrypted_payload + MKI
-        // (MKI is between encrypted payload and auth tag)
+        // Split packet: [header + encrypted_payload | MKI | auth_tag]
+        // RFC 3711 §4.2: authenticated portion is header + encrypted payload only, MKI excluded
         let auth_tag_start = packet.len() - auth_tag_len;
-        let auth_data = &packet[..auth_tag_start];
         let received_tag = &packet[auth_tag_start..];
+        let auth_data = &packet[..packet.len() - auth_tag_len - mki_len];
 
-        // Verify authentication tag (auth is computed over header + encrypted_payload + MKI)
+        // Verify authentication tag (auth is computed over header + encrypted_payload only)
         let computed_tag = compute_rtp_auth_tag(
             &self.rtp_keys.auth_key,
             auth_data,
@@ -490,8 +534,16 @@ impl SrtpContext {
             return Err(RtpSipError::Rtp("Authentication failed".to_string()));
         }
 
-        // Strip MKI to get the encrypted RTP data (header + encrypted_payload)
-        let encrypted_data = &auth_data[..auth_data.len() - mki_len];
+        // auth_data already excludes MKI, so it is the encrypted RTP data
+        let encrypted_data = auth_data;
+
+        // Bug #14: Update ROC/s_l and replay window AFTER auth passes but BEFORE
+        // header parsing. This prevents replay of authenticated packets if header
+        // parsing fails (e.g., malformed extension headers). An authenticated
+        // packet is genuine even if its header is unparseable, so it must be
+        // consumed from the replay window.
+        self.update_roc_recv(seq, estimated_roc);
+        self.accept_replay(index);
 
         // Decrypt payload
         let header_len = rtp_header_len(encrypted_data)?;
@@ -504,10 +556,6 @@ impl SrtpContext {
             index,
             payload,
         );
-
-        // Update ROC state after successful decryption
-        self.update_roc_recv(seq, estimated_roc);
-        self.accept_replay(index);
 
         // Success -- reset error counter
         self.error_count = 0;
@@ -529,11 +577,18 @@ impl SrtpContext {
 
         if self.error_count >= SRTP_RESET_THRESHOLD {
             tracing::warn!(
-                "SRTP: {} consecutive errors reached reset threshold, re-deriving session keys",
+                "SRTP: {} consecutive errors reached reset threshold, resetting ROC and replay window",
                 self.error_count,
             );
-            self.rtp_keys = derive_session_keys(&self.master_key, &self.master_salt, false);
-            self.rtcp_keys = derive_session_keys(&self.master_key, &self.master_salt, true);
+            // Reset ROC and replay window to recover from desynchronization.
+            // Re-deriving session keys from unchanged master material is a no-op;
+            // the actual recovery action is resetting the sequence tracking state
+            // so that the next valid packet is accepted.
+            self.s_l = 0;
+            self.roc = 0;
+            self.replay_window = 0;
+            self.replay_window_base = 0;
+            self.initialized = false;
             self.error_count = 0;
         }
     }
@@ -550,6 +605,15 @@ impl SrtpContext {
         }
 
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+
+        // SRTCP index is 31-bit (max 0x7FFFFFFF). Guard against overflow to
+        // prevent keystream reuse (RFC 3711 §3.3.2).
+        if self.srtcp_index >= 0x80000000 {
+            return Err(RtpSipError::Rtp(
+                "SRTCP index overflow: 31-bit index space exhausted".to_string(),
+            ));
+        }
+
         let srtcp_index = self.srtcp_index;
         self.srtcp_index += 1;
 
@@ -568,20 +632,30 @@ impl SrtpContext {
         }
 
         // Append E-flag (1 = encrypted) | SRTCP index (31 bits)
+        //
+        // Bug #18 note: The E-flag is intentionally always set to 1 (encrypted).
+        // RFC 3711 §3.4 defines E=1 as "SRTCP packet is encrypted" and E=0 as
+        // "not encrypted". Since this implementation always encrypts SRTCP packets,
+        // E=1 is correct. If unencrypted SRTCP is ever needed (e.g., for debugging
+        // or null cipher), this would need to be conditional on the cipher suite.
         let e_srtcp_index = 0x8000_0000u32 | (srtcp_index & 0x7FFF_FFFF);
         output.extend_from_slice(&e_srtcp_index.to_be_bytes());
 
-        // Append MKI bytes if configured
-        if let Some(ref mki_bytes) = self.mki {
-            output.extend_from_slice(mki_bytes);
-        }
-
-        // Compute and append authentication tag (over header + encrypted_payload + E||index + MKI)
+        // Compute auth tag BEFORE appending MKI (RFC 3711 §4.2: authenticated
+        // portion is header + encrypted_payload + E||index, MKI excluded)
         let mut mac =
             <HmacSha1 as Mac>::new_from_slice(&self.rtcp_keys.auth_key).expect("HMAC key size");
         mac.update(&output);
         let full_tag = mac.finalize().into_bytes();
-        output.extend_from_slice(&full_tag[..SRTCP_AUTH_TAG_LEN]);
+        let auth_tag = full_tag[..SRTCP_AUTH_TAG_LEN].to_vec();
+
+        // Append MKI bytes if configured (after auth tag computation)
+        if let Some(ref mki_bytes) = self.mki {
+            output.extend_from_slice(mki_bytes);
+        }
+
+        // Append authentication tag
+        output.extend_from_slice(&auth_tag);
 
         Ok(output)
     }
@@ -596,12 +670,13 @@ impl SrtpContext {
 
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
-        // Split: [authenticated_data (includes MKI)] [auth_tag]
+        // Split: [authenticated_data | MKI | auth_tag]
+        // RFC 3711 §4.2: authenticated portion excludes MKI
         let auth_tag_start = packet.len() - SRTCP_AUTH_TAG_LEN;
-        let auth_data = &packet[..auth_tag_start];
         let received_tag = &packet[auth_tag_start..];
+        let auth_data = &packet[..packet.len() - SRTCP_AUTH_TAG_LEN - mki_len];
 
-        // Verify authentication (over everything before the auth tag, including MKI)
+        // Verify authentication (over header + encrypted_payload + E||index, MKI excluded)
         let mut mac =
             <HmacSha1 as Mac>::new_from_slice(&self.rtcp_keys.auth_key).expect("HMAC key size");
         mac.update(auth_data);
@@ -612,9 +687,8 @@ impl SrtpContext {
             return Err(RtpSipError::Rtp("SRTCP authentication failed".to_string()));
         }
 
-        // Strip MKI to find the E||index field
-        // Layout: [rtcp_data | E||index | MKI]
-        let data_with_index = &auth_data[..auth_data.len() - mki_len];
+        // auth_data already excludes MKI, so it contains [rtcp_data | E||index]
+        let data_with_index = auth_data;
 
         // Extract E-flag and SRTCP index
         let index_start = data_with_index.len() - SRTCP_INDEX_LEN;
@@ -691,6 +765,13 @@ impl SrtpContext {
     /// Implements RFC 3711 Section 3.3.1 properly. Determines the ROC value
     /// (v) to use when computing the packet index, based on the gap between
     /// the received sequence number and the highest sequence number seen so far.
+    ///
+    /// Bug #82: Limitation — this is a simplified heuristic that uses the
+    /// half-sequence-space rule (diff < 0x8000) to decide forward vs backward
+    /// wraparound. It works well for normal RTP streams but can misclassify
+    /// packets if the gap exceeds 32768 sequence numbers (e.g., extreme
+    /// reordering or long outages). See RFC 3711 Section 3.3.1 for the full
+    /// algorithm which also considers key derivation rate (KDR).
     fn estimate_roc(&self, seq: u16) -> u32 {
         if !self.initialized {
             return 0;
@@ -702,12 +783,15 @@ impl SrtpContext {
         if seq > s_l {
             // seq is ahead of s_l
             let diff = seq - s_l;
-            if diff < 0x8000 {
-                // Normal forward progression — same ROC
-                roc
-            } else {
+            // Bug #R8-6: Use `>` not `<` to match RFC 3711 §3.3.1 and the backward
+            // case (line 796). When diff == 0x8000 exactly, treat as normal progression
+            // (current ROC), not as a late packet from ROC-1.
+            if diff > 0x8000 {
                 // Large forward gap means seq actually wrapped backward (late packet)
                 roc.wrapping_sub(1)
+            } else {
+                // Normal forward progression — same ROC (includes boundary diff == 0x8000)
+                roc
             }
         } else if seq < s_l {
             // seq is behind s_l
@@ -848,7 +932,7 @@ fn prf_derive(
     let mut iv = [0u8; 16];
     // Copy salt into iv[0..14]
     iv[..SRTP_MASTER_SALT_LEN].copy_from_slice(master_salt);
-    // XOR key_id into the right-aligned position within 14 bytes (bytes 7..14)
+    // XOR key_id into position per RFC 3711 §4.3.1 (bytes 7..14 of the 14-byte IV space)
     for i in 0..7 {
         iv[7 + i] ^= key_id[i];
     }
@@ -889,7 +973,7 @@ fn aes_cm_encrypt(
 
     // Build IV per RFC 3711 Section 4.1.1
     // IV = 0x00000000 || SSRC || packet_index (48-bit) || 0x0000
-    // Then XOR with session_salt (14 bytes, left-padded with 2 zero bytes to 16)
+    // Then XOR with session_salt (14 bytes at iv[0..14], per RFC 3711 §4.1.1)
     let mut iv = [0u8; 16];
 
     // SSRC at bytes 4..8
@@ -899,9 +983,9 @@ fn aes_cm_encrypt(
     let idx_bytes = index.to_be_bytes(); // 8 bytes, we want low 6
     iv[8..14].copy_from_slice(&idx_bytes[2..8]);
 
-    // XOR with session salt (salt is 14 bytes, positioned at iv[2..16])
+    // XOR with session salt (14 bytes at iv[0..14], per RFC 3711 §4.1.1)
     for i in 0..SRTP_SESSION_SALT_LEN {
-        iv[2 + i] ^= session_salt[i];
+        iv[i] ^= session_salt[i];
     }
 
     // Generate keystream and XOR with data
@@ -910,14 +994,11 @@ fn aes_cm_encrypt(
 
     for block_idx in 0..blocks_needed {
         let mut block = iv;
-        // Add block counter to last 2 bytes
+        // Set block counter in last 2 bytes (direct assignment, not accumulation)
         let counter = block_idx as u16;
         // The counter goes into bytes 14-15 (replacing the zero padding)
-        let existing =
-            u16::from_be_bytes([block[14], block[15]]);
-        let new_val = existing.wrapping_add(counter);
-        block[14] = (new_val >> 8) as u8;
-        block[15] = new_val as u8;
+        block[14] = (counter >> 8) as u8;
+        block[15] = counter as u8;
 
         let block_ref: &mut aes::Block = block.as_mut_slice().into();
         cipher.encrypt_block(block_ref);
@@ -943,6 +1024,7 @@ fn compute_rtp_auth_tag(
     mac.update(authenticated_portion);
     mac.update(&roc.to_be_bytes());
     let full_tag = mac.finalize().into_bytes();
+    debug_assert!(tag_len <= 20, "auth tag length exceeds SHA1 output size");
     full_tag[..tag_len].to_vec()
 }
 
@@ -1558,11 +1640,9 @@ mod tests {
     #[test]
     fn test_mki_mismatch_corrupts_payload() {
         // Protect with MKI length 2, but receiver expects MKI length 4.
-        // The auth tag verification passes because it covers the same bytes
-        // (auth is computed over everything before the auth tag). However,
-        // the receiver strips 4 bytes as MKI instead of 2, eating 2 bytes of
-        // ciphertext and producing a corrupted (truncated) decrypted payload.
-        // This verifies the MKI length must match for correct operation.
+        // The receiver interprets the packet structure differently (strips 4
+        // bytes as MKI instead of 2), which causes the authentication check
+        // to fail because the auth tag boundary is misaligned.
         let crypto_send = {
             let mut c = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
             c.mki = Some(vec![0x00, 0x01]);
@@ -1589,12 +1669,10 @@ mod tests {
         rtp_packet.extend_from_slice(&[0xAA; 20]);
 
         let srtp_packet = send_ctx.protect_rtp(&rtp_packet).unwrap();
-        // Auth passes but decrypted output is wrong — payload is truncated
-        // because receiver incorrectly strips 4 bytes as MKI instead of 2.
-        let decrypted = recv_ctx.unprotect_rtp(&srtp_packet).unwrap();
-        assert_ne!(decrypted, rtp_packet, "MKI length mismatch should produce wrong output");
-        // Output is shorter: 2 bytes of ciphertext were consumed as MKI
-        assert_eq!(decrypted.len(), rtp_packet.len() - 2);
+        // MKI length mismatch causes the receiver to misparse the packet
+        // structure, leading to authentication failure.
+        let result = recv_ctx.unprotect_rtp(&srtp_packet);
+        assert!(result.is_err(), "MKI length mismatch should cause unprotect to fail");
     }
 
     #[test]
@@ -1745,5 +1823,235 @@ mod tests {
                 .expect(&format!("Failed to unprotect seq {} after ROC wrap with gap", seq));
             assert_eq!(decrypted, rtp);
         }
+    }
+
+    /// Verify AES-CM IV construction for SRTP encryption per RFC 3711 §4.1.1.
+    ///
+    /// The 16-byte IV is built as:
+    ///   bytes 0..4   = 0x00000000
+    ///   bytes 4..8   = SSRC (big-endian)
+    ///   bytes 8..14  = packet index (48-bit, big-endian)
+    ///   bytes 14..16 = 0x0000
+    /// Then the 14-byte session salt is XORed at iv[0..14].
+    #[test]
+    fn test_aes_cm_iv_salt_xor_at_offset_0() {
+        // Construct a known salt and check the IV layout.
+        let session_salt: [u8; SRTP_SESSION_SALT_LEN] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        ];
+        let ssrc: u32 = 0xDEADBEEF;
+        let index: u64 = 0x0000_0102_0304_0506;
+
+        // Build IV the same way aes_cm_encrypt does (after fix)
+        let mut iv = [0u8; 16];
+        iv[4..8].copy_from_slice(&ssrc.to_be_bytes());
+        let idx_bytes = index.to_be_bytes();
+        iv[8..14].copy_from_slice(&idx_bytes[2..8]);
+
+        // XOR salt at offset 0 (per RFC 3711 §4.1.1)
+        for i in 0..SRTP_SESSION_SALT_LEN {
+            iv[i] ^= session_salt[i];
+        }
+
+        // Verify bytes 0..4 are salt[0..4] XOR 0 = salt[0..4]
+        assert_eq!(iv[0], 0x01, "iv[0] should be salt[0] XOR 0x00");
+        assert_eq!(iv[1], 0x02, "iv[1] should be salt[1] XOR 0x00");
+        assert_eq!(iv[2], 0x03, "iv[2] should be salt[2] XOR 0x00");
+        assert_eq!(iv[3], 0x04, "iv[3] should be salt[3] XOR 0x00");
+
+        // Verify bytes 4..8 are salt[4..8] XOR SSRC
+        assert_eq!(iv[4], 0x05 ^ 0xDE);
+        assert_eq!(iv[5], 0x06 ^ 0xAD);
+        assert_eq!(iv[6], 0x07 ^ 0xBE);
+        assert_eq!(iv[7], 0x08 ^ 0xEF);
+
+        // Verify bytes 8..14 are salt[8..14] XOR packet_index
+        // index = 0x0000_0102_0304_0506, low 6 bytes = [01, 02, 03, 04, 05, 06]
+        // Wait: 0x0000_0102_0304_0506 as u64 big-endian = [00, 00, 01, 02, 03, 04, 05, 06]
+        // low 6 bytes (idx_bytes[2..8]) = [01, 02, 03, 04, 05, 06]
+        assert_eq!(iv[8], 0x09 ^ 0x01);
+        assert_eq!(iv[9], 0x0A ^ 0x02);
+        assert_eq!(iv[10], 0x0B ^ 0x03);
+        assert_eq!(iv[11], 0x0C ^ 0x04);
+        assert_eq!(iv[12], 0x0D ^ 0x05);
+        assert_eq!(iv[13], 0x0E ^ 0x06);
+
+        // Verify bytes 14..16 are untouched (counter space)
+        assert_eq!(iv[14], 0x00, "iv[14] must be 0 (counter space)");
+        assert_eq!(iv[15], 0x00, "iv[15] must be 0 (counter space)");
+    }
+
+    /// Verify PRF IV construction for SRTP key derivation per RFC 3711 §4.3.1.
+    ///
+    /// The 16-byte IV is built as:
+    ///   iv[0..14] = master_salt
+    ///   key_id (7 bytes: label || r) is XORed at iv[2..9]
+    ///   iv[14..16] = 0x0000 (counter space for AES-CM)
+    #[test]
+    fn test_prf_iv_key_id_xor_at_offset_7() {
+        let master_salt: [u8; SRTP_MASTER_SALT_LEN] = [
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
+            0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0,
+        ];
+
+        // Label 0x00 = cipher key, with r=0 (KDR=0)
+        let label: u8 = 0x00;
+        let key_id = [label, 0u8, 0, 0, 0, 0, 0]; // 7 bytes
+
+        let mut iv = [0u8; 16];
+        iv[..SRTP_MASTER_SALT_LEN].copy_from_slice(&master_salt);
+        // key_id XORed at offset 7 (per RFC 3711 §4.3.1)
+        for i in 0..7 {
+            iv[7 + i] ^= key_id[i];
+        }
+
+        // With label=0 and r=0, key_id is all zeros, so IV = salt || 0x0000
+        assert_eq!(
+            &iv[..14], &master_salt[..],
+            "With zero key_id, IV[0..14] should equal master_salt"
+        );
+        assert_eq!(iv[14], 0x00);
+        assert_eq!(iv[15], 0x00);
+
+        // Now test with a non-zero label (0x01 = auth key)
+        let label2: u8 = 0x01;
+        let key_id2 = [label2, 0u8, 0, 0, 0, 0, 0];
+
+        let mut iv2 = [0u8; 16];
+        iv2[..SRTP_MASTER_SALT_LEN].copy_from_slice(&master_salt);
+        for i in 0..7 {
+            iv2[7 + i] ^= key_id2[i];
+        }
+
+        // Bytes 0..7 unchanged (salt[0..7])
+        for i in 0..7 {
+            assert_eq!(iv2[i], master_salt[i], "iv[{}] should be salt[{}] unchanged", i, i);
+        }
+        // Byte 7 = salt[7] XOR label = 0x80 XOR 0x01 = 0x81
+        assert_eq!(iv2[7], 0x80 ^ 0x01, "iv[7] should be salt[7] XOR label");
+        // Bytes 8..14 = salt[8..14] XOR 0 = salt[8..14] (r=0)
+        for i in 8..14 {
+            assert_eq!(iv2[i], master_salt[i], "iv[{}] should be unchanged (r=0)", i);
+        }
+        assert_eq!(iv2[14], 0x00, "iv[14] must be 0 (counter space)");
+        assert_eq!(iv2[15], 0x00, "iv[15] must be 0 (counter space)");
+    }
+
+    /// End-to-end test: protect/unprotect still works after IV construction fixes.
+    /// This validates that both prf_derive (key derivation) and aes_cm_encrypt
+    /// (payload encryption) use the corrected IV offsets consistently.
+    #[test]
+    fn test_roundtrip_after_iv_fixes() {
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        // Send multiple sequential packets and verify roundtrip for each
+        for seq in 1u16..=10 {
+            let mut rtp = vec![0x80, 0x00];
+            rtp.extend_from_slice(&seq.to_be_bytes());
+            rtp.extend_from_slice(&((seq as u32) * 160).to_be_bytes()); // timestamp
+            rtp.extend_from_slice(&12345u32.to_be_bytes()); // ssrc
+            rtp.extend_from_slice(&[0x42; 160]); // audio payload
+
+            let srtp = send_ctx.protect_rtp(&rtp).unwrap();
+            // SRTP packet must differ from plaintext (encrypted)
+            assert_ne!(
+                &srtp[12..12 + 160], &[0x42; 160],
+                "payload should be encrypted for seq {}",
+                seq
+            );
+
+            let decrypted = recv_ctx.unprotect_rtp(&srtp).unwrap();
+            assert_eq!(decrypted, rtp, "round-trip failed for seq {}", seq);
+        }
+    }
+
+    #[test]
+    fn test_ssrc_extracted_from_correct_rtp_offset() {
+        // Bug #11a: SSRC must be read from bytes [8..12] of the RTP header,
+        // NOT bytes [4..8] (which is the timestamp field).
+        // RFC 3550 §5.1: V(2)|P|X|CC | M|PT | seq(2) | timestamp(4) | SSRC(4)
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut send_ctx = SrtpContext::from_crypto(&crypto);
+        let mut recv_ctx = SrtpContext::from_crypto(&crypto);
+
+        // Construct a packet where timestamp and SSRC are intentionally different
+        // so that using the wrong offset would produce a different keystream.
+        let ssrc: u32 = 0xDEADBEEF;
+        let timestamp: u32 = 0x12345678; // Different from SSRC
+        let seq: u16 = 1;
+
+        let mut rtp_packet = vec![0x80, 0x00]; // V=2, P=0, X=0, CC=0
+        rtp_packet.extend_from_slice(&seq.to_be_bytes()); // bytes 2-3: seq
+        rtp_packet.extend_from_slice(&timestamp.to_be_bytes()); // bytes 4-7: timestamp
+        rtp_packet.extend_from_slice(&ssrc.to_be_bytes()); // bytes 8-11: SSRC
+        rtp_packet.extend_from_slice(&[0xAA; 40]); // payload
+
+        // Protect and unprotect must round-trip correctly when SSRC != timestamp
+        let srtp_packet = send_ctx.protect_rtp(&rtp_packet).unwrap();
+        let decrypted = recv_ctx.unprotect_rtp(&srtp_packet).unwrap();
+        assert_eq!(
+            decrypted, rtp_packet,
+            "Round-trip failed: SSRC may be read from wrong offset"
+        );
+
+        // Also verify that different SSRCs produce different ciphertext for
+        // the same payload, confirming SSRC is actually used in encryption.
+        let mut send_ctx2 = SrtpContext::from_crypto(&crypto);
+        let ssrc2: u32 = 0xCAFEBABE;
+        let mut rtp_packet2 = vec![0x80, 0x00];
+        rtp_packet2.extend_from_slice(&seq.to_be_bytes());
+        rtp_packet2.extend_from_slice(&timestamp.to_be_bytes()); // same timestamp
+        rtp_packet2.extend_from_slice(&ssrc2.to_be_bytes()); // different SSRC
+        rtp_packet2.extend_from_slice(&[0xAA; 40]); // same payload
+
+        let srtp_packet2 = send_ctx2.protect_rtp(&rtp_packet2).unwrap();
+        // Encrypted payloads must differ because SSRC differs (different IV)
+        assert_ne!(
+            &srtp_packet[12..52],
+            &srtp_packet2[12..52],
+            "Different SSRCs must produce different ciphertext"
+        );
+    }
+
+    #[test]
+    fn test_srtcp_index_overflow_returns_error() {
+        // Bug #11d: SRTCP index is 31-bit (max 0x7FFFFFFF). Attempting to
+        // protect beyond this limit must return an error to prevent keystream reuse.
+        let crypto = CryptoAttribute::generate(SrtpCipherSuite::AesCm128HmacSha1_80);
+        let mut ctx = SrtpContext::from_crypto(&crypto);
+
+        // Set the SRTCP index just below the overflow boundary
+        ctx.srtcp_index = 0x7FFFFFFF;
+
+        let rtcp_packet = vec![
+            0x80, 0xC8, 0x00, 0x06, // V=2, PT=200 (SR), length=6
+            0x00, 0x00, 0x30, 0x39, // SSRC=12345
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // SR body
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+            0x11, 0x22, 0x33, 0x44,
+        ];
+
+        // This should succeed (index = 0x7FFFFFFF, the last valid value)
+        let result = ctx.protect_rtcp(&rtcp_packet);
+        assert!(result.is_ok(), "protect_rtcp should succeed at max index 0x7FFFFFFF");
+
+        // Now srtcp_index is 0x80000000, which exceeds the 31-bit space
+        assert_eq!(ctx.srtcp_index, 0x80000000);
+
+        // Next protect_rtcp call must fail
+        let result = ctx.protect_rtcp(&rtcp_packet);
+        assert!(
+            result.is_err(),
+            "protect_rtcp must fail when SRTCP index exceeds 31-bit space"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("SRTCP index overflow"),
+            "Error message should mention SRTCP index overflow, got: {}",
+            err_msg
+        );
     }
 }

@@ -238,12 +238,25 @@ impl Config {
                     "Provider name is required".to_string(),
                 ));
             }
+            if provider.port == 0 {
+                return Err(RtpSipError::Config(format!(
+                    "Provider '{}' has invalid port 0",
+                    provider.name
+                )));
+            }
         }
 
         // Check RTP port range
         if self.rtp.port_start >= self.rtp.port_end {
             return Err(RtpSipError::Config(
                 "RTP port_start must be less than port_end".to_string(),
+            ));
+        }
+
+        // Bug #29 fix: Require at least 2 ports in the range (one for RTP, one for RTCP)
+        if self.rtp.port_end - self.rtp.port_start < 2 {
+            return Err(RtpSipError::Config(
+                "RTP port range must contain at least 2 ports (one RTP + one RTCP)".to_string(),
             ));
         }
 

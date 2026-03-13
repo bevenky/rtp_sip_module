@@ -8,6 +8,10 @@
 //!
 //! Handles authentication (long-term credential mechanism per RFC 5389),
 //! allocation creation/refresh, permission installation, and channel binding.
+//!
+//! Bug #33 fix: Permissions (expire 300s, RFC 5766 §8) and channel bindings
+//! (expire 600s, §11) are tracked and automatically refreshed at 80% of their
+//! lifetime by the background refresh loop alongside allocation refresh.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,8 +26,8 @@ use crate::nat::stun::StunAttribute;
 
 use super::message::*;
 
-/// Maximum retries for a TURN transaction
-const MAX_RETRIES: u32 = 3;
+/// Maximum retries for a TURN transaction (RFC 5389 §7.2.1)
+const MAX_RETRIES: u32 = 7;
 
 /// Initial retransmission timeout in milliseconds
 const INITIAL_RTO_MS: u64 = 500;
@@ -91,6 +95,21 @@ impl TurnAuth {
     }
 }
 
+/// Tracked permission with creation time for automatic refresh
+#[derive(Debug, Clone)]
+struct TrackedPermission {
+    peer_addr: SocketAddr,
+    created: std::time::Instant,
+}
+
+/// Tracked channel binding with creation time for automatic refresh
+#[derive(Debug, Clone)]
+struct TrackedChannelBinding {
+    peer_addr: SocketAddr,
+    channel: u16,
+    created: std::time::Instant,
+}
+
 /// Full TURN client managing the relay lifecycle
 pub struct TurnClient {
     /// TURN server address
@@ -103,6 +122,10 @@ pub struct TurnClient {
     allocation: Arc<Mutex<Option<TurnAllocation>>>,
     /// Handle to cancel the background refresh task
     refresh_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Bug #33 fix: Track installed permissions for automatic refresh (expire 300s)
+    permissions: Arc<Mutex<Vec<TrackedPermission>>>,
+    /// Bug #33 fix: Track channel bindings for automatic refresh (expire 600s)
+    channel_bindings: Arc<Mutex<Vec<TrackedChannelBinding>>>,
 }
 
 impl TurnClient {
@@ -125,6 +148,8 @@ impl TurnClient {
             state: Arc::new(Mutex::new(TurnState::Init)),
             allocation: Arc::new(Mutex::new(None)),
             refresh_handle: Mutex::new(None),
+            permissions: Arc::new(Mutex::new(Vec::new())),
+            channel_bindings: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -197,8 +222,45 @@ impl TurnClient {
                 };
 
                 if auth_response.is_error() {
-                    *self.state.lock() = TurnState::Init;
                     let code = auth_response.error_code().unwrap_or(0);
+
+                    // Bug #23: Handle 438 Stale Nonce in allocate path,
+                    // matching the pattern used in refresh().
+                    if code == 438 {
+                        if let Some(new_nonce) = extract_nonce(&auth_response) {
+                            self.auth.nonce = Some(new_nonce);
+                            let mut retry_request = self.build_allocate_request();
+                            self.add_auth_attributes(&mut retry_request);
+                            let retry_response = match self
+                                .send_request(socket, &retry_request)
+                                .await
+                            {
+                                Ok(resp) => resp,
+                                Err(e) => {
+                                    *self.state.lock() = TurnState::Init;
+                                    return Err(e);
+                                }
+                            };
+                            if retry_response.is_error() {
+                                *self.state.lock() = TurnState::Init;
+                                let retry_code = retry_response.error_code().unwrap_or(0);
+                                return Err(RtpSipError::Auth(format!(
+                                    "TURN Allocate failed with error {} after stale nonce retry",
+                                    retry_code
+                                )));
+                            }
+                            let alloc = self.parse_allocate_success(&retry_response)?;
+                            *self.allocation.lock() = Some(alloc.clone());
+                            *self.state.lock() = TurnState::Allocated;
+                            return Ok(alloc);
+                        }
+                        *self.state.lock() = TurnState::Init;
+                        return Err(RtpSipError::Auth(
+                            "TURN Allocate 438 Stale Nonce but no NONCE in response".to_string(),
+                        ));
+                    }
+
+                    *self.state.lock() = TurnState::Init;
                     return Err(RtpSipError::Auth(format!(
                         "TURN Allocate failed with error {}",
                         code
@@ -229,7 +291,8 @@ impl TurnClient {
     /// Create a permission for a peer address.
     ///
     /// This must be done before the peer can send data through the relay.
-    /// Permissions last for 300 seconds and must be refreshed.
+    /// Permissions last for 300 seconds. Bug #33 fix: permissions are now
+    /// tracked and automatically refreshed by the background refresh loop.
     pub async fn create_permission(
         &self,
         socket: &UdpSocket,
@@ -248,6 +311,20 @@ impl TurnClient {
                 "TURN CreatePermission failed with error {}",
                 code
             )));
+        }
+
+        // Bug #33 fix: Track permission for automatic refresh
+        {
+            let mut perms = self.permissions.lock();
+            // Update existing or add new
+            if let Some(existing) = perms.iter_mut().find(|p| p.peer_addr == peer_addr) {
+                existing.created = std::time::Instant::now();
+            } else {
+                perms.push(TrackedPermission {
+                    peer_addr,
+                    created: std::time::Instant::now(),
+                });
+            }
         }
 
         Ok(())
@@ -286,13 +363,30 @@ impl TurnClient {
         }
 
         *self.state.lock() = TurnState::ChannelBound;
+
+        // Bug #33 fix: Track channel binding for automatic refresh
+        {
+            let mut bindings = self.channel_bindings.lock();
+            if let Some(existing) = bindings.iter_mut().find(|b| b.channel == channel) {
+                existing.peer_addr = peer_addr;
+                existing.created = std::time::Instant::now();
+            } else {
+                bindings.push(TrackedChannelBinding {
+                    peer_addr,
+                    channel,
+                    created: std::time::Instant::now(),
+                });
+            }
+        }
+
         Ok(())
     }
 
     /// Refresh the current allocation.
     ///
     /// Returns the new lifetime in seconds.
-    pub async fn refresh(&self, socket: &UdpSocket) -> Result<u32> {
+    /// Bug #47: Handles 438 Stale Nonce by extracting the new nonce and retrying.
+    pub async fn refresh(&mut self, socket: &UdpSocket) -> Result<u32> {
         self.ensure_allocated()?;
 
         let lifetime = self
@@ -309,6 +403,33 @@ impl TurnClient {
 
         if response.is_error() {
             let code = response.error_code().unwrap_or(0);
+
+            // Bug #47: Handle 438 Stale Nonce
+            if code == 438 {
+                if let Some(new_nonce) = extract_nonce(&response) {
+                    self.auth.nonce = Some(new_nonce);
+                    let mut retry_request = self.build_refresh_request(lifetime);
+                    self.add_auth_attributes(&mut retry_request);
+                    let retry_response = self.send_request(socket, &retry_request).await?;
+                    if retry_response.is_error() {
+                        let retry_code = retry_response.error_code().unwrap_or(0);
+                        return Err(RtpSipError::Sip(format!(
+                            "TURN Refresh failed with error {} after stale nonce retry",
+                            retry_code
+                        )));
+                    }
+                    let new_lifetime =
+                        parse_lifetime(&retry_response).unwrap_or(DEFAULT_LIFETIME);
+                    if let Some(ref mut alloc) = *self.allocation.lock() {
+                        alloc.lifetime = new_lifetime;
+                    }
+                    return Ok(new_lifetime);
+                }
+                return Err(RtpSipError::Sip(
+                    "TURN Refresh 438 Stale Nonce but no NONCE in response".to_string(),
+                ));
+            }
+
             return Err(RtpSipError::Sip(format!(
                 "TURN Refresh failed with error {}",
                 code
@@ -358,10 +479,17 @@ impl TurnClient {
     pub fn start_refresh_loop(&self, socket: Arc<UdpSocket>) {
         let state = Arc::clone(&self.state);
         let allocation = Arc::clone(&self.allocation);
+        let permissions = Arc::clone(&self.permissions);
+        let channel_bindings = Arc::clone(&self.channel_bindings);
         let server = self.server;
         let auth = self.auth.clone();
 
         let handle = tokio::spawn(async move {
+            // Bug #33 fix: Track time for permission and channel binding refresh.
+            // Use a shorter check interval (30s) to catch permission/binding expiry
+            // while still respecting allocation refresh timing.
+            let mut next_alloc_refresh = tokio::time::Instant::now();
+
             loop {
                 let lifetime = {
                     let alloc = allocation.lock();
@@ -371,11 +499,21 @@ impl TurnClient {
                     }
                 };
 
-                // Sleep for 80% of the lifetime
-                let refresh_secs = (lifetime as f64 * REFRESH_FRACTION) as u64;
-                let refresh_delay = Duration::from_secs(refresh_secs.max(1));
+                // Sleep for minimum of: 80% allocation lifetime or 30s check interval
+                let alloc_refresh_secs = (lifetime as f64 * REFRESH_FRACTION) as u64;
+                let alloc_refresh_delay = Duration::from_secs(alloc_refresh_secs.max(1));
 
-                tokio::time::sleep(refresh_delay).await;
+                if next_alloc_refresh <= tokio::time::Instant::now() {
+                    next_alloc_refresh = tokio::time::Instant::now() + alloc_refresh_delay;
+                }
+
+                // Check every 30 seconds for permission/binding refresh needs
+                let check_interval = Duration::from_secs(30);
+                let sleep_duration = check_interval.min(
+                    next_alloc_refresh.saturating_duration_since(tokio::time::Instant::now())
+                );
+
+                tokio::time::sleep(sleep_duration).await;
 
                 // Check if we're still in an allocated state
                 {
@@ -386,42 +524,197 @@ impl TurnClient {
                     }
                 }
 
-                // Send Refresh request
-                let current_lifetime = {
-                    let alloc = allocation.lock();
-                    alloc.as_ref().map(|a| a.lifetime).unwrap_or(DEFAULT_LIFETIME)
-                };
+                // Refresh allocation if it's time
+                let now = tokio::time::Instant::now();
+                if now >= next_alloc_refresh {
+                    let current_lifetime = {
+                        let alloc = allocation.lock();
+                        alloc.as_ref().map(|a| a.lifetime).unwrap_or(DEFAULT_LIFETIME)
+                    };
 
-                let mut request = build_refresh_request_static(current_lifetime);
-                add_auth_attributes_static(&auth, &mut request);
+                    let mut request = build_refresh_request_static(current_lifetime);
+                    add_auth_attributes_static(&auth, &mut request);
 
-                match send_request_static(&socket, server, &request).await {
-                    Ok(response) => {
-                        if response.is_success() {
-                            let new_lifetime =
-                                parse_lifetime(&response).unwrap_or(DEFAULT_LIFETIME);
-                            if let Some(ref mut alloc) = *allocation.lock() {
-                                alloc.lifetime = new_lifetime;
+                    let key = auth.compute_key();
+                    match send_request_static(&socket, server, &request, Some(&key)).await {
+                        Ok(response) => {
+                            if response.is_success() {
+                                let new_lifetime =
+                                    parse_lifetime(&response).unwrap_or(DEFAULT_LIFETIME);
+                                if let Some(ref mut alloc) = *allocation.lock() {
+                                    alloc.lifetime = new_lifetime;
+                                }
+                                let refresh_secs = (new_lifetime as f64 * REFRESH_FRACTION) as u64;
+                                next_alloc_refresh = tokio::time::Instant::now()
+                                    + Duration::from_secs(refresh_secs.max(1));
+                                tracing::debug!(
+                                    lifetime = new_lifetime,
+                                    "TURN allocation refreshed"
+                                );
+                            } else {
+                                let code = response.error_code().unwrap_or(0);
+
+                                // Bug #47: Handle 438 Stale Nonce per RFC 5389 §7.3.1.
+                                if code == 438 {
+                                    tracing::info!(
+                                        "TURN refresh received 438 Stale Nonce, \
+                                         extracting new nonce and retrying"
+                                    );
+                                    if let Some(new_nonce) = extract_nonce(&response) {
+                                        let mut retry_auth = auth.clone();
+                                        retry_auth.nonce = Some(new_nonce);
+                                        let mut retry_request =
+                                            build_refresh_request_static(current_lifetime);
+                                        add_auth_attributes_static(&retry_auth, &mut retry_request);
+                                        let retry_key = retry_auth.compute_key();
+                                        match send_request_static(
+                                            &socket, server, &retry_request, Some(&retry_key),
+                                        )
+                                        .await
+                                        {
+                                            Ok(retry_resp) if retry_resp.is_success() => {
+                                                let new_lifetime = parse_lifetime(&retry_resp)
+                                                    .unwrap_or(DEFAULT_LIFETIME);
+                                                if let Some(ref mut alloc) = *allocation.lock() {
+                                                    alloc.lifetime = new_lifetime;
+                                                }
+                                                let refresh_secs = (new_lifetime as f64 * REFRESH_FRACTION) as u64;
+                                                next_alloc_refresh = tokio::time::Instant::now()
+                                                    + Duration::from_secs(refresh_secs.max(1));
+                                                tracing::debug!(
+                                                    lifetime = new_lifetime,
+                                                    "TURN allocation refreshed after \
+                                                     stale nonce retry"
+                                                );
+                                            }
+                                            Ok(retry_resp) => {
+                                                let retry_code =
+                                                    retry_resp.error_code().unwrap_or(0);
+                                                tracing::warn!(
+                                                    error_code = retry_code,
+                                                    "TURN refresh retry after 438 failed"
+                                                );
+                                                *state.lock() = TurnState::Expired;
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "TURN refresh retry after 438 failed"
+                                                );
+                                                *state.lock() = TurnState::Expired;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "438 response missing NONCE attribute, \
+                                             cannot retry"
+                                        );
+                                        *state.lock() = TurnState::Expired;
+                                        break;
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        error_code = code,
+                                        "TURN refresh failed"
+                                    );
+                                    *state.lock() = TurnState::Expired;
+                                    break;
+                                }
                             }
-                            tracing::debug!(
-                                lifetime = new_lifetime,
-                                "TURN allocation refreshed"
-                            );
-                        } else {
-                            let code = response.error_code().unwrap_or(0);
-                            tracing::warn!(
-                                error_code = code,
-                                "TURN refresh failed"
-                            );
-                            // If refresh failed, mark as expired
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "TURN refresh request failed");
                             *state.lock() = TurnState::Expired;
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "TURN refresh request failed");
-                        *state.lock() = TurnState::Expired;
-                        break;
+                }
+
+                // Bug #33 fix: Refresh permissions at 80% of 300s lifetime (240s)
+                let perm_refresh_threshold = Duration::from_secs(
+                    (PERMISSION_LIFETIME as f64 * REFRESH_FRACTION) as u64,
+                );
+                let perms_to_refresh: Vec<SocketAddr> = {
+                    let perms = permissions.lock();
+                    perms
+                        .iter()
+                        .filter(|p| p.created.elapsed() >= perm_refresh_threshold)
+                        .map(|p| p.peer_addr)
+                        .collect()
+                };
+                for peer_addr in perms_to_refresh {
+                    let mut perm_request = build_create_permission_request_static(peer_addr);
+                    add_auth_attributes_static(&auth, &mut perm_request);
+                    let key = auth.compute_key();
+                    match send_request_static(&socket, server, &perm_request, Some(&key)).await {
+                        Ok(response) if response.is_success() => {
+                            let mut perms = permissions.lock();
+                            if let Some(p) = perms.iter_mut().find(|p| p.peer_addr == peer_addr) {
+                                p.created = std::time::Instant::now();
+                            }
+                            tracing::debug!(
+                                peer = %peer_addr,
+                                "TURN permission refreshed"
+                            );
+                        }
+                        Ok(response) => {
+                            let code = response.error_code().unwrap_or(0);
+                            tracing::warn!(
+                                peer = %peer_addr, error_code = code,
+                                "TURN permission refresh failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer_addr, error = %e,
+                                "TURN permission refresh request failed"
+                            );
+                        }
+                    }
+                }
+
+                // Bug #33 fix: Refresh channel bindings at 80% of 600s lifetime (480s)
+                let bind_refresh_threshold = Duration::from_secs(
+                    (CHANNEL_BIND_LIFETIME as f64 * REFRESH_FRACTION) as u64,
+                );
+                let bindings_to_refresh: Vec<(SocketAddr, u16)> = {
+                    let bindings = channel_bindings.lock();
+                    bindings
+                        .iter()
+                        .filter(|b| b.created.elapsed() >= bind_refresh_threshold)
+                        .map(|b| (b.peer_addr, b.channel))
+                        .collect()
+                };
+                for (peer_addr, channel) in bindings_to_refresh {
+                    let mut bind_request = build_channel_bind_request_static(peer_addr, channel);
+                    add_auth_attributes_static(&auth, &mut bind_request);
+                    let key = auth.compute_key();
+                    match send_request_static(&socket, server, &bind_request, Some(&key)).await {
+                        Ok(response) if response.is_success() => {
+                            let mut bindings = channel_bindings.lock();
+                            if let Some(b) = bindings.iter_mut().find(|b| b.channel == channel) {
+                                b.created = std::time::Instant::now();
+                            }
+                            tracing::debug!(
+                                peer = %peer_addr, channel = channel,
+                                "TURN channel binding refreshed"
+                            );
+                        }
+                        Ok(response) => {
+                            let code = response.error_code().unwrap_or(0);
+                            tracing::warn!(
+                                peer = %peer_addr, channel = channel, error_code = code,
+                                "TURN channel binding refresh failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer_addr, channel = channel, error = %e,
+                                "TURN channel binding refresh request failed"
+                            );
+                        }
                     }
                 }
             }
@@ -533,7 +826,8 @@ impl TurnClient {
         socket: &UdpSocket,
         request: &StunMessage,
     ) -> Result<StunMessage> {
-        send_request_static(socket, self.server, request).await
+        let key = self.auth.compute_key();
+        send_request_static(socket, self.server, request, Some(&key)).await
     }
 }
 
@@ -546,6 +840,30 @@ impl Drop for TurnClient {
 // --- Static helper functions (usable from both methods and background tasks) ---
 
 /// Build a Refresh request with a given lifetime (static version)
+/// Bug #33: Build a CreatePermission request (static version for refresh loop)
+fn build_create_permission_request_static(peer_addr: SocketAddr) -> StunMessage {
+    let mut msg = new_turn_message(CREATE_PERMISSION_REQUEST);
+    msg.add_attribute(StunAttribute::Unknown(
+        ATTR_XOR_PEER_ADDRESS,
+        encode_xor_address(&peer_addr, &msg.transaction_id),
+    ));
+    msg
+}
+
+/// Bug #33: Build a ChannelBind request (static version for refresh loop)
+fn build_channel_bind_request_static(peer_addr: SocketAddr, channel: u16) -> StunMessage {
+    let mut msg = new_turn_message(CHANNEL_BIND_REQUEST);
+    msg.add_attribute(StunAttribute::Unknown(
+        ATTR_CHANNEL_NUMBER,
+        encode_channel_number(channel),
+    ));
+    msg.add_attribute(StunAttribute::Unknown(
+        ATTR_XOR_PEER_ADDRESS,
+        encode_xor_address(&peer_addr, &msg.transaction_id),
+    ));
+    msg
+}
+
 fn build_refresh_request_static(lifetime: u32) -> StunMessage {
     let mut msg = new_turn_message(REFRESH_REQUEST);
     msg.add_attribute(StunAttribute::Unknown(
@@ -584,11 +902,25 @@ fn add_auth_attributes_static(auth: &TurnAuth, msg: &mut StunMessage) {
     msg.add_attribute(StunAttribute::Unknown(ATTR_MESSAGE_INTEGRITY, integrity));
 }
 
-/// Send a STUN/TURN request with retransmission (static version)
+/// Send a STUN/TURN request with retransmission (static version).
+///
+/// `integrity_key` is the long-term credential key (MD5(username:realm:password))
+/// used to verify MESSAGE-INTEGRITY on the response. Pass `None` for
+/// unauthenticated requests (e.g. the initial Allocate before 401 challenge).
+///
+/// Bug #105: This function calls `socket.recv_from()` directly, which means
+/// concurrent callers using the same socket will race for incoming datagrams.
+/// A response intended for one caller may be consumed by another. Currently
+/// this is mitigated by matching on transaction ID and retransmitting, but
+/// under high concurrency it can cause spurious timeouts.
+/// TODO: Implement a centralized recv loop (demultiplexer) that dispatches
+/// incoming datagrams to the correct pending transaction by transaction ID,
+/// rather than having each caller recv independently on the shared socket.
 async fn send_request_static(
     socket: &UdpSocket,
     server: SocketAddr,
     request: &StunMessage,
+    integrity_key: Option<&[u8]>,
 ) -> Result<StunMessage> {
     let data = request.marshal();
     let txn_id = request.transaction_id;
@@ -602,11 +934,13 @@ async fn send_request_static(
             .map_err(RtpSipError::Io)?;
 
         // Wait for response with current timeout
+        // RFC 5389 §7.2.1: cap retransmission timeout at Rm * RTO
+        // where Rm = 16 for the last attempt
         let timeout = if attempt < MAX_RETRIES {
             rto
         } else {
-            // Last attempt: give a bit more time
-            rto
+            // Last attempt: cap at Rm * initial RTO (Rm = 16)
+            std::cmp::min(rto, Duration::from_millis(INITIAL_RTO_MS * 16))
         };
 
         let deadline = tokio::time::Instant::now() + timeout;
@@ -618,9 +952,36 @@ async fn send_request_static(
             }
 
             match tokio::time::timeout(remaining, socket.recv_from(&mut recv_buf)).await {
-                Ok(Ok((len, _from))) => {
+                Ok(Ok((len, from))) => {
+                    // Bug #59: Validate that the response came from the expected
+                    // TURN server. Responses from unexpected sources could be
+                    // spoofed and must be discarded.
+                    if from != server {
+                        tracing::warn!(
+                            expected = %server,
+                            actual = %from,
+                            "TURN response from unexpected address, discarding"
+                        );
+                        continue;
+                    }
                     if let Ok(response) = StunMessage::unmarshal(&recv_buf[..len]) {
                         if response.transaction_id == txn_id {
+                            // Bug #8: Verify MESSAGE-INTEGRITY on the response
+                            // if present, to prevent tampering.
+                            if let Err(e) = verify_response_integrity(
+                                &recv_buf[..len],
+                                &response,
+                                integrity_key,
+                            ) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "TURN response MESSAGE-INTEGRITY verification \
+                                     failed, rejecting response"
+                                );
+                                // Reject this response and keep waiting for a
+                                // valid one (or timeout).
+                                continue;
+                            }
                             return Ok(response);
                         }
                     }
@@ -638,6 +999,138 @@ async fn send_request_static(
     Err(RtpSipError::Timeout(
         "TURN transaction timed out after max retries".to_string(),
     ))
+}
+
+/// Verify MESSAGE-INTEGRITY on a STUN/TURN response.
+///
+/// Per RFC 5389 Section 15.4, MESSAGE-INTEGRITY contains an HMAC-SHA1 computed
+/// over the STUN message up to (but not including) the MESSAGE-INTEGRITY
+/// attribute, with the message header length field adjusted to include the
+/// MESSAGE-INTEGRITY attribute (24 bytes: 4 TLV header + 20 HMAC value).
+///
+/// If MESSAGE-INTEGRITY is not present, this is a no-op (returns Ok).
+/// If present and `key` is provided, performs full HMAC-SHA1 verification.
+/// If present but `key` is `None`, logs a warning and accepts the response.
+///
+/// # Arguments
+/// * `raw_bytes` - The raw received bytes (needed for HMAC computation)
+/// * `response` - The parsed STUN message (to locate the attribute)
+/// * `key` - Optional long-term credential key: MD5(username:realm:password)
+fn verify_response_integrity(
+    raw_bytes: &[u8],
+    response: &StunMessage,
+    key: Option<&[u8]>,
+) -> std::result::Result<(), String> {
+    use crate::nat::stun::message::HEADER_SIZE;
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+
+    // Find MESSAGE-INTEGRITY attribute in the response
+    let mut mi_value: Option<&[u8]> = None;
+    for attr in &response.attributes {
+        if let StunAttribute::Unknown(attr_type, data) = attr {
+            if *attr_type == ATTR_MESSAGE_INTEGRITY {
+                mi_value = Some(data);
+                break;
+            }
+        }
+    }
+
+    let mi_data = match mi_value {
+        Some(data) => data,
+        None => return Ok(()), // No MESSAGE-INTEGRITY present, nothing to verify
+    };
+
+    if mi_data.len() != 20 {
+        return Err(format!(
+            "MESSAGE-INTEGRITY has invalid length {} (expected 20)",
+            mi_data.len()
+        ));
+    }
+
+    // Walk the raw bytes to find the offset of the MESSAGE-INTEGRITY attribute.
+    let msg_len =
+        u16::from_be_bytes([raw_bytes[2], raw_bytes[3]]) as usize;
+    let end = HEADER_SIZE + msg_len;
+    // Bug #R7-4: Validate declared msg_len doesn't exceed actual buffer
+    if end > raw_bytes.len() {
+        return Err(format!(
+            "STUN message length {} exceeds buffer size {}",
+            msg_len,
+            raw_bytes.len()
+        ));
+    }
+    let mut offset = HEADER_SIZE;
+    let mut mi_offset: Option<usize> = None;
+
+    while offset + 4 <= end {
+        let attr_type =
+            u16::from_be_bytes([raw_bytes[offset], raw_bytes[offset + 1]]);
+        let attr_len =
+            u16::from_be_bytes([raw_bytes[offset + 2], raw_bytes[offset + 3]]) as usize;
+
+        if attr_type == ATTR_MESSAGE_INTEGRITY {
+            mi_offset = Some(offset);
+            break;
+        }
+
+        offset += 4 + ((attr_len + 3) & !3); // advance past padded value
+    }
+
+    let mi_off = match mi_offset {
+        Some(off) => off,
+        None => {
+            return Err(
+                "MESSAGE-INTEGRITY found in parsed attributes but not in raw bytes"
+                    .to_string(),
+            );
+        }
+    };
+
+    // Build the input for HMAC-SHA1 verification:
+    // - Bytes before the MESSAGE-INTEGRITY attribute
+    // - With the STUN header message-length adjusted to include up to and
+    //   including the MESSAGE-INTEGRITY attribute (24 bytes: 4 TLV header + 20 value)
+    let adjusted_len = (mi_off - HEADER_SIZE + 24) as u16;
+    let mut buf = Vec::with_capacity(mi_off);
+    buf.extend_from_slice(&raw_bytes[..mi_off]);
+    let len_bytes = adjusted_len.to_be_bytes();
+    buf[2] = len_bytes[0];
+    buf[3] = len_bytes[1];
+
+    match key {
+        Some(k) => {
+            // Full HMAC-SHA1 verification
+            let mut mac = Hmac::<Sha1>::new_from_slice(k)
+                .expect("HMAC can take key of any size");
+            mac.update(&buf);
+            let expected = mac.finalize().into_bytes();
+
+            if expected.as_slice() != mi_data {
+                return Err(
+                    "MESSAGE-INTEGRITY HMAC-SHA1 mismatch: response may be \
+                     tampered or credentials differ"
+                        .to_string(),
+                );
+            }
+
+            tracing::trace!(
+                mi_offset = mi_off,
+                "TURN response MESSAGE-INTEGRITY verified successfully"
+            );
+        }
+        None => {
+            // No key available — MESSAGE-INTEGRITY is present but we have
+            // no credentials to verify it. Accepting the response would
+            // bypass authentication, so reject it.
+            return Err(
+                "MESSAGE-INTEGRITY present but no key for verification"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Create a new STUN message with a TURN method type and random transaction ID
@@ -817,6 +1310,19 @@ fn extract_auth_challenge(response: &StunMessage) -> Result<(String, String)> {
             "401 response missing NONCE attribute".to_string(),
         )),
     }
+}
+
+/// Extract the NONCE attribute from a STUN/TURN response.
+/// Used for handling 438 Stale Nonce responses (Bug #47).
+fn extract_nonce(msg: &StunMessage) -> Option<String> {
+    for attr in &msg.attributes {
+        if let StunAttribute::Unknown(attr_type, data) = attr {
+            if *attr_type == ATTR_NONCE {
+                return Some(String::from_utf8_lossy(data).to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Find XOR-RELAYED-ADDRESS in a STUN message
@@ -1627,7 +2133,8 @@ mod tests {
             server_socket.send_to(&resp_data, client_addr).await.unwrap();
         });
 
-        let client = TurnClient::new(server_addr, "user", "pass", "realm");
+        // Bug #R11-8: refresh() requires &mut self
+        let mut client = TurnClient::new(server_addr, "user", "pass", "realm");
         *client.state.lock() = TurnState::Allocated;
         *client.allocation.lock() = Some(TurnAllocation {
             relayed_addr: "198.51.100.1:49152".parse().unwrap(),
@@ -1916,9 +2423,10 @@ mod tests {
         let mut client = TurnClient::new(server_addr, "user", "pass", "realm");
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        // This should timeout after retries
+        // This should timeout after retries (with MAX_RETRIES=7 and
+        // exponential backoff, total time can be ~72 seconds)
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(120),
             client.allocate(&socket),
         )
         .await;

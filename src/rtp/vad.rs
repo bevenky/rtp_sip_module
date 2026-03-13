@@ -6,8 +6,8 @@
 //!
 //! # Algorithm
 //!
-//! 1. Compute mean absolute energy of each frame: `sum(|sample|) / (n / divisor)`
-//!    where `divisor = sample_rate / 8000` normalizes across sample rates
+//! 1. Compute mean absolute energy of each frame: `sum(|sample|) / n`
+//!    (pure mean absolute value, sample-rate-invariant)
 //! 2. Compare against configurable threshold (default 100)
 //! 3. Voice onset: require sustained energy above threshold for `voice_onset_ms`
 //!    (default 200ms) before emitting `StartTalking`
@@ -173,6 +173,10 @@ pub struct VoiceActivityDetector {
 
     /// Detection mode
     mode: VadMode,
+
+    /// Bug #92: DC offset estimate (exponential moving average, scaled by 256).
+    /// Used to remove DC bias from samples before energy computation.
+    dc_estimate: i64,
 }
 
 impl VoiceActivityDetector {
@@ -189,19 +193,22 @@ impl VoiceActivityDetector {
     /// - `sample_rate` - Audio sample rate in Hz (8000, 16000, etc.)
     pub fn new(sample_rate: u32) -> Self {
         let sample_rate = sample_rate.max(8000);
-        let divisor = (sample_rate / 8000).max(1);
+        // Round instead of truncating to handle non-standard rates
+        let divisor = ((sample_rate + 4000) / 8000).max(1);
         Self {
             threshold: 100,
             sample_rate,
             divisor,
             channels: 1,
-            voice_onset_samples: 200 * (sample_rate / 1000),
-            silence_holdoff_samples: 500 * (sample_rate / 1000),
+            // Bug #57: Use same formula as with_config() for consistency
+            voice_onset_samples: sample_rate * 200 / 1000,
+            silence_holdoff_samples: sample_rate * 500 / 1000,
             voice_sample_count: 0,
             silence_sample_count: 0,
             state: VadState::None,
             last_energy: 0,
             mode: VadMode::Energy,
+            dc_estimate: 0,
         }
     }
 
@@ -219,7 +226,8 @@ impl VoiceActivityDetector {
         silence_holdoff_ms: u32,
     ) -> Self {
         let sample_rate = sample_rate.max(8000);
-        let divisor = (sample_rate / 8000).max(1);
+        // Round instead of truncating to handle non-standard rates
+        let divisor = ((sample_rate + 4000) / 8000).max(1);
         Self {
             threshold,
             sample_rate,
@@ -232,6 +240,7 @@ impl VoiceActivityDetector {
             state: VadState::None,
             last_energy: 0,
             mode: VadMode::Energy,
+            dc_estimate: 0,
         }
     }
 
@@ -322,14 +331,42 @@ impl VoiceActivityDetector {
             return self.process_silence(0);
         }
 
+        // Bug #23 / #92: Update DC offset estimate (exponential moving average).
+        // Per-frame update using the frame's average on channel 0, with a slow
+        // time constant (255/256) to avoid stripping voice energy. The old code
+        // ran the EMA per-sample with time constant 15/16 which was far too fast.
+        {
+            let channels = self.channels.max(1) as usize;
+            let per_ch = samples.len() / channels;
+            if per_ch > 0 {
+                let frame_avg = (0..per_ch)
+                    .filter_map(|i| {
+                        let idx = i * channels;
+                        if idx < samples.len() {
+                            Some(samples[idx] as i64)
+                        } else {
+                            None
+                        }
+                    })
+                    .sum::<i64>()
+                    / per_ch as i64;
+                // Bug #25: Use f64 intermediate for division to avoid precision loss
+                self.dc_estimate = ((self.dc_estimate as f64 * 255.0) / 256.0) as i64 + frame_avg;
+            }
+        }
+
         // Per-channel sample count
         let per_channel = samples.len() as u32 / self.channels;
 
         // Compute energy based on mode
+        // Bug #92 / #23: Subtract DC offset from each sample before computing energy
+        let dc_offset = (self.dc_estimate / 256) as i32;
         let energy = if self.mode.is_webrtc_style() {
-            self.compute_webrtc_score(samples, per_channel)
+            // Bug #43: Apply DC correction before computing WebRTC score,
+            // same as the energy-based mode does.
+            self.compute_webrtc_score(samples, per_channel, dc_offset)
         } else {
-            compute_mean_abs_multichannel(samples, self.divisor, self.channels)
+            compute_mean_abs_multichannel_dc(samples, self.divisor, self.channels, dc_offset)
         };
         self.last_energy = energy;
 
@@ -349,7 +386,7 @@ impl VoiceActivityDetector {
     ///
     /// Returns: if voice detected → `threshold + 100`, else → `0`.
     /// This maps the binary result into the energy-based state machine.
-    fn compute_webrtc_score(&self, samples: &[i16], per_channel: u32) -> u32 {
+    fn compute_webrtc_score(&self, samples: &[i16], per_channel: u32, dc_offset: i32) -> u32 {
         if per_channel < 2 {
             return 0;
         }
@@ -357,27 +394,30 @@ impl VoiceActivityDetector {
         let channels = self.channels as usize;
         let n = per_channel as usize;
 
-        // Compute RMS energy and zero-crossing rate on channel 0
+        // Bug #43: Apply DC correction before computing RMS energy and
+        // zero-crossing rate on channel 0, same as the energy-based mode does.
         let mut sum_sq: u64 = 0;
         let mut zero_crossings: u32 = 0;
-        let mut prev_sign = samples[0] >= 0;
+        let first_corrected = samples[0] as i32 - dc_offset;
+        let mut prev_sign = first_corrected >= 0;
 
         for i in 0..n {
             let idx = i * channels;
             if idx >= samples.len() {
                 break;
             }
-            let s = samples[idx] as i64;
+            let s = samples[idx] as i64 - dc_offset as i64;
             sum_sq += (s * s) as u64;
 
-            let cur_sign = samples[idx] >= 0;
+            let cur_sign = s >= 0;
             if cur_sign != prev_sign {
                 zero_crossings += 1;
             }
             prev_sign = cur_sign;
         }
 
-        let rms = ((sum_sq / n as u64) as f64).sqrt() as u64;
+        // Bug #R12-1: Cast to f64 before division to avoid integer truncation
+        let rms = (sum_sq as f64 / n as f64).sqrt() as u64;
 
         // Mode-dependent minimum RMS threshold (higher = more aggressive)
         let min_rms: u64 = match self.mode {
@@ -397,7 +437,7 @@ impl VoiceActivityDetector {
         // Voiced speech (100-400Hz) at 8kHz has ~25-100 crossings per 160 samples.
         // White noise has ~80 crossings per 160 samples.
         // Very high ZCR relative to frame length suggests noise, not voice.
-        let zcr_ratio = zero_crossings as f64 / n as f64;
+        let zcr_ratio = zero_crossings as f64 / (n - 1).max(1) as f64;
 
         // Mode-dependent ZCR threshold (lower = more strict about ZCR)
         let max_zcr: f64 = match self.mode {
@@ -412,7 +452,8 @@ impl VoiceActivityDetector {
             return 0; // too many zero crossings → likely noise
         }
 
-        self.threshold + 100 // voice detected
+        // Bug #91: Use saturating_add to prevent overflow
+        self.threshold.saturating_add(100) // voice detected
     }
 
     /// Handle a voice frame (energy above threshold)
@@ -474,6 +515,7 @@ impl VoiceActivityDetector {
         self.silence_sample_count = 0;
         self.state = VadState::None;
         self.last_energy = 0;
+        self.dc_estimate = 0;
     }
 }
 
@@ -483,28 +525,27 @@ impl Default for VoiceActivityDetector {
     }
 }
 
-/// Compute mean absolute energy with sample-rate normalization and
-/// multi-channel support.
+/// Compute mean absolute energy with multi-channel support.
 ///
 /// For multi-channel interleaved audio, processes only channel 0 using
 /// stride-based access (`j += channels`). The per-channel sample count
 /// is `total_samples / channels`.
 ///
-/// Formula: `sum(|sample[j]|) / (per_channel_count / divisor)`
+/// Formula: `sum(|sample[j]|) / per_channel_count`
 ///
-/// The divisor normalizes for sample rate: `divisor = sample_rate / 8000`.
+/// This is a pure mean absolute value, making it sample-rate-invariant
+/// so the threshold works consistently across all rates.
 ///
-/// Short frame guard: if per-channel count < divisor, score stays 0.
-/// This prevents false voice detection on very short frames.
+/// The `_divisor` parameter is retained for API compatibility but is
+/// no longer used in the computation.
 ///
-/// Returns 0 for empty input or frames shorter than divisor.
-fn compute_mean_abs_multichannel(samples: &[i16], divisor: u32, channels: u32) -> u32 {
+/// Returns 0 for empty input.
+fn compute_mean_abs_multichannel(samples: &[i16], _divisor: u32, channels: u32) -> u32 {
     let channels = channels.max(1) as usize;
     let per_channel = samples.len() / channels;
     let n = per_channel as u32;
 
-    // Short frame guard: if per-channel count < divisor, return 0
-    if n == 0 || divisor == 0 || n < divisor {
+    if n == 0 {
         return 0;
     }
 
@@ -518,9 +559,38 @@ fn compute_mean_abs_multichannel(samples: &[i16], divisor: u32, channels: u32) -
         j += channels;
     }
 
-    // score = energy / (per_channel_count / divisor)
-    let normalized_count = (n / divisor) as u64;
-    (sum / normalized_count) as u32
+    // Pure mean absolute value: sample-rate-invariant so threshold
+    // works consistently across all rates.
+    (sum / n as u64) as u32
+}
+
+/// Bug #92: DC-offset-corrected version of `compute_mean_abs_multichannel`.
+/// Subtracts `dc_offset` from each sample before taking the absolute value.
+fn compute_mean_abs_multichannel_dc(
+    samples: &[i16],
+    _divisor: u32,
+    channels: u32,
+    dc_offset: i32,
+) -> u32 {
+    let channels = channels.max(1) as usize;
+    let per_channel = samples.len() / channels;
+    let n = per_channel as u32;
+
+    if n == 0 {
+        return 0;
+    }
+
+    let mut sum: u64 = 0;
+    let mut j = 0usize;
+    for _ in 0..per_channel {
+        if j < samples.len() {
+            let corrected = (samples[j] as i32) - dc_offset;
+            sum += corrected.unsigned_abs() as u64;
+        }
+        j += channels;
+    }
+
+    (sum / n as u64) as u32
 }
 
 /// Backward-compatible mono wrapper
@@ -565,32 +635,29 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_abs_sample_rate_normalization() {
-        // score = energy / (samples / divisor)
-        // 8kHz (divisor=1): 160*1000 / (160/1) = 1000
-        // 16kHz (divisor=2): 320*1000 / (320/2) = 2000
+    fn test_mean_abs_sample_rate_invariant() {
+        // With pure mean (sum/n), energy is sample-rate-invariant:
+        // 8kHz: 160*1000 / 160 = 1000
+        // 16kHz: 320*1000 / 320 = 1000
         let samples_8k = vec![1000i16; 160];
         let samples_16k = vec![1000i16; 320];
         assert_eq!(compute_mean_abs(&samples_8k, 1), 1000);
-        assert_eq!(compute_mean_abs(&samples_16k, 2), 2000);
+        assert_eq!(compute_mean_abs(&samples_16k, 2), 1000);
     }
 
     #[test]
-    fn test_mean_abs_48khz_normalization() {
-        // 48kHz (divisor=6): 960*1000 / (960/6) = 960000/160 = 6000
+    fn test_mean_abs_48khz_invariant() {
+        // 48kHz: 960*1000 / 960 = 1000
         let samples = vec![1000i16; 960];
-        assert_eq!(compute_mean_abs(&samples, 6), 6000);
+        assert_eq!(compute_mean_abs(&samples, 6), 1000);
     }
 
     #[test]
-    fn test_mean_abs_short_frame_guard() {
-        // If per-channel count < divisor, score stays 0
-        // At 16kHz (divisor=2), a single sample is < divisor → energy = 0
-        assert_eq!(compute_mean_abs(&[10000], 2), 0);
-        // At 48kHz (divisor=6), 5 samples is < divisor → energy = 0
-        assert_eq!(compute_mean_abs(&[10000; 5], 6), 0);
-        // Exactly divisor samples: 2 samples at divisor=2 → allowed
-        assert_eq!(compute_mean_abs(&[1000, 1000], 2), 2000); // sum=2000, 2/2=1, 2000/1=2000
+    fn test_mean_abs_short_frame() {
+        // With pure mean, even single samples compute correctly
+        assert_eq!(compute_mean_abs(&[10000], 2), 10000);
+        assert_eq!(compute_mean_abs(&[10000; 5], 6), 10000);
+        assert_eq!(compute_mean_abs(&[1000, 1000], 2), 1000); // sum=2000, n=2, 2000/2=1000
     }
 
     #[test]
@@ -614,9 +681,9 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_abs_divisor_zero_returns_zero() {
-        // Guard: divisor=0 → return 0 (shouldn't happen but defensive)
-        assert_eq!(compute_mean_abs(&[1000; 160], 0), 0);
+    fn test_mean_abs_divisor_ignored() {
+        // Divisor is no longer used in computation; pure mean is returned
+        assert_eq!(compute_mean_abs(&[1000; 160], 0), 1000);
     }
 
     // ========== Multi-channel compute_mean_abs tests ==========
@@ -650,23 +717,22 @@ mod tests {
 
     #[test]
     fn test_multichannel_stereo_with_divisor() {
-        // 16kHz stereo: 320 interleaved samples = 160 per channel, divisor=2
+        // 16kHz stereo: 320 interleaved samples = 160 per channel
         // Channel 0 = 500
         let mut samples = vec![0i16; 320];
         for i in 0..160 {
             samples[i * 2] = 500; // ch0
             samples[i * 2 + 1] = 0; // ch1
         }
-        // per_channel=160, sum=160*500=80000, normalized_count=160/2=80
-        // energy = 80000/80 = 1000
-        assert_eq!(compute_mean_abs_multichannel(&samples, 2, 2), 1000);
+        // per_channel=160, sum=160*500=80000, mean = 80000/160 = 500
+        assert_eq!(compute_mean_abs_multichannel(&samples, 2, 2), 500);
     }
 
     #[test]
-    fn test_multichannel_short_frame_guard() {
-        // 16kHz stereo: 2 total samples = 1 per channel, divisor=2
-        // 1 < 2 → short frame guard → 0
-        assert_eq!(compute_mean_abs_multichannel(&[10000, 5000], 2, 2), 0);
+    fn test_multichannel_short_frame() {
+        // 16kHz stereo: 2 total samples = 1 per channel
+        // With pure mean, single sample computes normally: 10000
+        assert_eq!(compute_mean_abs_multichannel(&[10000, 5000], 2, 2), 10000);
     }
 
     #[test]
@@ -1012,23 +1078,22 @@ mod tests {
 
     #[test]
     fn test_vad_single_sample_at_8khz() {
-        // At 8kHz, divisor=1, single sample is >= divisor, so energy IS computed.
+        // Pure mean: sum=10000, n=1, energy=10000.
         // But onset requires >1600 samples, so state stays None.
         let mut vad = VoiceActivityDetector::new(8000);
         let state = vad.process(&[10000]);
         assert_eq!(state, VadState::None);
-        // Energy is computed: sum=10000, samples/divisor=1/1=1, score=10000
         assert_eq!(vad.last_energy(), 10000);
     }
 
     #[test]
-    fn test_vad_single_sample_at_16khz_is_silence() {
-        // At 16kHz, divisor=2, single sample (1 < 2) → short frame guard: score=0
+    fn test_vad_single_sample_at_16khz() {
+        // Pure mean: sum=10000, n=1, energy=10000 (same as 8kHz).
+        // State stays None because onset needs >3200 samples.
         let mut vad = VoiceActivityDetector::new(16000);
         let state = vad.process(&[10000]);
         assert_eq!(state, VadState::None);
-        // Energy is 0 because short frame guard triggered
-        assert_eq!(vad.last_energy(), 0);
+        assert_eq!(vad.last_energy(), 10000);
     }
 
     #[test]

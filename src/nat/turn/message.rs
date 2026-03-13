@@ -70,13 +70,21 @@ pub fn parse_channel_data(data: &[u8]) -> Option<(u16, &[u8])> {
     Some((channel, &data[CHANNEL_DATA_HEADER_SIZE..CHANNEL_DATA_HEADER_SIZE + length]))
 }
 
-/// Build a TURN ChannelData message
+/// Build a TURN ChannelData message.
+///
+/// Note (Bug #60): RFC 5766 §11.5 specifies that padding to a 4-byte boundary
+/// is only required for connection-oriented transports (TCP/TLS). For UDP
+/// transport, the padding bytes are unnecessary and may confuse strict servers.
+/// Currently this function always pads; callers using UDP transport should be
+/// aware that the extra padding bytes are included but are not required by the
+/// RFC for UDP.
 pub fn build_channel_data(channel: u16, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(CHANNEL_DATA_HEADER_SIZE + payload.len());
     buf.extend_from_slice(&channel.to_be_bytes());
     buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     buf.extend_from_slice(payload);
-    // Pad to 4-byte boundary
+    // Pad to 4-byte boundary (required for TCP/TLS per RFC 5766 §11.5,
+    // not strictly needed for UDP but kept for consistency)
     while buf.len() % 4 != 0 {
         buf.push(0);
     }

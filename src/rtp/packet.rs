@@ -68,6 +68,7 @@ impl RtpPacketBuilder {
         // Increment sequence (wraps at 65535)
         self.sequence = self.sequence.wrapping_add(1);
         // Increment timestamp by number of samples
+        debug_assert!(samples > 0, "timestamp advance with zero samples");
         self.timestamp = self.timestamp.wrapping_add(samples);
 
         packet
@@ -104,6 +105,25 @@ impl RtpPacketBuilder {
     /// Get current sequence number
     pub fn sequence(&self) -> u16 {
         self.sequence
+    }
+
+    /// Consume and return the next sequence number (post-increments).
+    ///
+    /// This is used by the DTMF sender so that DTMF packets share
+    /// the same monotonic sequence-number space as audio packets
+    /// (RFC 4733 §2.5).
+    pub fn next_sequence(&mut self) -> u16 {
+        let seq = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        seq
+    }
+
+    /// Set the current sequence number.
+    ///
+    /// Used after a batch of DTMF packets have consumed sequence numbers
+    /// from an external counter that was seeded from this builder.
+    pub fn set_sequence(&mut self, seq: u16) {
+        self.sequence = seq;
     }
 
     /// Get current timestamp

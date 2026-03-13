@@ -88,6 +88,9 @@ pub struct SymmetricRtp {
     /// Total packets processed (for diagnostics)
     packets_processed: u64,
 
+    /// Learned SSRC for validating source consistency (Bug #16)
+    learned_ssrc: Option<u32>,
+
     // --- Rate limiting for Always mode (Bug #51) ---
     /// Rate limit config
     rate_limit: SwitchRateLimit,
@@ -117,6 +120,7 @@ impl SymmetricRtp {
             learned_addr: None,
             mode: AutoAdjustMode::Always,
             packets_processed: 0,
+            learned_ssrc: None,
             rate_limit: SwitchRateLimit::default(),
             switch_times: Vec::new(),
             locked: false,
@@ -143,6 +147,7 @@ impl SymmetricRtp {
             learned_addr: None,
             mode: AutoAdjustMode::Always,
             packets_processed: 0,
+            learned_ssrc: None,
             rate_limit: SwitchRateLimit::default(),
             switch_times: Vec::new(),
             locked: false,
@@ -161,6 +166,7 @@ impl SymmetricRtp {
             learned_addr: None,
             mode: AutoAdjustMode::Disabled,
             packets_processed: 0,
+            learned_ssrc: None,
             rate_limit: SwitchRateLimit::default(),
             switch_times: Vec::new(),
             locked: false,
@@ -235,6 +241,38 @@ impl SymmetricRtp {
         true
     }
 
+    /// Process an incoming packet's source address with SSRC validation (Bug #16).
+    ///
+    /// If an SSRC is provided, validates it against the previously learned SSRC.
+    /// If the SSRC changes, the learning state is reset (candidate_addr cleared,
+    /// tally reset to 0) because a new SSRC indicates a different media source
+    /// and the previously learned address may no longer be valid.
+    ///
+    /// Returns true if the learned address changed.
+    pub fn process_incoming_with_ssrc(
+        &mut self,
+        source: SocketAddr,
+        ssrc: u32,
+    ) -> bool {
+        match self.learned_ssrc {
+            Some(prev_ssrc) if prev_ssrc != ssrc => {
+                tracing::warn!(
+                    old_ssrc = prev_ssrc,
+                    new_ssrc = ssrc,
+                    "SSRC changed, resetting symmetric RTP learning state"
+                );
+                self.candidate_addr = None;
+                self.tally = 0;
+                self.learned_ssrc = Some(ssrc);
+            }
+            None => {
+                self.learned_ssrc = Some(ssrc);
+            }
+            _ => {}
+        }
+        self.process_incoming_with_time(source, Instant::now())
+    }
+
     /// Process an incoming packet's source address.
     ///
     /// Returns true if the learned address changed (caller must update send target).
@@ -275,11 +313,11 @@ impl SymmetricRtp {
             return false;
         }
 
-        // If source matches configured addr, nothing to learn
+        // If source matches configured addr, nothing to learn.
+        // Bug #30: Do NOT decrement the learning window here — packets from the
+        // configured address are expected traffic and should not consume the
+        // window budget that exists to learn a *different* (NATted) address.
         if self.configured_addr == Some(source) {
-            if self.mode == AutoAdjustMode::Once {
-                self.decrement_window();
-            }
             return false;
         }
 
@@ -402,6 +440,7 @@ impl SymmetricRtp {
         self.tally = 0;
         self.window_remaining = self.window;
         self.packets_processed = 0;
+        self.learned_ssrc = None;
         self.switch_times.clear();
         self.locked = false;
     }

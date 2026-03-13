@@ -26,9 +26,11 @@ impl CodecType {
         8000 // G.711 is always 8kHz
     }
 
-    /// Get samples per packet (20ms frame)
-    pub fn samples_per_frame(&self) -> usize {
-        160 // 20ms at 8kHz = 160 samples
+    /// Get samples per packet for the given ptime.
+    /// Bug #26: Previously hardcoded to 160 (20ms at 8kHz), now takes ptime_ms
+    /// to support variable packet sizes (e.g. 10ms, 30ms).
+    pub fn samples_per_frame(&self, ptime_ms: u32) -> usize {
+        (self.sample_rate() * ptime_ms / 1000) as usize
     }
 
     /// Parse codec from string
@@ -90,19 +92,30 @@ impl G711Codec {
         }
     }
 
-    /// Check if a G.711 frame is silence.
+    /// Check if a G.711 frame is silence or near-silence.
     /// For mu-law, silence is 0xFF (positive zero) or 0x7F (negative zero).
     /// For A-law, silence is 0xD5 (positive zero) or 0x55 (negative zero).
     /// Bug #65: Uses 95% threshold for better alignment with energy-based VAD.
+    /// Bug #109: Also includes near-silence byte values:
+    ///   - mu-law: 0xFE/0x7E (amplitude +/-4) and 0xFD/0x7D (amplitude +/-8)
+    ///   - A-law:  0xD4/0x54 (amplitude +/-4) and 0xD7/0x57 (amplitude +/-8)
+    ///   These represent signal levels below the noise floor for telephony.
     pub fn is_silence_frame(&self, data: &[u8]) -> bool {
         if data.is_empty() {
             return true;
         }
         let silence_count = match self.codec_type {
-            CodecType::Pcmu => data.iter().filter(|&&b| b == 0xFF || b == 0x7F).count(),
-            CodecType::Pcma => data.iter().filter(|&&b| b == 0xD5 || b == 0x55).count(),
+            CodecType::Pcmu => data
+                .iter()
+                .filter(|&&b| matches!(b, 0xFF | 0x7F | 0xFE | 0x7E | 0xFD | 0x7D))
+                .count(),
+            CodecType::Pcma => data
+                .iter()
+                .filter(|&&b| matches!(b, 0xD5 | 0x55 | 0xD4 | 0x54 | 0xD7 | 0x57))
+                .count(),
         };
-        silence_count * 100 / data.len() >= 95
+        // Bug #26: Avoid integer division truncation by cross-multiplying
+        silence_count * 100 >= data.len() * 95
     }
 
     /// Get the silence byte value for this codec.

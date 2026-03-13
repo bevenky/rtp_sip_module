@@ -210,9 +210,12 @@ impl SessionTimer {
     /// - `"1800;refresher=uac"`
     /// - `"1800;refresher=uas"`
     ///
+    /// Bug #71: `is_uac` indicates whether *we* are the UAC side of the dialog.
+    /// This affects the mapping of `refresher=uac`/`refresher=uas` to Local/Remote.
+    ///
     /// Returns `None` if the header cannot be parsed. When the `refresher`
     /// parameter is absent, the second element of the tuple is `None`.
-    pub fn parse_session_expires(header: &str) -> Option<(u32, Option<RefreshRole>)> {
+    pub fn parse_session_expires(header: &str, is_uac: bool) -> Option<(u32, Option<RefreshRole>)> {
         let header = header.trim();
         let mut parts = header.splitn(2, ';');
 
@@ -220,7 +223,7 @@ impl SessionTimer {
         let seconds: u32 = seconds_str.parse().ok()?;
 
         let role = if let Some(params) = parts.next() {
-            Self::extract_refresher_role(params)
+            Self::extract_refresher_role(params, is_uac)
         } else {
             None
         };
@@ -281,18 +284,20 @@ impl SessionTimer {
     /// # Arguments
     /// * `session_expires_header` - The raw `Session-Expires` header value from
     ///   the 200 OK, or `None` if the header was absent.
+    /// * `is_uac` - Whether we are the UAC side of the dialog (Bug #71).
     ///
     /// # Returns
     /// The negotiated `(session_expires, RefreshRole)` that was applied to the timer.
     pub fn process_response(
         &mut self,
         session_expires_header: Option<&str>,
+        is_uac: bool,
     ) -> (u32, RefreshRole) {
         const DEFAULT_SESSION_EXPIRES: u32 = 1800;
 
         match session_expires_header {
             Some(header) => {
-                if let Some((seconds, role_opt)) = Self::parse_session_expires(header) {
+                if let Some((seconds, role_opt)) = Self::parse_session_expires(header, is_uac) {
                     let role = role_opt.unwrap_or(self.config.preferred_role);
                     self.start(seconds, role);
                     (seconds.max(self.min_se), role)
@@ -338,14 +343,26 @@ impl SessionTimer {
     // ── private helpers ──────────────────────────────────────────────
 
     /// Extract the `RefreshRole` from a parameters string like `"refresher=uac"`.
-    fn extract_refresher_role(params: &str) -> Option<RefreshRole> {
+    ///
+    /// Bug #71: The mapping depends on whether *we* are the UAC or UAS:
+    /// - If we are UAC: `refresher=uac` -> Local, `refresher=uas` -> Remote
+    /// - If we are UAS: `refresher=uac` -> Remote, `refresher=uas` -> Local
+    fn extract_refresher_role(params: &str, is_uac: bool) -> Option<RefreshRole> {
         for param in params.split(';') {
             let param = param.trim();
             if let Some(value) = param.strip_prefix("refresher=") {
                 let value = value.trim().to_lowercase();
                 return match value.as_str() {
-                    "uac" => Some(RefreshRole::Local),
-                    "uas" => Some(RefreshRole::Remote),
+                    "uac" => Some(if is_uac {
+                        RefreshRole::Local
+                    } else {
+                        RefreshRole::Remote
+                    }),
+                    "uas" => Some(if is_uac {
+                        RefreshRole::Remote
+                    } else {
+                        RefreshRole::Local
+                    }),
                     _ => None,
                 };
             }
@@ -451,31 +468,42 @@ mod tests {
 
     #[test]
     fn test_parse_session_expires_with_refresher() {
-        let result = SessionTimer::parse_session_expires("1800;refresher=uac");
+        // As UAC: refresher=uac -> Local, refresher=uas -> Remote
+        let result = SessionTimer::parse_session_expires("1800;refresher=uac", true);
         assert_eq!(result, Some((1800, Some(RefreshRole::Local))));
 
-        let result = SessionTimer::parse_session_expires("900;refresher=uas");
+        let result = SessionTimer::parse_session_expires("900;refresher=uas", true);
         assert_eq!(result, Some((900, Some(RefreshRole::Remote))));
 
         // With whitespace
-        let result = SessionTimer::parse_session_expires("  3600 ; refresher=uac ");
+        let result = SessionTimer::parse_session_expires("  3600 ; refresher=uac ", true);
         assert_eq!(result, Some((3600, Some(RefreshRole::Local))));
     }
 
     #[test]
+    fn test_parse_session_expires_with_refresher_as_uas() {
+        // Bug #71: As UAS: refresher=uac -> Remote, refresher=uas -> Local
+        let result = SessionTimer::parse_session_expires("1800;refresher=uac", false);
+        assert_eq!(result, Some((1800, Some(RefreshRole::Remote))));
+
+        let result = SessionTimer::parse_session_expires("900;refresher=uas", false);
+        assert_eq!(result, Some((900, Some(RefreshRole::Local))));
+    }
+
+    #[test]
     fn test_parse_session_expires_without_refresher() {
-        let result = SessionTimer::parse_session_expires("1800");
+        let result = SessionTimer::parse_session_expires("1800", true);
         assert_eq!(result, Some((1800, None)));
 
-        let result = SessionTimer::parse_session_expires("  600  ");
+        let result = SessionTimer::parse_session_expires("  600  ", true);
         assert_eq!(result, Some((600, None)));
     }
 
     #[test]
     fn test_parse_session_expires_invalid() {
-        assert!(SessionTimer::parse_session_expires("").is_none());
-        assert!(SessionTimer::parse_session_expires("abc").is_none());
-        assert!(SessionTimer::parse_session_expires(";refresher=uac").is_none());
+        assert!(SessionTimer::parse_session_expires("", true).is_none());
+        assert!(SessionTimer::parse_session_expires("abc", true).is_none());
+        assert!(SessionTimer::parse_session_expires(";refresher=uac", true).is_none());
     }
 
     #[test]
@@ -582,7 +610,7 @@ mod tests {
     #[test]
     fn test_parse_session_expires_unknown_refresher() {
         // An unknown refresher value should yield None for the role.
-        let result = SessionTimer::parse_session_expires("1800;refresher=unknown");
+        let result = SessionTimer::parse_session_expires("1800;refresher=unknown", true);
         assert_eq!(result, Some((1800, None)));
     }
 
@@ -657,7 +685,7 @@ mod tests {
     fn test_process_response_with_valid_header() {
         let mut timer = SessionTimer::new(SessionTimerConfig::default());
 
-        let (se, role) = timer.process_response(Some("900;refresher=uac"));
+        let (se, role) = timer.process_response(Some("900;refresher=uac"), true);
         assert_eq!(se, 900);
         assert_eq!(role, RefreshRole::Local);
         assert!(timer.is_active());
@@ -668,7 +696,7 @@ mod tests {
         let mut timer = SessionTimer::new(SessionTimerConfig::default());
 
         // Bug #63: Remote omits Session-Expires -> default 1800s, Local refresher
-        let (se, role) = timer.process_response(None);
+        let (se, role) = timer.process_response(None, true);
         assert_eq!(se, 1800);
         assert_eq!(role, RefreshRole::Local);
         assert!(timer.is_active());
@@ -679,7 +707,7 @@ mod tests {
         let mut timer = SessionTimer::new(SessionTimerConfig::default());
 
         // Malformed header -> fall back to 1800s
-        let (se, role) = timer.process_response(Some("invalid"));
+        let (se, role) = timer.process_response(Some("invalid"), true);
         assert_eq!(se, 1800);
         assert_eq!(role, RefreshRole::Local);
         assert!(timer.is_active());
@@ -690,7 +718,7 @@ mod tests {
         let mut timer = SessionTimer::new(SessionTimerConfig::default());
 
         // No refresher specified -> use preferred_role from config (Local)
-        let (se, role) = timer.process_response(Some("600"));
+        let (se, role) = timer.process_response(Some("600"), true);
         assert_eq!(se, 600);
         assert_eq!(role, RefreshRole::Local);
         assert!(timer.is_active());

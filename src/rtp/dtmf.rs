@@ -69,7 +69,9 @@
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::time::Instant;
 
 use crate::error::{Result, RtpSipError};
 
@@ -263,10 +265,9 @@ impl DtmfPayload {
             return None;
         }
 
-        // Edge case: reject all-zero payload (malformed packet from certain equipment)
-        if data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0 {
-            return None;
-        }
+        // Bug #R8-2: Removed dead all-zero payload check. The previous condition
+        // (data[0] > 15) could never be true after the event > 15 early return above.
+        // All-zero payloads [0,0,0,0] are valid Digit '0' per RFC 4733 (event=0).
 
         let is_end = (data[1] & 0x80) != 0;
         let volume = data[1] & 0x3F;
@@ -282,6 +283,8 @@ impl DtmfPayload {
 
     /// Serialize to 4-byte payload
     pub fn serialize(&self) -> [u8; 4] {
+        // Bug #R6-4: Validate event code is in valid DTMF range (0-15)
+        debug_assert!(self.event <= 15, "Invalid DTMF event code: {}", self.event);
         let mut out = [0u8; 4];
         out[0] = self.event;
         out[1] = (if self.is_end { 0x80 } else { 0x00 }) | (self.volume & 0x3F);
@@ -293,7 +296,7 @@ impl DtmfPayload {
     /// Convert duration from milliseconds to timestamp units (at 8000Hz)
     pub fn ms_to_timestamp(ms: u32) -> u16 {
         // 8000 samples/sec * ms / 1000 = 8 * ms
-        (ms * 8).min(u16::MAX as u32) as u16
+        ms.saturating_mul(8).min(u16::MAX as u32) as u16
     }
 
     /// Convert duration from timestamp units to milliseconds
@@ -444,10 +447,13 @@ impl RtpBugFlags {
 /// # Usage Pattern
 ///
 /// ```ignore
-/// let sender = DtmfSender::new(ssrc);
+/// let mut sender = DtmfSender::new(ssrc);
+/// let mut seq: u16 = packet_builder.sequence();  // shared with audio
+/// let audio_ts: u32 = packet_builder.timestamp(); // snapshot audio timestamp
 ///
 /// // Send digit '5' for 100ms
-/// let packets = sender.generate_digit('5', 100, 20)?;
+/// let packets = sender.generate_digit('5', 100, 20, &mut seq, audio_ts)?;
+/// packet_builder.set_sequence(seq); // sync back
 /// for packet in packets {
 ///     socket.send(&packet.to_rtp_bytes()).await?;
 ///     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -483,16 +489,16 @@ pub struct DtmfSender {
     payload_type: u8,
     /// SSRC for RTP packets
     ssrc: u32,
-    /// Current sequence number
-    sequence: AtomicU16,
-    /// Timestamp for current digit (stays constant during digit in normal mode)
-    timestamp_dtmf: AtomicU32,
-    /// Current digit being sent (0xFF = none)
-    out_digit: Mutex<Option<DtmfEvent>>,
+    /// Timestamp for current digit (stays constant during digit in normal mode).
+    /// Initialized from the audio RTP stream's timestamp when a digit starts
+    /// (RFC 4733 §2.5).
+    digit_timestamp: u32,
+    /// Current digit being sent (None = idle)
+    out_digit: Option<DtmfEvent>,
     /// Duration sent so far (in timestamp units)
-    out_digit_sofar: AtomicU32,
+    out_digit_sofar: u32,
     /// Total duration for current digit
-    out_digit_dur: AtomicU32,
+    out_digit_dur: u32,
     /// RTP bug workaround flags (Sonus, etc)
     rtp_bugs: RtpBugFlags,
 }
@@ -503,11 +509,10 @@ impl DtmfSender {
         Self {
             payload_type: TELEPHONE_EVENT_PT,
             ssrc,
-            sequence: AtomicU16::new(rand::random()),
-            timestamp_dtmf: AtomicU32::new(rand::random()),
-            out_digit: Mutex::new(None),
-            out_digit_sofar: AtomicU32::new(0),
-            out_digit_dur: AtomicU32::new(0),
+            digit_timestamp: 0,
+            out_digit: None,
+            out_digit_sofar: 0,
+            out_digit_dur: 0,
             rtp_bugs: RtpBugFlags::default(),
         }
     }
@@ -551,99 +556,189 @@ impl DtmfSender {
         self.payload_type
     }
 
-    /// Start sending a new digit
+    /// Start sending a new digit.
     ///
-    /// Returns the packets to send immediately (first packet with marker bit)
-    pub fn start_digit(&self, digit: char, duration_ms: u32) -> Result<Vec<DtmfPacket>> {
+    /// `seq` is a mutable reference to the shared RTP sequence counter
+    /// (from `RtpPacketBuilder`). `audio_timestamp` is the current audio
+    /// RTP timestamp at the moment the digit starts — per RFC 4733 §2.5 the
+    /// DTMF event timestamp must be drawn from the audio stream.
+    /// `interval_ms` is the ptime in milliseconds (typically 20ms) — the initial
+    /// packet duration matches one ptime interval, just like FreeSWITCH.
+    ///
+    /// Returns the packets to send immediately (first packet with marker bit).
+    /// If a digit is already in progress, it is properly ended first (Bug #30).
+    pub fn start_digit(
+        &mut self,
+        digit: char,
+        duration_ms: u32,
+        seq: &mut u16,
+        audio_timestamp: u32,
+        interval_ms: u32,
+    ) -> Result<Vec<DtmfPacket>> {
         let event = DtmfEvent::from_char(digit)
             .ok_or_else(|| RtpSipError::Rtp(format!("Invalid DTMF digit: {}", digit)))?;
 
-        // Store current digit state
-        *self.out_digit.lock() = Some(event);
-        self.out_digit_dur
-            .store(DtmfPayload::ms_to_timestamp(duration_ms) as u32, Ordering::Relaxed);
-        self.out_digit_sofar.store(0, Ordering::Relaxed);
+        // Bug #30: If a digit is already in progress, end it first to avoid
+        // silently overwriting it (which would leak the old digit without END
+        // packets and leave the receiver hanging).
+        let mut prefix_packets = Vec::new();
+        if self.out_digit.is_some() {
+            prefix_packets = self.end_digit(seq);
+        }
 
-        // Generate first packet with marker bit
-        let payload = DtmfPayload::new(event, false, 0);
-        let packet = self.build_packet(&payload, true);
+        // Initialize the DTMF timestamp from the audio stream (RFC 4733 §2.5).
+        self.digit_timestamp = audio_timestamp;
 
-        Ok(vec![packet])
+        // Bug #34: Store the raw u32 duration (ms * 8) instead of going through
+        // ms_to_timestamp() which clamps to u16 and breaks digits > 8.19s.
+        // The u16 clamping is deferred to DtmfPayload construction time.
+        self.out_digit = Some(event);
+        // Bug #62: Use saturating_mul to prevent overflow for adversarially large values
+        self.out_digit_dur = duration_ms.saturating_mul(8);
+        self.out_digit_sofar = 0;
+
+        // Bug #28: Use a non-zero initial duration. The first packet should
+        // carry one interval worth of duration rather than 0, which some
+        // receivers interpret as an empty/invalid digit.
+        // Bug #R6-7: Derive from actual ptime instead of hardcoding 160 (20ms).
+        // FreeSWITCH uses samples_per_interval for this, matching the ptime.
+        let initial_duration = DtmfPayload::ms_to_timestamp(interval_ms.max(1));
+        let payload = DtmfPayload::new(event, false, initial_duration);
+        let packet = self.build_packet(&payload, true, seq);
+
+        // Track that we already sent `initial_duration` worth of audio so
+        // the next continue_digit() call advances from here instead of
+        // re-sending the same duration (which caused a duration plateau).
+        self.out_digit_sofar = initial_duration as u32;
+
+        prefix_packets.push(packet);
+        Ok(prefix_packets)
     }
 
-    /// Continue sending current digit (call every 20ms)
+    /// Continue sending current digit (call every 20ms).
     ///
-    /// Returns packet to send, or None if digit is complete
-    pub fn continue_digit(&self, interval_ms: u32) -> Option<DtmfPacket> {
-        let digit = (*self.out_digit.lock())?;
-        let interval_ts = DtmfPayload::ms_to_timestamp(interval_ms) as u32;
+    /// `seq` is a mutable reference to the shared RTP sequence counter.
+    /// Returns packet to send, or None if digit is complete.
+    pub fn continue_digit(&mut self, interval_ms: u32, seq: &mut u16) -> Option<DtmfPacket> {
+        let digit = self.out_digit?;
+        let total = self.out_digit_dur;
 
-        let sofar = self.out_digit_sofar.fetch_add(interval_ts, Ordering::Relaxed) + interval_ts;
-        let total = self.out_digit_dur.load(Ordering::Relaxed);
+        // Check if digit is already complete BEFORE incrementing to prevent
+        // unbounded growth of out_digit_sofar (Bug #10: u32 wrap after ~26M calls
+        // would re-enter intermediate state producing garbage packets).
+        if self.out_digit_sofar >= total {
+            return None;
+        }
+
+        let interval_ts = DtmfPayload::ms_to_timestamp(interval_ms) as u32;
+        self.out_digit_sofar += interval_ts;
+        let sofar = self.out_digit_sofar;
 
         if sofar >= total {
-            // Final packet(s) with end bit
-            let payload = DtmfPayload::new(digit, true, total.min(u16::MAX as u32) as u16);
-            Some(self.build_packet(&payload, false))
+            // Bug #27: Do NOT emit an end packet here. Let end_digit() be the
+            // sole source of end packets to avoid duplicate END sequences
+            // (continue_digit was emitting one, then end_digit three more).
+            None
         } else {
             // Intermediate packet
             let payload = DtmfPayload::new(digit, false, sofar.min(u16::MAX as u32) as u16);
-            Some(self.build_packet(&payload, false))
+            Some(self.build_packet(&payload, false, seq))
         }
     }
 
     /// Check if we're done with current digit
     pub fn is_complete(&self) -> bool {
-        let sofar = self.out_digit_sofar.load(Ordering::Relaxed);
-        let total = self.out_digit_dur.load(Ordering::Relaxed);
-        self.out_digit.lock().is_none() || sofar >= total
+        self.out_digit.is_none() || self.out_digit_sofar >= self.out_digit_dur
     }
 
-    /// End current digit (generates final packets with end bit)
-    pub fn end_digit(&self) -> Vec<DtmfPacket> {
+    /// End current digit (generates final packets with end bit).
+    ///
+    /// `seq` is a mutable reference to the shared RTP sequence counter.
+    pub fn end_digit(&mut self, seq: &mut u16) -> Vec<DtmfPacket> {
         let mut packets = Vec::new();
 
-        if let Some(digit) = self.out_digit.lock().take() {
-            let total = self.out_digit_dur.load(Ordering::Relaxed);
-            let payload = DtmfPayload::new(digit, true, total.min(u16::MAX as u32) as u16);
+        if let Some(digit) = self.out_digit.take() {
+            // Bug #29: Use the actual accumulated duration, not the total
+            // requested duration.  If the digit was cut short (e.g., by
+            // start_digit overriding it), we report what was actually sent.
+            let actual_dur = self.out_digit_sofar;
+            let payload = DtmfPayload::new(digit, true, actual_dur.min(u16::MAX as u32) as u16);
 
-            // RFC 4733: Send end packet 3 times for redundancy
-            for _ in 0..3 {
-                packets.push(self.build_packet(&payload, false));
+            if self.rtp_bugs.sonus_dtmf_timestamp {
+                // Bug #R6-8: In Sonus mode, each END packet gets its own
+                // incrementing timestamp and sequence number, matching
+                // FreeSWITCH's rtp_common_write() behavior for Sonus devices.
+                // Sonus expects every RTP packet (including END redundancy)
+                // to have a unique, incrementing timestamp.
+                for _ in 0..3 {
+                    packets.push(self.build_packet(&payload, false, seq));
+                }
+            } else {
+                // Normal (RFC-compliant) mode: Build the end packet once and
+                // clone for the 3 redundant retransmissions.
+                // RFC 4733 §2.5.1.3: All 3 redundant END packets must share
+                // the SAME sequence number as the first END packet.
+                let base_packet = self.build_packet(&payload, false, seq);
+                let end_seq = base_packet.sequence;
+                packets.push(base_packet.clone());
+                for _ in 0..2 {
+                    let mut retransmit = base_packet.clone();
+                    retransmit.sequence = end_seq;
+                    packets.push(retransmit);
+                }
             }
 
-            // Advance timestamp for next digit
-            self.timestamp_dtmf.fetch_add(total, Ordering::Relaxed);
+            // Bug #31: In Sonus mode, timestamps were already advanced
+            // per-packet by build_packet, so skip the additional advance
+            // here to avoid double-advancing.
+            if !self.rtp_bugs.sonus_dtmf_timestamp {
+                // Normal mode: advance digit_timestamp for next digit
+                self.digit_timestamp = self.digit_timestamp.wrapping_add(self.out_digit_dur);
+            }
         }
 
         packets
     }
 
-    /// Generate all packets for a complete digit (convenience method)
-    pub fn generate_digit(&self, digit: char, duration_ms: u32, interval_ms: u32) -> Result<Vec<DtmfPacket>> {
-        let mut packets = self.start_digit(digit, duration_ms)?;
+    /// Generate all packets for a complete digit (convenience method).
+    ///
+    /// `seq` is a mutable reference to the shared RTP sequence counter.
+    /// `audio_timestamp` is the current audio RTP timestamp — the DTMF event
+    /// timestamp is drawn from the audio stream per RFC 4733 §2.5.
+    pub fn generate_digit(
+        &mut self,
+        digit: char,
+        duration_ms: u32,
+        interval_ms: u32,
+        seq: &mut u16,
+        audio_timestamp: u32,
+    ) -> Result<Vec<DtmfPacket>> {
+        let mut packets = self.start_digit(digit, duration_ms, seq, audio_timestamp, interval_ms)?;
 
-        let num_intervals = (duration_ms / interval_ms).max(1);
+        let num_intervals = ((duration_ms + interval_ms - 1) / interval_ms).max(1);
         for _ in 0..num_intervals {
-            if let Some(packet) = self.continue_digit(interval_ms) {
+            if let Some(packet) = self.continue_digit(interval_ms, seq) {
                 packets.push(packet);
             }
         }
 
-        packets.extend(self.end_digit());
+        packets.extend(self.end_digit(seq));
         Ok(packets)
     }
 
-    fn build_packet(&self, payload: &DtmfPayload, marker: bool) -> DtmfPacket {
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+    fn build_packet(&mut self, payload: &DtmfPayload, marker: bool, seq: &mut u16) -> DtmfPacket {
+        let s = *seq;
+        *seq = seq.wrapping_add(1);
 
         // Sonus mode: increment timestamp with each packet (WRONG per RFC 4733)
         // Normal mode: same timestamp throughout digit
         let ts = if self.rtp_bugs.sonus_dtmf_timestamp {
             // Sonus expects timestamp to increment by 160 (20ms at 8kHz) per packet
-            self.timestamp_dtmf.fetch_add(160, Ordering::Relaxed)
+            let t = self.digit_timestamp;
+            self.digit_timestamp = self.digit_timestamp.wrapping_add(160);
+            t
         } else {
-            self.timestamp_dtmf.load(Ordering::Relaxed)
+            self.digit_timestamp
         };
 
         // Apply marker bit rules
@@ -656,7 +751,7 @@ impl DtmfSender {
 
         DtmfPacket {
             payload_type: self.payload_type,
-            sequence: seq,
+            sequence: s,
             timestamp: ts,
             ssrc: self.ssrc,
             marker: actual_marker,
@@ -776,6 +871,9 @@ const DTMF_INTERDIGIT_GAP: u32 = 640;
 pub struct DtmfDetector {
     /// Last received digit sequence number
     in_digit_seq: AtomicU16,
+    /// Highest sequence number seen for the current in-progress digit.
+    /// Used to reject reordered RTP packets within a digit (Bug #26).
+    prev_seq: AtomicU16,
     /// Last received digit timestamp
     in_digit_ts: AtomicU32,
     /// Previous timestamp for comparison
@@ -795,8 +893,8 @@ pub struct DtmfDetector {
     /// expected_pt=0 (any dynamic PT), the PT is latched here so that
     /// subsequent packets must use the same PT. 0 means not yet latched.
     latched_pt: AtomicU8,
-    /// Queue for detected digits
-    detected_queue: Mutex<Vec<DetectedDtmf>>,
+    /// Queue for detected digits (Bug #84: VecDeque for O(1) pop_front)
+    detected_queue: Mutex<VecDeque<DetectedDtmf>>,
     /// Timestamp of the last END packet, for interdigit overlap protection.
     /// 0 means no previous END has been seen.
     last_end_timestamp: AtomicU32,
@@ -807,6 +905,11 @@ pub struct DtmfDetector {
     /// been accumulating for longer than this (measured via RTP timestamps), it is
     /// force-completed. Default: 5000ms.
     end_timeout_ms: u32,
+    /// Bug #33: Wall-clock time when the current in-progress digit started.
+    /// Used as a secondary timeout mechanism that fires even if no new RTP
+    /// packets arrive (the RTP-timestamp-based check only runs when a new
+    /// packet is processed).
+    digit_start_time: Mutex<Option<Instant>>,
 }
 
 impl DtmfDetector {
@@ -814,6 +917,7 @@ impl DtmfDetector {
     pub fn new() -> Self {
         Self {
             in_digit_seq: AtomicU16::new(0),
+            prev_seq: AtomicU16::new(0),
             in_digit_ts: AtomicU32::new(0),
             last_in_digit_ts: AtomicU32::new(0),
             in_digit_sanity: AtomicU32::new(0),
@@ -822,10 +926,11 @@ impl DtmfDetector {
             current_digit: Mutex::new(None),
             expected_pt: TELEPHONE_EVENT_PT,
             latched_pt: AtomicU8::new(0),
-            detected_queue: Mutex::new(Vec::new()),
+            detected_queue: Mutex::new(VecDeque::new()),
             last_end_timestamp: AtomicU32::new(0),
             first_packet_ts: AtomicU32::new(0),
             end_timeout_ms: DTMF_END_TIMEOUT_MS,
+            digit_start_time: Mutex::new(None),
         }
     }
 
@@ -849,9 +954,10 @@ impl DtmfDetector {
         self.end_timeout_ms = ms;
     }
 
-    /// Reset the detector state
+    /// Reset the detector state (full reset, including detected queue)
     pub fn reset(&self) {
         self.in_digit_seq.store(0, Ordering::Relaxed);
+        self.prev_seq.store(0, Ordering::Relaxed);
         self.in_digit_ts.store(0, Ordering::Relaxed);
         self.last_in_digit_ts.store(0, Ordering::Relaxed);
         self.in_digit_sanity.store(0, Ordering::Relaxed);
@@ -861,8 +967,27 @@ impl DtmfDetector {
         self.detected_queue.lock().clear();
         self.last_end_timestamp.store(0, Ordering::Relaxed);
         self.first_packet_ts.store(0, Ordering::Relaxed);
+        *self.digit_start_time.lock() = None;
         // Note: latched_pt is intentionally NOT reset — once latched, the PT
         // should persist across digit boundaries.
+    }
+
+    /// Bug #85: Reset detection state but preserve the detected digit queue.
+    /// Used internally from `process_rtp` so that already-detected digits
+    /// are not lost when the detector resets due to sanity/timeout checks.
+    fn reset_state(&self) {
+        self.in_digit_seq.store(0, Ordering::Relaxed);
+        self.prev_seq.store(0, Ordering::Relaxed);
+        self.in_digit_ts.store(0, Ordering::Relaxed);
+        self.last_in_digit_ts.store(0, Ordering::Relaxed);
+        self.in_digit_sanity.store(0, Ordering::Relaxed);
+        self.last_duration.store(0, Ordering::Relaxed);
+        self.duration_flip.store(0, Ordering::Relaxed);
+        *self.current_digit.lock() = None;
+        // Note: detected_queue is intentionally NOT cleared here
+        self.last_end_timestamp.store(0, Ordering::Relaxed);
+        self.first_packet_ts.store(0, Ordering::Relaxed);
+        *self.digit_start_time.lock() = None;
     }
 
     /// Process incoming RTP packet
@@ -934,54 +1059,89 @@ impl DtmfDetector {
             }
         }
 
+        // Bug #26: Guard against reordered RTP packets within a digit.
+        // If the sequence number is not advancing (i.e., seq <= prev_seq for the
+        // current digit), the packet is out of order and its duration value could
+        // corrupt the detected duration. Ignore it.
+        // We use wrapping arithmetic: a seq that is "behind" prev_seq by less than
+        // half the 16-bit space is considered reordered.
+        let prev = self.prev_seq.load(Ordering::Relaxed);
+        if prev != 0 && timestamp == self.in_digit_ts.load(Ordering::Relaxed) {
+            let diff = sequence.wrapping_sub(prev);
+            if diff == 0 || diff > 0x8000 {
+                // Duplicate or reordered packet within the same digit — ignore
+                return None;
+            }
+        }
+
         let last_ts = self.in_digit_ts.swap(timestamp, Ordering::Relaxed);
         let _last_seq = self.in_digit_seq.swap(sequence, Ordering::Relaxed);
+        self.prev_seq.store(sequence, Ordering::Relaxed);
 
         // Sanity check: detect out-of-order or stuck streams
         if timestamp == last_ts {
             let sanity = self.in_digit_sanity.fetch_add(1, Ordering::Relaxed);
             if sanity > DTMF_SANITY_LIMIT {
                 // Stream appears stuck (same timestamp for 30+ seconds), reset
-                self.reset();
+                // Bug #85: Use reset_state() to preserve already-detected digits
+                self.reset_state();
                 return None;
             }
         } else {
             self.in_digit_sanity.store(0, Ordering::Relaxed);
         }
 
-        // Bug #42: Missing END timeout.  If a digit has been in-progress for
-        // longer than end_timeout_ms (measured via RTP timestamps at 8kHz),
-        // force-complete it.  This handles permanently lost END packets.
+        // Bug #42 + Bug #33: Missing END timeout.  If a digit has been in-progress
+        // for longer than end_timeout_ms, force-complete it.  This handles
+        // permanently lost END packets.
+        //
+        // Bug #33: We now check BOTH RTP-timestamp-based elapsed time AND
+        // wall-clock elapsed time (via digit_start_time).  The wall-clock check
+        // ensures timeout fires even if no new RTP packets arrive (the
+        // RTP-timestamp check only runs when a new packet is processed).
         {
             let mut timeout_current = self.current_digit.lock();
             if timeout_current.is_some() {
                 let first_ts = self.first_packet_ts.load(Ordering::Relaxed);
-                if first_ts != 0 {
+                let rtp_timeout = if first_ts != 0 {
                     let elapsed_samples = timestamp.wrapping_sub(first_ts);
-                    let timeout_samples = self.end_timeout_ms * 8; // 8 samples per ms at 8kHz
+                    // Bug #62: Use saturating_mul to prevent overflow for adversarially large values
+                    let timeout_samples = self.end_timeout_ms.saturating_mul(8); // 8 samples per ms at 8kHz
                     // Guard against backwards timestamps (wrapping_sub produces
                     // a very large value for backwards jumps)
-                    if elapsed_samples > timeout_samples && elapsed_samples < 0x8000_0000 {
-                        let flip = self.duration_flip.load(Ordering::Relaxed);
-                        let old_duration =
-                            self.last_duration.load(Ordering::Relaxed) as u32 + flip;
-                        let duration_ms =
-                            (old_duration / 8).max(DTMF_MIN_DURATION_MS);
-                        let digit = timeout_current.take().unwrap();
-                        let old_ts = self.last_in_digit_ts.load(Ordering::Relaxed);
-                        let result = DetectedDtmf {
-                            digit: digit.to_char(),
-                            event: digit,
-                            duration_ms,
-                            is_end: false,
-                        };
-                        self.duration_flip.store(0, Ordering::Relaxed);
-                        self.last_duration.store(0, Ordering::Relaxed);
-                        self.last_end_timestamp.store(old_ts, Ordering::Relaxed);
-                        self.first_packet_ts.store(0, Ordering::Relaxed);
-                        self.detected_queue.lock().push(result);
-                        // Fall through — the current packet may start a new digit
-                    }
+                    elapsed_samples > timeout_samples && elapsed_samples < 0x8000_0000
+                } else {
+                    false
+                };
+
+                // Bug #33: Also check wall-clock time
+                let wall_timeout = self
+                    .digit_start_time
+                    .lock()
+                    .map(|t| t.elapsed().as_millis() as u32 > self.end_timeout_ms)
+                    .unwrap_or(false);
+
+                if rtp_timeout || wall_timeout {
+                    let flip = self.duration_flip.load(Ordering::Relaxed);
+                    let old_duration =
+                        self.last_duration.load(Ordering::Relaxed) as u32 + flip;
+                    let duration_ms =
+                        (old_duration / 8).max(DTMF_MIN_DURATION_MS);
+                    let digit = timeout_current.take().unwrap();
+                    let old_ts = self.last_in_digit_ts.load(Ordering::Relaxed);
+                    let result = DetectedDtmf {
+                        digit: digit.to_char(),
+                        event: digit,
+                        duration_ms,
+                        is_end: false,
+                    };
+                    self.duration_flip.store(0, Ordering::Relaxed);
+                    self.last_duration.store(0, Ordering::Relaxed);
+                    self.last_end_timestamp.store(old_ts, Ordering::Relaxed);
+                    self.first_packet_ts.store(0, Ordering::Relaxed);
+                    *self.digit_start_time.lock() = None;
+                    self.detected_queue.lock().push_back(result);
+                    // Fall through — the current packet may start a new digit
                 }
             }
             drop(timeout_current);
@@ -990,13 +1150,51 @@ impl DtmfDetector {
         // Check for new digit (timestamp changed)
         let mut current = self.current_digit.lock();
         if timestamp != self.last_in_digit_ts.load(Ordering::Relaxed) {
+            // Bug #R6-6: Force-complete previous digit before overwriting.
+            // Without this, if a new digit arrives before the 5-second timeout
+            // fires, the previous digit is silently lost.
+            if let Some(prev_digit) = current.take() {
+                let flip = self.duration_flip.load(Ordering::Relaxed);
+                let old_duration =
+                    self.last_duration.load(Ordering::Relaxed) as u32 + flip;
+                let duration_ms =
+                    (old_duration / 8).max(DTMF_MIN_DURATION_MS);
+                let result = DetectedDtmf {
+                    digit: prev_digit.to_char(),
+                    event: prev_digit,
+                    duration_ms,
+                    is_end: false,
+                };
+                // Bug R15-2 fix: Update last_end_timestamp for interdigit gap protection.
+                // Must be done before last_in_digit_ts is overwritten below.
+                // Matches the timeout path (line 1140) and END packet path (line 1264).
+                let old_ts = self.last_in_digit_ts.load(Ordering::Relaxed);
+                self.last_end_timestamp.store(old_ts, Ordering::Relaxed);
+                self.first_packet_ts.store(0, Ordering::Relaxed);
+                *self.digit_start_time.lock() = None;
+                self.detected_queue.lock().push_back(result);
+            }
             // New digit starting - reset duration tracking
             *current = Some(event);
             self.last_in_digit_ts.store(timestamp, Ordering::Relaxed);
             self.last_duration.store(0, Ordering::Relaxed);
             self.duration_flip.store(0, Ordering::Relaxed);
+            // Bug #26: Reset prev_seq for the new digit
+            self.prev_seq.store(sequence, Ordering::Relaxed);
             // Bug #42: record the RTP timestamp of the first packet for timeout
             self.first_packet_ts.store(timestamp, Ordering::Relaxed);
+            // Bug #33: record wall-clock time for secondary timeout
+            *self.digit_start_time.lock() = Some(Instant::now());
+        } else if let Some(ref current_event) = *current {
+            // Bug #63: Same timestamp but different event code — this is corrupt
+            // or malformed. Log a warning and reject the packet.
+            if event != *current_event {
+                tracing::warn!(
+                    "DTMF event code changed within same timestamp: {:?} -> {:?}",
+                    current_event, event
+                );
+                return None;
+            }
         }
 
         // Track duration with wraparound detection ("flip" mechanism)
@@ -1014,8 +1212,9 @@ impl DtmfDetector {
         // The old threshold (last_dur > 0xFC17) was too conservative and too
         // narrow — it only caught wraps from ~7.9s+.  The new guard catches
         // wraps from 4s+ while rejecting reordering artifacts.
+        // Bug #R9-2: Use >= to catch wraparound when last_dur is exactly 0x8000
         if dtmf.duration < last_dur
-            && last_dur > 0x8000
+            && last_dur >= 0x8000
             && dtmf.duration < last_dur / 2
         {
             // Duration wrapped around, accumulate 0xFFFF
@@ -1028,7 +1227,8 @@ impl DtmfDetector {
 
         // 30-second maximum duration sanity check (most digits are < 1 second)
         if total_duration > DTMF_MAX_DURATION {
-            self.reset();
+            // Bug #85: Use reset_state() to preserve already-detected digits
+            self.reset_state();
             return None;
         }
 
@@ -1042,13 +1242,15 @@ impl DtmfDetector {
                 current.take(); // discard the in-progress digit
                 self.duration_flip.store(0, Ordering::Relaxed);
                 self.first_packet_ts.store(0, Ordering::Relaxed);
+                *self.digit_start_time.lock() = None;
                 return None;
             }
 
             let digit = current.take().unwrap();
             // Convert total duration (in timestamp units) to ms
             // At 8kHz: ms = total_duration / 8
-            let duration_ms = total_duration / 8;
+            // Bug #61: Clamp to minimum duration, same as the timeout path does.
+            let duration_ms = (total_duration / 8).max(DTMF_MIN_DURATION_MS);
             let result = DetectedDtmf {
                 digit: digit.to_char(),
                 event: digit,
@@ -1062,11 +1264,14 @@ impl DtmfDetector {
             // Reset first_packet_ts for next digit
             self.first_packet_ts.store(0, Ordering::Relaxed);
 
+            // Bug #33: Clear wall-clock timer
+            *self.digit_start_time.lock() = None;
+
             // Record end timestamp for interdigit overlap protection
             self.last_end_timestamp.store(timestamp, Ordering::Relaxed);
 
             // Queue it
-            self.detected_queue.lock().push(result.clone());
+            self.detected_queue.lock().push_back(result.clone());
 
             return Some(result);
         }
@@ -1075,13 +1280,9 @@ impl DtmfDetector {
     }
 
     /// Pop detected digit from queue
+    /// Bug #84: Uses VecDeque::pop_front() for O(1) instead of Vec::remove(0) which is O(n)
     pub fn pop_digit(&self) -> Option<DetectedDtmf> {
-        let mut queue = self.detected_queue.lock();
-        if queue.is_empty() {
-            None
-        } else {
-            Some(queue.remove(0))
-        }
+        self.detected_queue.lock().pop_front()
     }
 
     /// Check if there are detected digits waiting
@@ -1186,8 +1387,10 @@ mod tests {
 
     #[test]
     fn test_dtmf_sender_generate_digit() {
-        let sender = DtmfSender::new(0x12345678);
-        let packets = sender.generate_digit('5', 100, 20).unwrap();
+        let mut sender = DtmfSender::new(0x12345678);
+        let mut seq: u16 = 1000;
+        let audio_ts: u32 = 48000;
+        let packets = sender.generate_digit('5', 100, 20, &mut seq, audio_ts).unwrap();
 
         // Should have multiple packets
         assert!(packets.len() >= 3); // At least start + end*3
@@ -1195,11 +1398,32 @@ mod tests {
         // First packet should have marker
         assert!(packets[0].marker);
 
-        // All packets should have same timestamp
+        // All packets should have same timestamp (drawn from audio stream)
         let ts = packets[0].timestamp;
+        assert_eq!(ts, audio_ts);
         for packet in &packets {
             assert_eq!(packet.timestamp, ts);
         }
+
+        // Sequence numbers: non-END packets should be monotonically increasing;
+        // the last 3 END packets must share the SAME sequence number per RFC 4733 §2.5.1.3.
+        assert_eq!(packets[0].sequence, 1000);
+        let n = packets.len();
+        // Non-END packets are monotonically increasing
+        for i in 1..n.saturating_sub(3) {
+            assert_eq!(packets[i].sequence, packets[i - 1].sequence.wrapping_add(1));
+        }
+        // Last 3 END packets share the same sequence number
+        assert!(n >= 3);
+        let end_seq = packets[n - 3].sequence;
+        assert_eq!(packets[n - 2].sequence, end_seq);
+        assert_eq!(packets[n - 1].sequence, end_seq);
+
+        // The shared seq counter should have been advanced by (total - 2)
+        // since the 3 END packets consume only 1 sequence number.
+        let non_end_count = n - 3;
+        let expected_seq = 1000u16.wrapping_add(non_end_count as u16 + 1);
+        assert_eq!(seq, expected_seq);
 
         // Last 3 packets should have end bit
         let last_payload = DtmfPayload::parse(&packets[packets.len() - 1].payload).unwrap();
@@ -1269,10 +1493,16 @@ mod tests {
     }
 
     #[test]
-    fn test_dtmf_payload_all_zero_rejected() {
-        // Edge case: all-zero payload (malformed packet from certain equipment)
+    fn test_dtmf_payload_all_zero_is_digit_zero() {
+        // Bug #R10-3: All-zero payload [0,0,0,0] is valid Digit '0' per RFC 4733
+        // (event=0, is_end=false, volume=0, duration=0). Updated from is_none()
+        // after Bug #R8-2 removed the dead all-zero rejection code.
         let data = [0, 0, 0, 0];
-        assert!(DtmfPayload::parse(&data).is_none());
+        let payload = DtmfPayload::parse(&data).unwrap();
+        assert_eq!(payload.event, 0); // Digit '0'
+        assert!(!payload.is_end);
+        assert_eq!(payload.volume, 0);
+        assert_eq!(payload.duration, 0);
     }
 
     #[test]
@@ -1311,7 +1541,9 @@ mod tests {
         let mut sender = DtmfSender::new(0x12345678);
         sender.enable_sonus_mode();
 
-        let packets = sender.generate_digit('5', 100, 20).unwrap();
+        let mut seq: u16 = 0;
+        let audio_ts: u32 = 48000;
+        let packets = sender.generate_digit('5', 100, 20, &mut seq, audio_ts).unwrap();
 
         // In Sonus mode, timestamps should increment (unlike normal mode)
         assert!(packets.len() >= 3);
@@ -1319,6 +1551,9 @@ mod tests {
         // Check that timestamps are different between packets
         let ts1 = packets[0].timestamp;
         let ts2 = packets[1].timestamp;
+
+        // First timestamp should come from the audio stream
+        assert_eq!(ts1, audio_ts, "Sonus mode should start from audio timestamp");
 
         // In Sonus mode: timestamp increments by 160 (20ms at 8kHz) per packet
         assert_ne!(ts1, ts2, "Sonus mode should have different timestamps per packet");
@@ -1331,7 +1566,8 @@ mod tests {
         let mut sender = DtmfSender::new(0x12345678);
         sender.enable_sonus_mode();
 
-        let packets = sender.generate_digit('5', 100, 20).unwrap();
+        let mut seq: u16 = 0;
+        let packets = sender.generate_digit('5', 100, 20, &mut seq, 48000).unwrap();
 
         // In Sonus mode, NO packet should have marker bit (even first one)
         for packet in &packets {
@@ -1342,12 +1578,15 @@ mod tests {
     #[test]
     fn test_normal_mode_constant_timestamp() {
         // Normal mode: all packets for one digit have same timestamp
-        let sender = DtmfSender::new(0x12345678);
-        let packets = sender.generate_digit('5', 100, 20).unwrap();
+        let mut sender = DtmfSender::new(0x12345678);
+        let mut seq: u16 = 0;
+        let audio_ts: u32 = 48000;
+        let packets = sender.generate_digit('5', 100, 20, &mut seq, audio_ts).unwrap();
 
         assert!(packets.len() >= 3);
 
         let ts = packets[0].timestamp;
+        assert_eq!(ts, audio_ts, "DTMF timestamp should come from audio stream");
         for packet in &packets {
             assert_eq!(packet.timestamp, ts, "Normal mode should have constant timestamp");
         }
@@ -1356,8 +1595,9 @@ mod tests {
     #[test]
     fn test_normal_mode_marker_on_first() {
         // Normal mode: first packet should have marker bit
-        let sender = DtmfSender::new(0x12345678);
-        let packets = sender.generate_digit('5', 100, 20).unwrap();
+        let mut sender = DtmfSender::new(0x12345678);
+        let mut seq: u16 = 0;
+        let packets = sender.generate_digit('5', 100, 20, &mut seq, 48000).unwrap();
 
         assert!(packets[0].marker, "Normal mode should set marker on first packet");
 
@@ -1776,5 +2016,82 @@ mod tests {
         let p3 = [7, 0x8A, 0, 160];
         let result = detector.process_rtp(100, 3, 4000, &p3);
         assert!(result.is_none(), "Non-latched PT should still be rejected after reset");
+    }
+
+    // === Bug #10: out_digit_sofar unbounded increment ===
+
+    #[test]
+    fn test_bug10_continue_digit_returns_none_after_complete() {
+        // After a digit is complete (sofar >= total), continue_digit() must
+        // return None and must NOT increment out_digit_sofar any further.
+        let mut sender = DtmfSender::new(0x12345678);
+        let mut seq: u16 = 0;
+
+        // Start a 60ms digit (= 480 timestamp units at 8kHz)
+        sender.start_digit('5', 60, &mut seq, 48000, 20).unwrap();
+
+        // Call continue_digit with 20ms intervals until the digit completes.
+        // 60ms / 20ms = 3 intervals needed to reach completion.
+        let mut packets = Vec::new();
+        for _ in 0..3 {
+            if let Some(pkt) = sender.continue_digit(20, &mut seq) {
+                packets.push(pkt);
+            }
+        }
+
+        // Digit should now be complete
+        assert!(sender.is_complete(), "Digit should be complete after 3 intervals");
+
+        // Further calls to continue_digit must return None
+        for i in 0..100 {
+            assert!(
+                sender.continue_digit(20, &mut seq).is_none(),
+                "continue_digit should return None after completion (call #{})",
+                i
+            );
+        }
+
+        // Verify out_digit_sofar did NOT continue incrementing.
+        // If the bug were present, 100 extra calls * 160 ts = 16000 additional.
+        // We check via is_complete() which reads the field — it should still be
+        // complete, but more importantly, we verify the value hasn't wrapped.
+        let sofar = sender.out_digit_sofar;
+        let total = sender.out_digit_dur;
+        assert!(
+            sofar <= total + 160, // Allow at most one interval overshoot from the completing call
+            "out_digit_sofar should not grow unboundedly: sofar={}, total={}",
+            sofar,
+            total
+        );
+    }
+
+    #[test]
+    fn test_bug10_sofar_does_not_increment_after_completion() {
+        // Targeted test: verify the exact value of out_digit_sofar stays stable
+        // after the digit is done.
+        let mut sender = DtmfSender::new(0xDEADBEEF);
+        let mut seq: u16 = 0;
+
+        // Start a 40ms digit (= 320 timestamp units)
+        sender.start_digit('1', 40, &mut seq, 48000, 20).unwrap();
+
+        // Two 20ms intervals => sofar reaches 320 (== total), digit complete
+        sender.continue_digit(20, &mut seq);
+        sender.continue_digit(20, &mut seq);
+        assert!(sender.is_complete());
+
+        let sofar_after_complete = sender.out_digit_sofar;
+
+        // Call continue_digit many more times
+        for _ in 0..500 {
+            let result = sender.continue_digit(20, &mut seq);
+            assert!(result.is_none(), "Must return None after completion");
+        }
+
+        let sofar_after_extra_calls = sender.out_digit_sofar;
+        assert_eq!(
+            sofar_after_complete, sofar_after_extra_calls,
+            "out_digit_sofar must not change after digit is complete"
+        );
     }
 }

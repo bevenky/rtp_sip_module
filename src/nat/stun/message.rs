@@ -25,6 +25,12 @@ pub const MAGIC_COOKIE: u32 = 0x2112_A442;
 /// STUN header size
 pub const HEADER_SIZE: usize = 20;
 
+/// FINGERPRINT attribute type (RFC 5389 Section 15.5)
+pub const ATTR_FINGERPRINT: u16 = 0x8028;
+
+/// FINGERPRINT XOR constant (RFC 5389 Section 15.5)
+const FINGERPRINT_XOR: u32 = 0x5354_554E;
+
 // Message types (RFC 5389 Section 6, method = Binding, class encoded in bits)
 pub const BINDING_REQUEST: u16 = 0x0001;
 pub const BINDING_SUCCESS: u16 = 0x0101;
@@ -78,6 +84,18 @@ impl StunMessage {
         if data[0] & 0xC0 != 0 {
             return false;
         }
+        // Bug #101: STUN message length must be a multiple of 4 bytes
+        // (RFC 5389 Section 6: "all STUN attributes are padded to a multiple
+        // of 4 bytes"). A non-aligned length indicates this is not a valid
+        // STUN message.
+        let msg_len = u16::from_be_bytes([data[2], data[3]]);
+        if msg_len % 4 != 0 {
+            return false;
+        }
+        // Bug #27: Validate that the buffer is large enough for the claimed message length
+        if data.len() < 20 + msg_len as usize {
+            return false;
+        }
         // Magic cookie at bytes 4-7
         let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         cookie == MAGIC_COOKIE
@@ -97,6 +115,11 @@ impl StunMessage {
         let msg_type = u16::from_be_bytes([data[0], data[1]]);
         let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
 
+        // Bug #31: Message length must be a multiple of 4 (RFC 5389 Section 6)
+        if msg_len % 4 != 0 {
+            return Err(StunError::InvalidHeader);
+        }
+
         // Verify magic cookie
         let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         if cookie != MAGIC_COOKIE {
@@ -112,15 +135,18 @@ impl StunMessage {
             return Err(StunError::TooShort);
         }
 
-        // Parse attributes
+        // Parse attributes, tracking FINGERPRINT position if present
         let mut attributes = Vec::new();
         let mut offset = HEADER_SIZE;
         let end = HEADER_SIZE + msg_len;
+        let mut fingerprint_value: Option<u32> = None;
+        let mut fingerprint_offset: Option<usize> = None;
 
         while offset + 4 <= end {
             let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let attr_len =
                 u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            let attr_start = offset;
             offset += 4;
 
             // Bug #53: If the attribute's declared length extends beyond the
@@ -128,6 +154,22 @@ impl StunMessage {
             // accepting a truncated message.
             if offset + attr_len > end {
                 return Err(StunError::TruncatedAttribute);
+            }
+
+            // Check for FINGERPRINT attribute (RFC 5389 Section 15.5)
+            if attr_type == ATTR_FINGERPRINT {
+                if attr_len == 4 {
+                    fingerprint_value = Some(u32::from_be_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]));
+                    fingerprint_offset = Some(attr_start);
+                }
+                // FINGERPRINT is always last; do not add to parsed attributes
+                offset += (attr_len + 3) & !3;
+                continue;
             }
 
             if let Some(attr) = StunAttribute::decode(
@@ -142,6 +184,31 @@ impl StunMessage {
             offset += (attr_len + 3) & !3;
         }
 
+        // Bug #9: Validate FINGERPRINT if present.
+        // Per RFC 5389 Section 15.5, the CRC-32 is computed over the STUN
+        // message up to (but not including) the FINGERPRINT attribute, with
+        // the message header length field adjusted to point to the end of
+        // the FINGERPRINT attribute (i.e. as if FINGERPRINT were the last
+        // attribute, and the length includes the FINGERPRINT TLV = 8 bytes).
+        if let (Some(fp_val), Some(fp_off)) = (fingerprint_value, fingerprint_offset) {
+            // Build a copy of the bytes preceding FINGERPRINT, with the
+            // STUN header message-length field adjusted to include the
+            // FINGERPRINT attribute (8 bytes: 4 header + 4 value).
+            let bytes_before_fp = fp_off; // everything before the FINGERPRINT TLV
+            let adjusted_len = (fp_off - HEADER_SIZE + 8) as u16; // attrs before + FP itself
+            let mut buf = Vec::with_capacity(bytes_before_fp);
+            buf.extend_from_slice(&data[..bytes_before_fp]);
+            // Patch the message-length field (bytes 2..4)
+            let len_bytes = adjusted_len.to_be_bytes();
+            buf[2] = len_bytes[0];
+            buf[3] = len_bytes[1];
+
+            let crc = crc32fast::hash(&buf) ^ FINGERPRINT_XOR;
+            if crc != fp_val {
+                return Err(StunError::FingerprintMismatch);
+            }
+        }
+
         Ok(Self {
             msg_type,
             transaction_id,
@@ -150,6 +217,13 @@ impl StunMessage {
     }
 
     /// Serialize this message to bytes
+    ///
+    /// TODO(Bug #102): For strict RFC 5389 compliance, this should append a
+    /// FINGERPRINT attribute (CRC-32 XOR'd with 0x5354554E) as the last
+    /// attribute. The unmarshal path already validates FINGERPRINT when
+    /// present. Omitting it is interoperable with most STUN implementations
+    /// since FINGERPRINT is optional, but some strict middleboxes may
+    /// require it for reliable STUN-vs-data demultiplexing.
     pub fn marshal(&self) -> Vec<u8> {
         // Encode all attributes first to compute total length
         let mut attr_bytes = Vec::new();
@@ -260,6 +334,8 @@ pub enum StunError {
     InvalidMagicCookie,
     /// An attribute's declared length extends beyond the message boundary
     TruncatedAttribute,
+    /// FINGERPRINT attribute CRC-32 check failed
+    FingerprintMismatch,
 }
 
 impl std::fmt::Display for StunError {
@@ -272,6 +348,9 @@ impl std::fmt::Display for StunError {
             StunError::InvalidMagicCookie => write!(f, "invalid magic cookie"),
             StunError::TruncatedAttribute => {
                 write!(f, "attribute length extends beyond message boundary")
+            }
+            StunError::FingerprintMismatch => {
+                write!(f, "FINGERPRINT CRC-32 verification failed")
             }
         }
     }
@@ -454,17 +533,18 @@ mod tests {
         // message boundary must produce TruncatedAttribute, not silently
         // succeed with a partial attribute list.
         //
-        // Setup: msg_len declares only 10 bytes of attribute payload,
+        // Setup: msg_len declares only 12 bytes of attribute payload
+        // (must be multiple of 4 per RFC 5389),
         // but the attribute TLV header claims attr_len = 20 (value bytes).
         // After consuming the 4-byte TLV header, offset = 24, attr_len = 20,
-        // but end = 20 + 10 = 30, so 24 + 20 = 44 > 30 => truncated.
+        // but end = 20 + 12 = 32, so 24 + 20 = 44 > 32 => truncated.
         let txn_id: TransactionId = [0xDD; 12];
         let attr_type: u16 = 0x8022; // SOFTWARE
         let attr_len: u16 = 20; // claims 20 bytes of value
 
         // msg_len is smaller than what the attribute needs:
-        // 4 (attr header) + 6 (partial value) = 10
-        let msg_len: u16 = 10;
+        // 4 (attr header) + 8 (partial value) = 12 (multiple of 4)
+        let msg_len: u16 = 12;
 
         let mut data = Vec::new();
         data.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
@@ -474,10 +554,10 @@ mod tests {
         // Attribute TLV header
         data.extend_from_slice(&attr_type.to_be_bytes());
         data.extend_from_slice(&attr_len.to_be_bytes());
-        // Only 6 bytes of value (partial)
-        data.extend_from_slice(b"short!");
+        // Only 8 bytes of value (partial, not the claimed 20)
+        data.extend_from_slice(b"short!XY");
 
-        // Total data: 20 + 10 = 30 bytes (matches HEADER_SIZE + msg_len)
+        // Total data: 20 + 12 = 32 bytes (matches HEADER_SIZE + msg_len)
         // so the outer length check passes.
         assert_eq!(data.len(), HEADER_SIZE + msg_len as usize);
 
@@ -505,8 +585,9 @@ mod tests {
         let attr2_claimed_len: u16 = 50;
 
         // msg_len covers first attr (8) + second attr header (4) + only
-        // 2 bytes of the second attr's value (not the full 50).
-        let msg_len: u16 = (attr1_padded_total + 4 + 2) as u16; // = 14
+        // 4 bytes of the second attr's value (not the full 50).
+        // Total msg_len = 16, which is a multiple of 4 per RFC 5389.
+        let msg_len: u16 = (attr1_padded_total + 4 + 4) as u16; // = 16
 
         let mut data = Vec::new();
         data.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
@@ -523,15 +604,15 @@ mod tests {
         // Second attribute header
         data.extend_from_slice(&attr2_type.to_be_bytes());
         data.extend_from_slice(&attr2_claimed_len.to_be_bytes());
-        // Only 2 bytes of value (not the claimed 50)
-        data.extend_from_slice(b"hi");
+        // Only 4 bytes of value (not the claimed 50)
+        data.extend_from_slice(b"hiXY");
 
-        // Total data = HEADER_SIZE + msg_len = 20 + 14 = 34
+        // Total data = HEADER_SIZE + msg_len = 20 + 16 = 36
         assert_eq!(data.len(), HEADER_SIZE + msg_len as usize);
 
         // After parsing first attr, offset advances to 32 (header 20 +
         // first attr padded 8 + second attr header 4).
-        // attr_len = 50, end = 34, so 32 + 50 = 82 > 34 => TruncatedAttribute
+        // attr_len = 50, end = 36, so 32 + 50 = 82 > 36 => TruncatedAttribute
         let result = StunMessage::unmarshal(&data);
         assert_eq!(result.unwrap_err(), StunError::TruncatedAttribute);
     }
@@ -574,5 +655,85 @@ mod tests {
         let result = StunMessage::unmarshal(&data);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), StunError::TooShort);
+    }
+
+    // --- Bug #9 tests: FINGERPRINT validation ---
+
+    #[test]
+    fn test_fingerprint_valid() {
+        // Build a STUN message, then manually append a correct FINGERPRINT.
+        let txn_id: TransactionId = [0x11; 12];
+        let addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let msg = StunMessage {
+            msg_type: BINDING_SUCCESS,
+            transaction_id: txn_id,
+            attributes: vec![StunAttribute::XorMappedAddress(addr)],
+        };
+        let mut data = msg.marshal();
+
+        // Compute the FINGERPRINT value.
+        // Per RFC 5389: adjust message length to include FINGERPRINT (8 bytes),
+        // compute CRC-32 over the adjusted message, XOR with 0x5354554E.
+        let current_attr_len = data.len() - HEADER_SIZE;
+        let new_attr_len = (current_attr_len + 8) as u16; // +8 for FINGERPRINT TLV
+        let len_bytes = new_attr_len.to_be_bytes();
+        let mut adjusted = data.clone();
+        adjusted[2] = len_bytes[0];
+        adjusted[3] = len_bytes[1];
+        let crc = crc32fast::hash(&adjusted) ^ FINGERPRINT_XOR;
+
+        // Append FINGERPRINT attribute: type 0x8028, length 4, value = crc
+        data.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&crc.to_be_bytes());
+        // Also update the message length in the header to include FINGERPRINT
+        data[2] = len_bytes[0];
+        data[3] = len_bytes[1];
+
+        let parsed = StunMessage::unmarshal(&data).unwrap();
+        assert!(parsed.is_success());
+        assert_eq!(parsed.xor_mapped_address(), Some(addr));
+    }
+
+    #[test]
+    fn test_fingerprint_invalid_returns_error() {
+        // Build a STUN message with a bogus FINGERPRINT value.
+        let txn_id: TransactionId = [0x22; 12];
+        let addr: SocketAddr = "192.168.1.1:3478".parse().unwrap();
+        let msg = StunMessage {
+            msg_type: BINDING_SUCCESS,
+            transaction_id: txn_id,
+            attributes: vec![StunAttribute::XorMappedAddress(addr)],
+        };
+        let mut data = msg.marshal();
+
+        let current_attr_len = data.len() - HEADER_SIZE;
+        let new_attr_len = (current_attr_len + 8) as u16;
+        let len_bytes = new_attr_len.to_be_bytes();
+
+        // Append FINGERPRINT with a deliberately wrong CRC value
+        data.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&0xDEADBEEFu32.to_be_bytes()); // bogus
+        data[2] = len_bytes[0];
+        data[3] = len_bytes[1];
+
+        let result = StunMessage::unmarshal(&data);
+        assert_eq!(result.unwrap_err(), StunError::FingerprintMismatch);
+    }
+
+    #[test]
+    fn test_fingerprint_absent_still_parses() {
+        // Messages without FINGERPRINT should still parse normally.
+        let txn_id: TransactionId = [0x33; 12];
+        let addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let msg = StunMessage {
+            msg_type: BINDING_SUCCESS,
+            transaction_id: txn_id,
+            attributes: vec![StunAttribute::XorMappedAddress(addr)],
+        };
+        let data = msg.marshal();
+        let parsed = StunMessage::unmarshal(&data).unwrap();
+        assert_eq!(parsed.xor_mapped_address(), Some(addr));
     }
 }

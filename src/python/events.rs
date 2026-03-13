@@ -386,7 +386,7 @@ impl From<RustCallEvent> for PyCallEvent {
     }
 }
 
-/// Call state enum for Python (simplified - 5 states)
+/// Call state enum for Python (simplified - 6 states)
 #[pyclass(name = "CallState", eq, eq_int)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PyCallState {

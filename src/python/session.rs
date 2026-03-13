@@ -147,6 +147,8 @@ impl PyRtpSession {
     }
 
     /// Set the remote address
+    /// Bug #R11-7: Return error when called before start() instead of silently
+    /// discarding the address. The engine must be initialized first.
     fn set_remote(&self, addr: &str) -> PyResult<()> {
         let addr: SocketAddr = addr
             .parse()
@@ -154,12 +156,19 @@ impl PyRtpSession {
 
         if let Some(engine) = &self.engine {
             engine.set_remote(addr);
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "Session not started. Call start() first, or pass remote_addr to constructor.",
+            ));
         }
         Ok(())
     }
 
     /// Start the RTP session
-    fn start(&mut self) -> PyResult<()> {
+    ///
+    /// Bug #R6-3: Release GIL during async engine creation to avoid
+    /// blocking the Python interpreter.
+    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.engine.is_some() {
             return Err(PyRuntimeError::new_err("Session already started"));
         }
@@ -179,8 +188,15 @@ impl PyRtpSession {
             ..Default::default()
         };
 
-        let engine = self.runtime.block_on(async {
-            RtpEngine::new(local_addr, config).await
+        let runtime = self.runtime.clone();
+        let engine = py.allow_threads(|| {
+            // Bug R15-1 fix: Enter runtime context before block_on() so that
+            // tokio::spawn and other runtime-dependent calls inside RtpEngine::new()
+            // can find the runtime handle. Matches pattern in send_audio() (Bug #12 fix).
+            let _guard = runtime.enter();
+            runtime.block_on(async {
+                RtpEngine::new(local_addr, config).await
+            })
         }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let engine = Arc::new(engine);
@@ -219,6 +235,10 @@ impl PyRtpSession {
         let runtime = self.runtime.clone();
 
         py.allow_threads(|| {
+            // Bug #12 fix: Enter runtime context before block_on() so that
+            // tokio::spawn and other runtime-dependent calls inside send_audio
+            // can find the runtime handle.
+            let _guard = runtime.enter();
             runtime.block_on(async {
                 engine.send_audio(&samples).await
             }).map_err(|e| PyRuntimeError::new_err(e.to_string()))

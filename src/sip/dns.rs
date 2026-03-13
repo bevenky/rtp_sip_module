@@ -161,7 +161,12 @@ impl SipResolver {
         }
 
         // Extract domain and optional port
-        let (domain, port) = if let Some(colon_pos) = domain_port.rfind(':') {
+        // Bug #70: Skip rfind(':') port extraction for IPv6 addresses
+        // (which contain more than one colon)
+        let (domain, port) = if domain_port.matches(':').count() > 1 {
+            // IPv6 address — treat the entire string as the domain
+            (domain_port, None)
+        } else if let Some(colon_pos) = domain_port.rfind(':') {
             let port_str = &domain_port[colon_pos + 1..];
             if let Ok(port) = port_str.parse::<u16>() {
                 (&domain_port[..colon_pos], Some(port))
@@ -188,6 +193,7 @@ impl SipResolver {
             }
         }
 
+        // TODO: Use hickory-resolver or trust-dns for RFC 3263 SRV/NAPTR resolution
         // Fall back to A/AAAA record lookup
         let lookup_host = format!("{}:{}", domain, default_port);
         let addrs = tokio::net::lookup_host(&lookup_host)

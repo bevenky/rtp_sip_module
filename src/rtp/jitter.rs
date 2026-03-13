@@ -5,6 +5,7 @@
 
 use rtp::packet::Packet as RtpPacket;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 /// Jitter buffer statistics
@@ -47,6 +48,9 @@ pub struct JitterConfig {
     pub samples_per_packet: u32,
     /// Enable NACK-based retransmission requests (Fix 11)
     pub nack_enabled: bool,
+    /// Bug #88: Number of consecutive pops that must fail to find the expected
+    /// sequence before counting a packet as lost. Default 2.
+    pub max_wait_before_loss: u32,
 }
 
 impl Default for JitterConfig {
@@ -59,6 +63,7 @@ impl Default for JitterConfig {
             sample_rate: 8000,
             samples_per_packet: 160,
             nack_enabled: false,
+            max_wait_before_loss: 2,
         }
     }
 }
@@ -93,7 +98,12 @@ pub struct JitterBuffer {
     /// Initial buffering complete
     initial_buffering_done: bool,
     /// Pending NACK sequence numbers (Fix 11)
-    nack_list: Vec<u16>,
+    /// Bug #53: Changed from Vec to VecDeque so that eviction of oldest entries
+    /// uses O(1) pop_front() instead of O(n) Vec::remove(0).
+    nack_list: VecDeque<u16>,
+    /// Bug #88: Consecutive pop misses for the expected sequence number.
+    /// Only count as lost after `config.max_wait_before_loss` consecutive misses.
+    consecutive_miss: u32,
 }
 
 impl JitterBuffer {
@@ -117,7 +127,8 @@ impl JitterBuffer {
             current_delay_ms,
             playout_started: false,
             initial_buffering_done: false,
-            nack_list: Vec::new(),
+            nack_list: VecDeque::new(),
+            consecutive_miss: 0,
         }
     }
 
@@ -129,33 +140,55 @@ impl JitterBuffer {
         let seq = packet.header.sequence_number;
         let timestamp = packet.header.timestamp;
 
+        // Bug #R9-1: Check if packet is too old BEFORE updating jitter/timestamps.
+        // Previously, jitter calculation and last_arrival/last_timestamp were updated
+        // unconditionally, then rejected packets corrupted the timing baseline.
+        if let Some(last_played) = self.last_played_sequence {
+            if Self::sequence_before(seq, last_played) || seq == last_played {
+                self.stats.packets_dropped += 1;
+                return;
+            }
+        }
+
         // Update jitter estimate (RFC 3550)
+        // Bug #19: Only update jitter estimate when the packet's RTP timestamp
+        // is newer than the last one, to avoid corrupting the estimate with
+        // out-of-order packets.
+        // RFC 3550 §6.4.1: Jitter MUST be calculated for every received packet.
+        // Use u32 half-space comparison to handle timestamp wraparound safely.
         if let (Some(last_arrival), Some(last_timestamp)) = (self.last_arrival, self.last_timestamp)
         {
+            let raw_diff = timestamp.wrapping_sub(last_timestamp);
+            // Half-space check: if raw_diff > 0x80000000, this is a backward jump
+            let ts_diff_samples = if raw_diff < 0x80000000 {
+                raw_diff as i64
+            } else {
+                // backward: -(last_timestamp.wrapping_sub(timestamp)) as i64
+                -(last_timestamp.wrapping_sub(timestamp) as i64)
+            };
             let arrival_diff = now.duration_since(last_arrival).as_millis() as i64;
-            let timestamp_diff = timestamp
-                .wrapping_sub(last_timestamp)
-                .wrapping_mul(1000)
-                / self.config.sample_rate;
-            let d = (arrival_diff - timestamp_diff as i64).abs() as f64;
+            let timestamp_diff =
+                ts_diff_samples * 1000 / self.config.sample_rate as i64;
+            let d = (arrival_diff - timestamp_diff).abs() as f64;
             self.jitter_estimate += (d - self.jitter_estimate) / 16.0;
             self.stats.jitter_ms = self.jitter_estimate;
         }
         self.last_arrival = Some(now);
         self.last_timestamp = Some(timestamp);
 
-        // Check if packet is too old (already played out)
-        if let Some(last_played) = self.last_played_sequence {
-            if Self::sequence_before(seq, last_played) {
-                self.stats.packets_dropped += 1;
-                return;
-            }
-        }
-
-        // Check for reordering
+        // Check for reordering: a packet is reordered when it arrives
+        // before the expected sequence (out of order) but is still within
+        // the playout window (not too old to have been already played).
         if let Some(expected) = self.next_sequence {
-            if seq != expected && !Self::sequence_before(seq, expected) {
-                self.stats.packets_reordered += 1;
+            if Self::sequence_before(seq, expected) {
+                // Only count as reordered if it hasn't already been played out
+                let within_window = match self.last_played_sequence {
+                    Some(last_played) => !Self::sequence_before(seq, last_played),
+                    None => true,
+                };
+                if within_window {
+                    self.stats.packets_reordered += 1;
+                }
             }
         }
 
@@ -171,7 +204,12 @@ impl JitterBuffer {
                         for i in 0..gap {
                             let missing = expected.wrapping_add(i);
                             if !self.packets.contains_key(&missing) {
-                                self.nack_list.push(missing);
+                                // Bug #87: Cap NACK list at 500 entries to prevent
+                                // unbounded growth. Remove oldest entries when full.
+                                if self.nack_list.len() >= 500 {
+                                    self.nack_list.pop_front();
+                                }
+                                self.nack_list.push_back(missing);
                                 self.stats.nack_requests += 1;
                             }
                         }
@@ -181,7 +219,11 @@ impl JitterBuffer {
         }
 
         // Update next expected sequence
-        if self.next_sequence.is_none() || Self::sequence_after(seq, self.next_sequence.unwrap()) {
+        // Bug #R10-2: Use !sequence_before instead of sequence_after so that
+        // next_sequence is also updated when seq == next_sequence. Without this,
+        // in-order packets (100, 101, 102...) leave next_sequence stale, causing
+        // spurious NACK requests for already-received packets.
+        if self.next_sequence.is_none() || !Self::sequence_before(seq, self.next_sequence.unwrap()) {
             self.next_sequence = Some(seq.wrapping_add(1));
         }
 
@@ -194,23 +236,34 @@ impl JitterBuffer {
             },
         );
 
-        // Enforce max buffer size
+        // Enforce max buffer size: evict the truly oldest packet using
+        // wraparound-aware sequence comparison, not the numerically smallest key.
         while self.packets.len() > self.config.max_packets {
-            if let Some((&oldest_seq, _)) = self.packets.iter().next() {
-                self.packets.remove(&oldest_seq);
-                self.stats.packets_dropped += 1;
-            }
+            let oldest_seq = {
+                let mut keys = self.packets.keys();
+                let mut oldest = *keys.next().unwrap();
+                for &k in keys {
+                    if Self::sequence_before(k, oldest) {
+                        oldest = k;
+                    }
+                }
+                oldest
+            };
+            self.packets.remove(&oldest_seq);
+            self.stats.packets_dropped += 1;
         }
 
         self.stats.buffer_size = self.packets.len();
 
         // Check if initial buffering is complete
         if !self.initial_buffering_done {
-            let buffer_duration_ms = self.packets.len() as u32
-                * self.config.samples_per_packet
+            // Bug #42: Use u64 intermediate arithmetic to prevent u32 overflow
+            // when packets.len() * samples_per_packet * 1000 exceeds u32::MAX.
+            let buffer_duration_ms = (self.packets.len() as u64
+                * self.config.samples_per_packet as u64
                 * 1000
-                / self.config.sample_rate;
-            if buffer_duration_ms >= self.config.target_delay_ms {
+                / self.config.sample_rate as u64) as u32;
+            if buffer_duration_ms >= self.current_delay_ms.min(self.config.target_delay_ms) {
                 self.initial_buffering_done = true;
             }
         }
@@ -230,14 +283,23 @@ impl JitterBuffer {
         let target_seq = if let Some(last) = self.last_played_sequence {
             last.wrapping_add(1)
         } else {
-            // Start with the oldest packet in buffer
-            *self.packets.keys().next()?
+            // Start with the truly oldest packet using wraparound-aware comparison
+            let mut keys = self.packets.keys();
+            let first = keys.next()?;
+            let mut oldest = *first;
+            for &k in keys {
+                if Self::sequence_before(k, oldest) {
+                    oldest = k;
+                }
+            }
+            oldest
         };
 
         // Try to get the target packet
         if let Some(buffered) = self.packets.remove(&target_seq) {
             self.last_played_sequence = Some(target_seq);
             self.stats.buffer_size = self.packets.len();
+            self.consecutive_miss = 0;
 
             // Adapt delay based on buffer level
             self.adapt_delay();
@@ -245,18 +307,38 @@ impl JitterBuffer {
             return Some(buffered.packet);
         }
 
+        // Bug #88: Only count as lost after max_wait_before_loss consecutive
+        // pops fail to find the expected sequence. This avoids premature loss
+        // counting for packets that are merely late.
+        self.consecutive_miss += 1;
+        if self.consecutive_miss < self.config.max_wait_before_loss {
+            return None;
+        }
+
         // Packet is missing - count as lost
+        self.consecutive_miss = 0;
         self.stats.packets_lost += 1;
         self.last_played_sequence = Some(target_seq);
 
         // Try to get next available packet if we're too far behind
+        // Use wraparound-aware scan (same as eviction/playout) instead of
+        // BTreeMap iteration order, which picks numerically smallest key and
+        // breaks near u16 wraparound (Bug #12).
         if self.packets.len() > self.config.max_packets / 2 {
-            if let Some((&next_seq, _)) = self.packets.iter().next() {
-                if let Some(buffered) = self.packets.remove(&next_seq) {
-                    self.last_played_sequence = Some(next_seq);
-                    self.stats.buffer_size = self.packets.len();
-                    return Some(buffered.packet);
+            let oldest_seq = {
+                let mut keys = self.packets.keys();
+                let mut oldest = *keys.next().unwrap();
+                for &k in keys {
+                    if Self::sequence_before(k, oldest) {
+                        oldest = k;
+                    }
                 }
+                oldest
+            };
+            if let Some(buffered) = self.packets.remove(&oldest_seq) {
+                self.last_played_sequence = Some(oldest_seq);
+                self.stats.buffer_size = self.packets.len();
+                return Some(buffered.packet);
             }
         }
 
@@ -275,6 +357,19 @@ impl JitterBuffer {
         self.initial_buffering_done || self.playout_started
     }
 
+    /// Bug #18: Reset initial buffering state so the next push can trigger
+    /// immediate playout. Called when an incoming marker bit signals a stream
+    /// restart (e.g. after hold/resume or talk-spurt boundary).
+    pub fn reset_initial_buffering(&mut self) {
+        self.initial_buffering_done = false;
+    }
+
+    /// Bug #19: Check whether a sequence number is already in the buffer
+    /// (duplicate detection).
+    pub fn contains_seq(&self, seq: u16) -> bool {
+        self.packets.contains_key(&seq)
+    }
+
     /// Reset the buffer
     pub fn reset(&mut self) {
         self.packets.clear();
@@ -288,6 +383,7 @@ impl JitterBuffer {
         self.playout_started = false;
         self.initial_buffering_done = false;
         self.nack_list.clear();
+        self.consecutive_miss = 0;
     }
 
     /// Drain and return the list of pending NACK sequence numbers (Fix 11).
@@ -296,7 +392,7 @@ impl JitterBuffer {
         // Remove any sequences that have since arrived
         self.nack_list
             .retain(|seq| !self.packets.contains_key(seq));
-        std::mem::take(&mut self.nack_list)
+        self.nack_list.drain(..).collect()
     }
 
     /// Process an RFC 2198 redundancy (RED, PT 121) payload (Fix 11).
@@ -304,6 +400,8 @@ impl JitterBuffer {
     /// RED packets carry a primary encoding plus one or more redundant copies
     /// of earlier packets. We extract redundant blocks and insert any that
     /// fill gaps in the buffer.
+    // TODO: Implement actual RED packet insertion
+    #[allow(dead_code)]
     pub fn process_redundancy(&mut self, packet: &RtpPacket) {
         let payload = &packet.payload;
         if payload.is_empty() {
@@ -376,18 +474,26 @@ impl JitterBuffer {
 
     /// Adapt buffer delay based on current conditions
     fn adapt_delay(&mut self) {
-        let buffer_level = self.packets.len() as u32
-            * self.config.samples_per_packet
+        // Bug #42: Use u64 intermediate arithmetic to prevent u32 overflow
+        let buffer_level = (self.packets.len() as u64
+            * self.config.samples_per_packet as u64
             * 1000
-            / self.config.sample_rate;
+            / self.config.sample_rate as u64) as u32;
 
-        // Simple adaptive algorithm
-        if buffer_level < self.config.min_delay_ms {
+        // Bug #20: Incorporate jitter estimate into delay calculation.
+        // Use 2x jitter as the target, clamped to [min_delay, max_delay].
+        let jitter_target = (self.stats.jitter_ms * 2.0) as u32;
+        let adaptive_target = jitter_target.clamp(self.config.min_delay_ms, self.config.max_delay_ms);
+
+        // Adapt delay towards the jitter-informed target
+        if buffer_level < adaptive_target {
             // Buffer underrun risk - increase delay
             self.current_delay_ms = (self.current_delay_ms + 10).min(self.config.max_delay_ms);
-        } else if buffer_level > self.config.max_delay_ms {
+        } else if buffer_level > adaptive_target {
             // Too much delay - decrease
-            self.current_delay_ms = (self.current_delay_ms - 10).max(self.config.min_delay_ms);
+            // Bug #R7-1: Use saturating_sub to prevent u32 underflow when
+            // current_delay_ms < 10 (possible with min_delay_ms < 10).
+            self.current_delay_ms = self.current_delay_ms.saturating_sub(10).max(self.config.min_delay_ms);
         }
 
         self.stats.buffer_delay_ms = self.current_delay_ms;
@@ -411,6 +517,7 @@ impl Default for JitterBuffer {
 }
 
 /// Packet Loss Concealment (PLC) for G.711
+// TODO: This is a simplified duplicate of plc::PacketLossConcealer. Consider removing in favor of the plc.rs version.
 pub struct PacketLossConcealer {
     /// Last good samples for interpolation
     last_samples: Vec<i16>,

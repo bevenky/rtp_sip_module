@@ -48,7 +48,13 @@ impl NatDetector {
     /// - If reflexive == local → Open
     /// - Otherwise → Unknown (likely behind NAT, type indeterminate)
     pub async fn detect(&self) -> Result<(NatType, SocketAddr)> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        // Bug #4 fix: Use "[::]:0" for IPv6 STUN servers, "0.0.0.0:0" for IPv4.
+        let bind_addr = if self.primary_server.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(RtpSipError::Io)?;
         let local_addr = socket.local_addr().map_err(RtpSipError::Io)?;
@@ -75,7 +81,9 @@ impl NatDetector {
         );
 
         // Check if we're not behind NAT
-        if reflexive.ip() == local_addr.ip() || is_public_ip(local_addr.ip()) {
+        // Bug #29: Only compare reflexive vs local IP. Having a public local IP
+        // does not guarantee there's no NAT (e.g., 1:1 NAT, cloud NAT, CGNAT).
+        if reflexive.ip() == local_addr.ip() {
             // Local and reflexive IP match — likely no NAT
             // But could still be behind a 1:1 NAT. Check with change request.
             return Ok((NatType::Open, reflexive));

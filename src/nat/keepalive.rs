@@ -45,6 +45,9 @@ pub struct NatKeepalive {
     rebind_occurred: Arc<AtomicBool>,
     /// Bug #52: Consecutive stable cycles since last rebinding
     stable_count_since_rebind: Arc<Mutex<u32>>,
+    /// Bug #103: Store the background task handle to prevent task leaks.
+    /// The Drop implementation calls stop() to signal the task to exit.
+    task_handle: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl NatKeepalive {
@@ -63,6 +66,7 @@ impl NatKeepalive {
             effective_min: Arc::new(Mutex::new(min_interval)),
             rebind_occurred: Arc::new(AtomicBool::new(false)),
             stable_count_since_rebind: Arc::new(Mutex::new(0)),
+            task_handle: Mutex::new(None),
         }
     }
 
@@ -88,17 +92,29 @@ impl NatKeepalive {
         addr_change_tx: Option<mpsc::Sender<SocketAddr>>,
     ) -> tokio::task::JoinHandle<()> {
         self.running.store(true, Ordering::SeqCst);
-        let this = Arc::clone(self);
+        let weak = Arc::downgrade(self);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut last_reflexive: Option<SocketAddr> = None;
-            // Bug #52: local copies that mirror the shared state for the
-            // async loop. The shared Mutex/AtomicBool fields are used for
-            // the notify_rebinding/notify_stable test helpers.
+            // Bug #104: The background task now reads `rebind_occurred` from
+            // the shared Arc<AtomicBool> (this.rebind_occurred) instead of
+            // maintaining a separate local boolean. This ensures consistency
+            // between the task's view and external callers using
+            // notify_rebinding()/notify_stable(). The stable_count is still
+            // local since only the task mutates it during the keepalive loop,
+            // but the shared stable_count_since_rebind is kept in sync.
             let mut stable_count: u32 = 0;
-            let mut rebind_occurred: bool = false;
 
-            while this.running.load(Ordering::SeqCst) {
+            loop {
+                let this = match weak.upgrade() {
+                    Some(arc) => arc,
+                    None => break,
+                };
+
+                if !this.running.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 let eff_min = *this.effective_min.lock();
                 let min_secs = eff_min.as_secs_f64();
                 let max_secs = this.max_interval.as_secs_f64();
@@ -108,15 +124,31 @@ impl NatKeepalive {
                             * (max_secs - min_secs).max(0.0),
                 );
 
+                let stun_server = this.stun_server;
+                let socket = Arc::clone(&this.socket);
+                let rebind_occurred = Arc::clone(&this.rebind_occurred);
+                let effective_min = Arc::clone(&this.effective_min);
+                let stable_count_since_rebind =
+                    Arc::clone(&this.stable_count_since_rebind);
+                let max_interval = this.max_interval;
+
+                // Drop the strong reference before sleeping
+                drop(this);
+
                 tokio::time::sleep(interval).await;
+
+                let this = match weak.upgrade() {
+                    Some(arc) => arc,
+                    None => break,
+                };
 
                 if !this.running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                let client = StunClient::new(this.stun_server);
+                let client = StunClient::new(stun_server);
                 match client
-                    .binding_request_on(&this.socket, this.stun_server)
+                    .binding_request_on(&socket, stun_server)
                     .await
                 {
                     Ok(reflexive) => {
@@ -133,7 +165,7 @@ impl NatKeepalive {
 
                                 // Adaptive: halve the effective min interval
                                 {
-                                    let mut eff = this.effective_min.lock();
+                                    let mut eff = effective_min.lock();
                                     let halved = *eff / 2;
                                     let floor = Duration::from_secs(
                                         ADAPTIVE_MIN_INTERVAL_SECS,
@@ -148,22 +180,30 @@ impl NatKeepalive {
                                 // Bug #52: Reset stable count from the LAST
                                 // rebind.
                                 stable_count = 0;
-                                rebind_occurred = true;
+                                // Bug #46: Sync shared stable count
+                                *stable_count_since_rebind.lock() = stable_count;
+                                // Bug #104: Write to shared state so external
+                                // callers see the rebinding.
+                                rebind_occurred.store(true, Ordering::SeqCst);
                             } else {
                                 // Same reflexive address as last time.
                                 // Bug #52: Only count toward stability if a
                                 // rebinding has occurred. Before any rebinding,
                                 // the interval should stay at its configured
                                 // value.
-                                if rebind_occurred {
+                                // Bug #104: Read from shared state for consistency.
+                                if rebind_occurred.load(Ordering::SeqCst) {
                                     stable_count += 1;
+                                    // Bug #46: Sync shared stable count
+                                    *stable_count_since_rebind.lock() =
+                                        stable_count;
                                     if stable_count >= STABLE_THRESHOLD {
                                         let mut eff =
-                                            this.effective_min.lock();
+                                            effective_min.lock();
                                         let increased =
                                             eff.mul_f64(1.25);
                                         *eff = increased
-                                            .min(this.max_interval);
+                                            .min(max_interval);
                                         tracing::debug!(
                                             new_min_ms = eff.as_millis(),
                                             "Adaptive keepalive: increased \
@@ -171,6 +211,9 @@ impl NatKeepalive {
                                             stable_count
                                         );
                                         stable_count = 0;
+                                        // Bug #46: Sync shared stable count
+                                        *stable_count_since_rebind.lock() =
+                                            stable_count;
                                     }
                                 }
                             }
@@ -183,16 +226,24 @@ impl NatKeepalive {
                             "Keepalive STUN request failed"
                         );
                         let _ = StunClient::send_keepalive(
-                            &this.socket,
-                            this.stun_server,
+                            &socket,
+                            stun_server,
                         )
                         .await;
                     }
                 }
+
+                // Drop the strong reference at the end of the loop iteration
+                drop(this);
             }
 
             tracing::debug!("NAT keepalive task stopped");
-        })
+        });
+
+        // Bug #15: Store the AbortHandle so Drop can cancel the task
+        *self.task_handle.lock() = Some(handle.abort_handle());
+
+        handle
     }
 
     /// Stop the keepalive loop
@@ -235,10 +286,12 @@ impl NatKeepalive {
             return;
         }
 
+        // Bug #45: Lock effective_min first, then stable_count_since_rebind
+        // to match the lock ordering in notify_rebinding() and avoid deadlock.
+        let mut eff = self.effective_min.lock();
         let mut count = self.stable_count_since_rebind.lock();
         *count += 1;
         if *count >= STABLE_THRESHOLD {
-            let mut eff = self.effective_min.lock();
             let increased = eff.mul_f64(1.25);
             *eff = increased.min(self.max_interval);
             *count = 0;
@@ -253,6 +306,18 @@ impl NatKeepalive {
     /// Current consecutive stable count since last rebind (useful for testing)
     pub fn stable_count(&self) -> u32 {
         *self.stable_count_since_rebind.lock()
+    }
+}
+
+/// Bug #103 fix: Implement Drop to stop the keepalive task and prevent leaks.
+/// When the NatKeepalive struct is dropped, we signal the background task to
+/// stop and abort the JoinHandle if it was stored.
+impl Drop for NatKeepalive {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(handle) = self.task_handle.lock().take() {
+            handle.abort();
+        }
     }
 }
 

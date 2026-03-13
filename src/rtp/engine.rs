@@ -24,7 +24,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
@@ -42,12 +42,29 @@ fn get_port_pool() -> &'static parking_lot::Mutex<HashSet<u16>> {
 }
 
 /// Allocate an even-numbered RTP port from the range.
-/// Returns None if all ports are exhausted.
+/// Returns None if all ports are exhausted or the range is invalid.
 pub fn allocate_rtp_port(start: u16, end: u16) -> Option<u16> {
+    // Bug #16: Validate that end > start to avoid underflow
+    if end <= start {
+        tracing::error!(start, end, "Invalid port range: end must be greater than start");
+        return None;
+    }
+
+    // Bug #37: Use saturating_add to prevent u16 overflow when start is odd near MAX
+    let start = if start % 2 != 0 { start.saturating_add(1) } else { start };
+    if start >= end {
+        return None;
+    }
+
     let mut allocated = get_port_pool().lock();
     // Start from a random offset to avoid always getting the same port
-    let range_size = ((end - start) / 2) as usize;
-    let offset = rand::random::<usize>() % range_size.max(1);
+    // Bug #16: Ensure range_size is at least 1 to avoid division by zero
+    // Bug #38 / Bug #R11-1: Count even ports in [start, end] inclusive.
+    // (end - start) / 2 + 1 correctly handles all cases:
+    //   start=10000, end=10002 → (2/2)+1 = 2 ports: 10000, 10002
+    //   start=10000, end=10004 → (4/2)+1 = 3 ports: 10000, 10002, 10004
+    let range_size = ((((end - start) / 2) + 1) as usize).max(1);
+    let offset = rand::random::<usize>() % range_size;
     for i in 0..range_size {
         let idx = (offset + i) % range_size;
         let port = start + (idx as u16) * 2; // even ports only
@@ -76,7 +93,7 @@ struct TimestampNormalizer {
     local_base_ts: u32,
     /// The first remote timestamp we observed (used to compute the initial offset).
     remote_base_ts: Option<u32>,
-    /// Signed offset: normalized = remote.wrapping_add(ts_offset as u32).
+    /// Signed offset: normalized = ((remote as i64).wrapping_add(ts_offset)) as u32.
     ts_offset: i64,
     /// Last remote timestamp seen (for discontinuity detection).
     last_remote_ts: Option<u32>,
@@ -131,21 +148,31 @@ impl TimestampNormalizer {
                 self.remote_base_ts = Some(remote_ts);
                 self.ts_offset = self.local_base_ts as i64 - remote_ts as i64;
                 self.last_remote_ts = Some(remote_ts);
-                remote_ts.wrapping_add(self.ts_offset as u32)
+                ((remote_ts as i64).wrapping_add(self.ts_offset)) as u32
             }
             Some(_) => {
                 // Check for discontinuity against the last seen timestamp.
                 if let Some(last) = self.last_remote_ts {
                     let fwd_delta = remote_ts.wrapping_sub(last);
                     let bwd_delta = last.wrapping_sub(remote_ts);
-                    let abs_delta = fwd_delta.min(bwd_delta);
 
-                    if abs_delta > max_delta {
+                    // Bug #14: Distinguish true backward jumps from wrapped-forward.
+                    // If bwd_delta < max_delta, this is a genuine backward jump
+                    // (e.g. stream reset), not a huge forward wrap.
+                    let is_discontinuity = if bwd_delta < max_delta && bwd_delta < fwd_delta {
+                        // True backward jump exceeding zero — always a discontinuity
+                        true
+                    } else {
+                        fwd_delta > max_delta
+                    };
+
+                    if is_discontinuity {
                         // Large jump detected — reset the mapping.
                         // local_base_ts is where we "would have been" had the stream
                         // continued seamlessly (i.e. last normalised ts + one ptime).
                         // Bug #49: Use configured ptime instead of hardcoded 20ms
-                        self.local_base_ts = last.wrapping_add(self.ts_offset as u32)
+                        self.local_base_ts = ((last as i64).wrapping_add(self.ts_offset)) as u32;
+                        self.local_base_ts = self.local_base_ts
                             .wrapping_add(self.samples_per_packet());
                         self.ts_offset = self.local_base_ts as i64 - remote_ts as i64;
                         self.remote_base_ts = Some(remote_ts);
@@ -153,17 +180,21 @@ impl TimestampNormalizer {
                 }
 
                 self.last_remote_ts = Some(remote_ts);
-                remote_ts.wrapping_add(self.ts_offset as u32)
+                ((remote_ts as i64).wrapping_add(self.ts_offset)) as u32
             }
         }
     }
 
     /// Reset the normalizer (e.g. on SSRC change).
+    /// Bug #41: Also reset local_base_ts to 0 to avoid stale timestamp base
+    /// after SSRC change. The old comment "keep local_base_ts so that we
+    /// continue from where we left off" caused the normalizer to produce
+    /// timestamps with a stale offset when a new SSRC started a fresh stream.
     fn reset(&mut self) {
         self.remote_base_ts = None;
         self.ts_offset = 0;
         self.last_remote_ts = None;
-        // Keep local_base_ts so that we continue from where we left off.
+        self.local_base_ts = 0;
     }
 }
 
@@ -179,9 +210,19 @@ const CN_DEFAULT_NOISE_LEVEL: u8 = 65;
 
 /// RTCP payload types for mux discrimination (RFC 5761)
 const RTCP_PT_MIN: u8 = 200;
-const RTCP_PT_MAX: u8 = 204;
-/// RTCP XR payload type
-const RTCP_PT_XR: u8 = 207;
+/// Bug #25: Include RTCP-FB (205), PSFB (206), XR (207), and registered types up to 211
+const RTCP_PT_MAX_RANGE: u8 = 211;
+
+/// Check whether a packet is RTCP based on the second byte (payload type).
+/// RTCP uses the full 8-bit PT field in byte 1 (values 200-211 per RFC 5761 §4),
+/// including RTPFB (205, RFC 4585) and PSFB (206, RFC 4585).
+fn is_rtcp_packet(data: &[u8]) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    let pt_byte = data[1];
+    pt_byte >= RTCP_PT_MIN && pt_byte <= RTCP_PT_MAX_RANGE
+}
 
 /// RTP Engine configuration
 #[derive(Debug, Clone)]
@@ -318,11 +359,13 @@ pub struct RtpEngine {
 
     // === Fix 27: Port recycling ===
     /// Port allocated from the global port pool (if any), released on stop/drop.
-    allocated_port: std::sync::Mutex<Option<u16>>,
+    /// Bug #95: Uses parking_lot::Mutex instead of std::sync::Mutex
+    allocated_port: Mutex<Option<u16>>,
 
     // === Fix 31: CN noise level ===
     /// Last received Comfort Noise level in dBov (0 = max noise, 127 = silence, RFC 3389)
-    last_cn_level: std::sync::Mutex<Option<u8>>,
+    /// Bug #95: Uses parking_lot::Mutex instead of std::sync::Mutex
+    last_cn_level: Mutex<Option<u8>>,
 
     /// Whether we are currently in a CNG silence period.
     /// When this is true and voice resumes, the marker bit must be set on the
@@ -335,11 +378,19 @@ pub struct RtpEngine {
     /// Whether we have already warned about an audio PT mismatch
     audio_pt_mismatch_warned: AtomicBool,
 
+    // === Bug #24: Media timeout fires repeatedly ===
+    /// Whether the timeout has already fired (prevents repeated broadcasts)
+    timeout_fired: AtomicBool,
+
     // === Bug #50: Hold-specific media timeout ===
     /// Media timeout during hold (ms, default 1800000 = 30 minutes)
     hold_media_timeout_ms: u64,
     /// Whether currently in hold state (from SDP a=sendonly/a=inactive)
     is_on_hold: AtomicBool,
+
+    // === Bug #94: Rate-limited warning for recv_tx.try_send drops ===
+    /// Counter for dropped audio frames due to full recv channel
+    recv_drop_count: AtomicU64,
 }
 
 impl RtpEngine {
@@ -381,7 +432,7 @@ impl RtpEngine {
             running: AtomicBool::new(false),
             jitter_buffer: Mutex::new(JitterBuffer::with_config(config.jitter_config.clone())),
             plc: Mutex::new(PacketLossConcealer::new(
-                config.codec.samples_per_frame(),
+                config.codec.samples_per_frame(config.ptime_ms),
             )),
             config,
             recv_tx,
@@ -401,11 +452,13 @@ impl RtpEngine {
             timestamp_normalizer: Mutex::new(TimestampNormalizer::with_ptime(sample_rate, ptime_ms)),
             send_silence_when_idle,
             last_audio_sent: Mutex::new(None),
-            allocated_port: std::sync::Mutex::new(None),
-            last_cn_level: std::sync::Mutex::new(None),
+            allocated_port: Mutex::new(None),
+            last_cn_level: Mutex::new(None),
+            recv_drop_count: AtomicU64::new(0),
             in_cn_silence: AtomicBool::new(false),
             audio_payload_type,
             audio_pt_mismatch_warned: AtomicBool::new(false),
+            timeout_fired: AtomicBool::new(false),
             hold_media_timeout_ms,
             is_on_hold: AtomicBool::new(false),
         })
@@ -467,9 +520,12 @@ impl RtpEngine {
     }
 
     /// Check whether the media stream has timed out
+    /// Bug #R11-2: Use effective_media_timeout() to respect hold state.
+    /// Previously used raw media_timeout_ms, which would incorrectly report
+    /// timeout during hold when the hold timeout (30min) should apply.
     pub fn is_media_timed_out(&self) -> bool {
         if let Some(last) = *self.last_rtp_received.lock() {
-            last.elapsed().as_millis() as u64 >= self.media_timeout_ms
+            last.elapsed() >= self.effective_media_timeout()
         } else {
             false
         }
@@ -487,7 +543,8 @@ impl RtpEngine {
     /// 0 = maximum noise, 127 = digital silence. Returns `None` if no CN
     /// packet has been received yet.
     pub fn last_cn_level(&self) -> Option<u8> {
-        self.last_cn_level.lock().ok().and_then(|g| *g)
+        // Bug #95: parking_lot::Mutex never poisons, so just .lock()
+        *self.last_cn_level.lock()
     }
 
     /// Compute a PCM amplitude from the last received CN level (Fix 31).
@@ -630,7 +687,10 @@ impl RtpEngine {
                     let effective_timeout = engine_timeout.effective_media_timeout();
                     if let Some(last) = *engine_timeout.last_rtp_received.lock() {
                         if last.elapsed() >= effective_timeout {
-                            let _ = timeout_tx.send(());
+                            // Bug #24: Only broadcast on transition from not-fired to fired
+                            if !engine_timeout.timeout_fired.swap(true, Ordering::SeqCst) {
+                                let _ = timeout_tx.send(());
+                            }
                         }
                     }
                 }
@@ -638,13 +698,16 @@ impl RtpEngine {
         }
 
         // === Fix 14: Spawn silence-when-idle task ===
+        // Bug #36: Note: Silence task and user send_audio both acquire packet_builder lock,
+        // which serializes them. Race is benign as parking_lot::Mutex ensures ordering.
         if self.send_silence_when_idle {
             let engine_silence = self.clone();
-            let ptime_ms = self.ptime_ms.load(Ordering::Relaxed);
-            let samples_per_pkt = self.samples_per_packet() as usize;
             tokio::spawn(async move {
-                let interval = Duration::from_millis(ptime_ms as u64);
                 while engine_silence.running.load(Ordering::Relaxed) {
+                    // Bug #17: Read ptime inside the loop so dynamic changes are picked up
+                    let ptime_ms = engine_silence.ptime_ms.load(Ordering::Relaxed);
+                    let samples_per_pkt = engine_silence.samples_per_packet() as usize;
+                    let interval = Duration::from_millis(ptime_ms as u64);
                     tokio::time::sleep(interval).await;
                     let should_send = {
                         let last = engine_silence.last_audio_sent.lock();
@@ -677,26 +740,64 @@ impl RtpEngine {
                     Ok(Ok((len, _addr))) => {
                         let data = &buf[..len];
 
+                        // Minimum RTP header size check (12 bytes per RFC 3550)
+                        if data.len() < 12 {
+                            continue;
+                        }
+
                         // === Fix 6: RTCP-mux discrimination ===
                         // When RTCP-mux is enabled, check if this is an RTCP packet.
                         // RTCP packets have payload type 200-204 or 207 in the second byte.
-                        if engine.rtcp_mux.load(Ordering::Relaxed) && len >= 2 {
-                            let pt_byte = data[1] & 0x7F;
-                            if (pt_byte >= RTCP_PT_MIN && pt_byte <= RTCP_PT_MAX)
-                                || pt_byte == RTCP_PT_XR
-                            {
-                                // This is an RTCP packet on the muxed port — skip RTP processing.
-                                // A full implementation would forward to an RTCP handler here.
-                                continue;
-                            }
+                        // The full byte is used (no masking) because RTCP PT values (>=200)
+                        // have bit 7 set and masking with 0x7F would prevent identification.
+                        if engine.rtcp_mux.load(Ordering::Relaxed) && is_rtcp_packet(data) {
+                            // Bug #24: Log RTCP packet type instead of silently dropping.
+                            // TODO: Forward RTCP to RtcpSession for SR/RR/BYE processing
+                            let rtcp_pt = data[1];
+                            tracing::debug!(
+                                rtcp_payload_type = rtcp_pt,
+                                len = data.len(),
+                                "Received RTCP packet on muxed port (not yet processed)"
+                            );
+                            continue;
                         }
 
-                        if let Ok(packet) = parse_rtp_packet(data) {
+                        if let Ok(mut packet) = parse_rtp_packet(data) {
+                            // Bug #12: Reject packets with invalid RTP version
+                            if packet.header.version != 2 {
+                                continue;
+                            }
+
+                            // RFC 3550 §5.1: Strip padding bytes when padding bit is set.
+                            // The last byte of the payload indicates the total number of
+                            // padding bytes (including itself) to remove.
+                            if packet.header.padding && !packet.payload.is_empty() {
+                                let pad_len =
+                                    *packet.payload.last().unwrap() as usize;
+                                if pad_len == 0 || pad_len > packet.payload.len() {
+                                    continue; // malformed padding
+                                }
+                                packet.payload =
+                                    packet.payload.slice(..packet.payload.len() - pad_len);
+                            }
+
                             let pt = packet.header.payload_type;
                             let pkt_ssrc = packet.header.ssrc;
 
+                            // Bug #39: Check own-SSRC collision BEFORE updating timeout
+                            // to prevent spoofed/looped packets from keeping timeout alive
+                            if pkt_ssrc == engine.ssrc {
+                                tracing::warn!(
+                                    ssrc = pkt_ssrc,
+                                    "SSRC collision: received packet with our own SSRC, dropping"
+                                );
+                                continue;
+                            }
+
                             // === Fix 4: Update last RTP received timestamp ===
                             *engine.last_rtp_received.lock() = Some(Instant::now());
+                            // Bug #24: Clear timeout_fired flag when new RTP arrives
+                            engine.timeout_fired.store(false, Ordering::SeqCst);
 
                             // === Fix 9 + Bug #48: SSRC collision detection ===
                             {
@@ -758,7 +859,8 @@ impl RtpEngine {
                                 // (RFC 3389: 0 = max noise, 127 = silence).
                                 if !packet.payload.is_empty() {
                                     let level = packet.payload[0];
-                                    if let Ok(mut cn) = engine.last_cn_level.lock() {
+                                    {
+                                        let mut cn = engine.last_cn_level.lock();
                                         *cn = Some(level);
                                     }
                                 }
@@ -768,7 +870,16 @@ impl RtpEngine {
                                 // produces a pitch-repeated fade-out from the last audio,
                                 // which sounds better than hard silence or random noise.
                                 let cng_audio = engine.plc.lock().conceal();
-                                let _ = engine.recv_tx.try_send(cng_audio);
+                                // Bug #94: Rate-limited warning on channel full
+                                if let Err(mpsc::error::TrySendError::Full(_)) = engine.recv_tx.try_send(cng_audio) {
+                                    let count = engine.recv_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if count % 100 == 1 {
+                                        tracing::warn!(
+                                            total_drops = count,
+                                            "recv_tx channel full, dropping audio frame"
+                                        );
+                                    }
+                                }
 
                                 continue;
                             }
@@ -780,28 +891,69 @@ impl RtpEngine {
                                 .lock()
                                 .normalize(packet.header.timestamp);
 
-                            // Push raw encoded packet to jitter buffer (decode only on pop)
-                            engine.jitter_buffer.lock().push(packet);
-
-                            // Try to pop from jitter buffer — decode exactly once here
-                            let audio = {
+                            // Bug #40: Acquire jitter buffer lock once for marker-bit
+                            // reset, duplicate detection, push, and pop instead of
+                            // locking 3+ separate times per received packet.
+                            // Bug #11: Pop in a loop until pop() returns None to drain
+                            // multiple ready packets, preventing buffer growth under burst.
+                            let popped_packets: Vec<rtp::packet::Packet> = {
                                 let mut jb = engine.jitter_buffer.lock();
-                                if let Some(jb_packet) = jb.pop() {
+
+                                // Bug #18: Marker bit on incoming — reset jitter buffer
+                                // initial buffering state to reduce latency on stream restart
+                                if packet.header.marker {
+                                    jb.reset_initial_buffering();
+                                }
+
+                                // Bug #19: Duplicate packet detection — skip if seq already buffered
+                                if jb.contains_seq(packet.header.sequence_number) {
+                                    continue;
+                                }
+
+                                // Push raw encoded packet to jitter buffer (decode only on pop)
+                                jb.push(packet);
+
+                                // Bug #11: Pop all available packets, not just one
+                                let mut packets = Vec::new();
+                                while let Some(jb_packet) = jb.pop() {
+                                    packets.push(jb_packet);
+                                }
+                                packets
+                            };
+
+                            if !popped_packets.is_empty() {
+                                for jb_packet in popped_packets {
                                     // === Fix 7: Decode with receive codec ===
                                     let samples = engine.recv_codec.lock().decode(&jb_packet.payload);
                                     // Update PLC with the decoded samples
                                     engine.plc.lock().update(&samples);
-                                    Some(samples)
-                                } else if jb.is_ready() {
-                                    // Packet was lost, use PLC
-                                    Some(engine.plc.lock().conceal())
-                                } else {
-                                    None
+                                    // Bug #94: Rate-limited warning on channel full
+                                    if let Err(mpsc::error::TrySendError::Full(_)) = engine.recv_tx.try_send(samples) {
+                                        let count = engine.recv_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if count % 100 == 1 {
+                                            tracing::warn!(
+                                                total_drops = count,
+                                                "recv_tx channel full, dropping audio frame"
+                                            );
+                                        }
+                                    }
                                 }
-                            };
-
-                            if let Some(audio) = audio {
-                                let _ = engine.recv_tx.try_send(audio);
+                            } else {
+                                // No packets popped — check if we should conceal
+                                let jb_ready = engine.jitter_buffer.lock().is_ready();
+                                if jb_ready {
+                                    // Packet was lost, use PLC
+                                    let audio = engine.plc.lock().conceal();
+                                    if let Err(mpsc::error::TrySendError::Full(_)) = engine.recv_tx.try_send(audio) {
+                                        let count = engine.recv_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if count % 100 == 1 {
+                                            tracing::warn!(
+                                                total_drops = count,
+                                                "recv_tx channel full, dropping audio frame"
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -823,18 +975,15 @@ impl RtpEngine {
         self.running.store(false, Ordering::SeqCst);
 
         // === Fix 27: Release allocated port back to the pool ===
-        if let Ok(mut port) = self.allocated_port.lock() {
-            if let Some(p) = port.take() {
-                release_rtp_port(p);
-            }
+        // Bug #95: parking_lot::Mutex never poisons, so just .lock()
+        if let Some(p) = self.allocated_port.lock().take() {
+            release_rtp_port(p);
         }
     }
 
     /// Register an allocated port so it will be released on stop/drop (Fix 27).
     pub fn set_allocated_port(&self, port: u16) {
-        if let Ok(mut p) = self.allocated_port.lock() {
-            *p = Some(port);
-        }
+        *self.allocated_port.lock() = Some(port);
     }
 
     /// Send audio samples (PCM i16, 8kHz mono)
@@ -882,11 +1031,16 @@ impl RtpEngine {
             .lock()
             .ok_or(RtpSipError::NotConnected)?;
 
+        // Bug #8: Also consume force_marker and in_cn_silence flags
+        let force = self.force_marker.swap(false, Ordering::Relaxed);
+        let cn_resume = self.in_cn_silence.swap(false, Ordering::Relaxed);
+        let effective_marker = marker || force || cn_resume;
+
         let encoded = self.codec.encode(samples);
         let packet = self
             .packet_builder
             .lock()
-            .build_with_marker(Bytes::from(encoded), samples.len() as u32, marker);
+            .build_with_marker(Bytes::from(encoded), samples.len() as u32, effective_marker);
 
         let data = serialize_rtp_packet(&packet)?;
         self.socket.send_to(&data, remote).await?;
@@ -923,28 +1077,36 @@ impl RtpEngine {
         let cn_interval_ms = CN_PACING_PTIMES as u64
             * self.ptime_ms.load(Ordering::Relaxed) as u64;
         {
-            let mut last_cn = self.last_cn_timestamp.lock();
+            let last_cn = self.last_cn_timestamp.lock();
             if let Some(last) = *last_cn {
                 if last.elapsed().as_millis() < cn_interval_ms as u128 {
                     return Ok(false);
                 }
             }
-            *last_cn = Some(Instant::now());
+            // Bug #R8-3: Don't update timestamp here — update after successful send
+            // to avoid suppressing retries when socket.send_to() fails.
         }
 
         // Fix 31: If we have a received CN level, echo it back; otherwise
         // use the default of 65 dBov.
-        let dbov = match self.last_cn_level.lock().ok().and_then(|g| *g) {
+        // Bug #95: parking_lot::Mutex never poisons, so just .lock()
+        let dbov = match *self.last_cn_level.lock() {
             Some(level) => level,
             None => CN_DEFAULT_NOISE_LEVEL,
         };
 
         // 2-byte CN payload: [noise_level, 0] (RFC 3389)
         let cn_payload = vec![dbov, 0];
+
+        // Bug #13: Set marker=true on the first CN packet of a silence period
+        let is_first_cn = !self.in_cn_silence.load(Ordering::Relaxed);
+
+        // Bug #14: Use samples_per_packet() for timestamp increment instead of
+        // samples.len(), which may not match the configured ptime
         let mut packet = self.packet_builder.lock().build_with_marker(
             Bytes::from(cn_payload),
-            samples.len() as u32,
-            false,
+            self.samples_per_packet(),
+            is_first_cn,
         );
 
         // Set the correct payload type for Comfort Noise before serialization
@@ -952,6 +1114,9 @@ impl RtpEngine {
 
         let data = serialize_rtp_packet(&packet)?;
         self.socket.send_to(&data, remote).await?;
+
+        // Bug #R8-3: Update CN pacing timestamp only after successful send
+        *self.last_cn_timestamp.lock() = Some(Instant::now());
 
         // Mark that we're in CN silence — next voice packet gets marker bit
         self.in_cn_silence.store(true, Ordering::Relaxed);
@@ -970,6 +1135,9 @@ impl RtpEngine {
     }
 
     /// Receive audio samples with timeout (blocking version for sync API)
+    ///
+    /// Note: This method blocks the thread. Only call from synchronous/blocking
+    /// context, never from async tasks.
     pub fn recv_audio_blocking(&self, timeout: Duration) -> Result<Option<Vec<i16>>> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -998,7 +1166,7 @@ impl RtpEngine {
         self.jitter_buffer.lock().reset();
         self.plc
             .lock()
-            .update(&vec![0i16; self.config.codec.samples_per_frame()]);
+            .update(&vec![0i16; self.config.codec.samples_per_frame(self.config.ptime_ms)]);
     }
 
     // ========== RFC 2833 DTMF Methods ==========
@@ -1013,11 +1181,26 @@ impl RtpEngine {
             .lock()
             .ok_or(RtpSipError::NotConnected)?;
 
-        // Generate all packets for this digit (20ms intervals)
+        // Get shared sequence counter and current audio timestamp from packet_builder
+        let (mut seq, audio_ts) = {
+            let pb = self.packet_builder.lock();
+            (pb.sequence(), pb.timestamp())
+        };
+
+        // Bug #R6-7: Use actual ptime instead of hardcoded 20ms, matching FreeSWITCH
+        let ptime = self.ptime_ms.load(Ordering::Relaxed);
+        // Generate all packets for this digit using configured ptime intervals
+        // Uses shared sequence space per RFC 4733 §2.5
         let packets = self
             .dtmf_sender
             .lock()
-            .generate_digit(digit, duration_ms, 20)?;
+            .generate_digit(digit, duration_ms, ptime, &mut seq, audio_ts)?;
+
+        // Update the packet_builder's sequence to stay in sync
+        {
+            let mut pb = self.packet_builder.lock();
+            pb.set_sequence(seq);
+        }
 
         // Send packets with proper timing
         for (i, packet) in packets.iter().enumerate() {
@@ -1025,8 +1208,10 @@ impl RtpEngine {
             self.socket.send_to(&data, remote).await?;
 
             // Wait between packets (except for end packets which are sent rapidly)
+            // Bug #R9-3: Use configured ptime instead of hardcoded 20ms
             if i < packets.len().saturating_sub(3) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                let ptime = self.ptime_ms.load(Ordering::Relaxed) as u64;
+                tokio::time::sleep(Duration::from_millis(ptime)).await;
             }
         }
 
@@ -1105,10 +1290,11 @@ impl RtpEngine {
 
 impl Drop for RtpEngine {
     fn drop(&mut self) {
-        if let Ok(mut port) = self.allocated_port.lock() {
-            if let Some(p) = port.take() {
-                release_rtp_port(p);
-            }
+        // Bug #25: Ensure running flag is set to false so background tasks stop
+        self.running.store(false, Ordering::SeqCst);
+        // Bug #95: parking_lot::Mutex never poisons, so just .lock()
+        if let Some(p) = self.allocated_port.lock().take() {
+            release_rtp_port(p);
         }
     }
 }
@@ -1325,6 +1511,67 @@ mod tests {
         };
         let engine = RtpEngine::new(addr, config).await.unwrap();
         assert!(engine.is_rtcp_mux_enabled());
+    }
+
+    // === RTCP-mux demux identification tests ===
+
+    #[test]
+    fn test_is_rtcp_packet_identifies_all_rtcp_types() {
+        // RTCP payload types: SR=200, RR=201, SDES=202, BYE=203, APP=204, XR=207
+        let rtcp_pts: Vec<u8> = vec![200, 201, 202, 203, 204, 207];
+        for pt in &rtcp_pts {
+            // Minimal 12-byte RTCP-like packet: version=2, padding=0, RC=0, PT=<pt>
+            let mut pkt = vec![0x80, *pt, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                               0x00, 0x00, 0x00, 0x00];
+            assert!(
+                is_rtcp_packet(&pkt),
+                "RTCP PT {} should be identified as RTCP",
+                pt
+            );
+            // Also verify with padding bit set (byte 0 = 0xA0)
+            pkt[0] = 0xA0;
+            assert!(
+                is_rtcp_packet(&pkt),
+                "RTCP PT {} with padding should still be identified as RTCP",
+                pt
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_rtcp_packet_rejects_rtp() {
+        // Common RTP payload types should NOT be identified as RTCP
+        let rtp_pts: Vec<u8> = vec![0, 8, 9, 96, 111, 127];
+        for pt in &rtp_pts {
+            // RTP packet with marker=0, PT=<pt>
+            let pkt = vec![0x80, *pt, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0,
+                           0x00, 0x00, 0x00, 0x01];
+            assert!(
+                !is_rtcp_packet(&pkt),
+                "RTP PT {} should NOT be identified as RTCP",
+                pt
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_rtcp_packet_rejects_short_data() {
+        assert!(!is_rtcp_packet(&[]));
+        assert!(!is_rtcp_packet(&[0x80]));
+    }
+
+    #[test]
+    fn test_is_rtcp_packet_accepts_rtcpfb_types() {
+        // PT 205 (RTPFB) and 206 (PSFB) are valid RTCP per RFC 4585
+        for pt in [205u8, 206] {
+            let pkt = vec![0x80, pt, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                           0x00, 0x00, 0x00, 0x00];
+            assert!(
+                is_rtcp_packet(&pkt),
+                "PT {} is valid RTCP (RTPFB/PSFB per RFC 4585)",
+                pt
+            );
+        }
     }
 
     // === Fix 7: Codec asymmetry tests ===
@@ -1572,13 +1819,13 @@ mod tests {
         let engine = RtpEngine::with_defaults(addr).await.unwrap();
 
         // Manually set CN level to simulate receiving a CN packet
-        *engine.last_cn_level.lock().unwrap() = Some(0); // max noise
+        *engine.last_cn_level.lock() = Some(0); // max noise
         assert_eq!(engine.cn_amplitude(), 254); // (127-0)*2
 
-        *engine.last_cn_level.lock().unwrap() = Some(127); // digital silence
+        *engine.last_cn_level.lock() = Some(127); // digital silence
         assert_eq!(engine.cn_amplitude(), 0); // (127-127)*2
 
-        *engine.last_cn_level.lock().unwrap() = Some(60); // mid-level
+        *engine.last_cn_level.lock() = Some(60); // mid-level
         assert_eq!(engine.cn_amplitude(), 134); // (127-60)*2
     }
 

@@ -82,6 +82,17 @@ impl From<PyDtmfMode> for DtmfMode {
 /// with integrated RTP audio handling. Supports multiple providers
 /// with longest-prefix routing.
 ///
+/// # Tokio Runtime (Bug #38)
+///
+/// Each PySipRunner creates its own tokio runtime. This is intentional:
+/// the runtime is used for both the SIP engine's async operations and for
+/// blocking Python<->Rust bridge calls (via `block_on`). A single runtime
+/// per runner keeps the lifecycle simple — when the runner is dropped, the
+/// runtime and all its spawned tasks are cleaned up together.
+///
+/// TODO(P2): Consider sharing a runtime across multiple PySipRunner instances
+/// if resource usage becomes a concern in multi-runner deployments.
+///
 /// Example:
 /// ```python
 /// from rtpsip import SipRunner
@@ -197,6 +208,12 @@ impl PySipRunner {
     ) -> PyResult<Self> {
         use crate::config::{ProviderConfig, RoutingConfig, RtpConfig, SipConfig};
 
+        if rtp_port_start >= rtp_port_end {
+            return Err(PyValueError::new_err(
+                "rtp_port_start must be less than rtp_port_end",
+            ));
+        }
+
         let config = Config {
             sip: SipConfig {
                 local_ip: sip_ip.to_string(),
@@ -251,7 +268,8 @@ impl PySipRunner {
     ///
     /// This starts the SIP engine and begins listening for incoming calls.
     /// Must be called before making or receiving calls.
-    fn start(&self) -> PyResult<()> {
+    // Bug #R9-4: Added py parameter to release GIL during blocking engine creation
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
         if *self.running.lock() {
             return Err(PyRuntimeError::new_err("Runner is already running"));
         }
@@ -271,13 +289,15 @@ impl PySipRunner {
             ..Default::default()
         };
 
-        let _guard = self.runtime.enter();
+        let runtime = self.runtime.clone();
 
-        // Create engine
-        let engine = self
-            .runtime
-            .block_on(async { SipEngine::new(sip_config).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create SIP engine: {}", e)))?;
+        // Create engine — release GIL during async I/O
+        let engine = py.allow_threads(|| {
+            let _guard = runtime.enter();
+            runtime
+                .block_on(async { SipEngine::new(sip_config).await })
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create SIP engine: {}", e)))?;
 
         // Add all provider credentials
         for provider in &self.config.providers {
@@ -292,6 +312,11 @@ impl PySipRunner {
             };
             engine.add_provider(creds);
         }
+
+        // Bug #R11-6: Enter runtime context before calling engine.start() which
+        // uses tokio::spawn. The _guard from py.allow_threads was dropped when that
+        // closure returned, leaving no active runtime context.
+        let _guard = self.runtime.enter();
 
         // Start the incoming call listener
         engine.start().map_err(|e| {
@@ -309,19 +334,26 @@ impl PySipRunner {
     }
 
     /// Stop the SIP engine
-    fn stop(&self) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         if !*self.running.lock() {
             return Ok(());
         }
 
-        // Hangup all active calls and stop the engine
-        if let Some(ref engine) = *self.engine.lock() {
+        let runtime = self.runtime.clone();
+        let engine_opt = self.engine.lock().clone();
+
+        // Bug #R10-1: Release GIL during blocking hangup calls to avoid deadlock.
+        // Same pattern as start() fix in Round 9.
+        if let Some(ref engine) = engine_opt {
             let calls = engine.active_calls();
-            for call_id in calls {
-                let _ = self.runtime.block_on(engine.hangup(&call_id));
-            }
-            // Stop the incoming call listener
-            engine.stop();
+            py.allow_threads(|| {
+                let _guard = runtime.enter();
+                for call_id in calls {
+                    let _ = runtime.block_on(engine.hangup(&call_id));
+                }
+                // Stop the incoming call listener
+                engine.stop();
+            });
         }
 
         *self.engine.lock() = None;
@@ -422,14 +454,20 @@ impl PySipRunner {
     ///     event = runner.next_event(timeout_ms=30000)
     ///     if event and event.is_incoming():
     ///         runner.answer(event.call_id)
-    fn answer(&self, call_id: &str) -> PyResult<()> {
+    fn answer(&self, py: Python<'_>, call_id: &str) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
             PyRuntimeError::new_err("Runner not started")
         })?;
 
-        engine
-            .answer(call_id)
-            .map_err(|e| PyRuntimeError::new_err(format!("Answer failed: {}", e)))
+        // Bug #39: Release the GIL before acquiring Rust locks to avoid
+        // deadlocks with other Python threads that may also hold the GIL
+        // while waiting on Rust locks.
+        let call_id = call_id.to_string();
+        py.allow_threads(move || {
+            engine
+                .answer(&call_id)
+                .map_err(|e| PyRuntimeError::new_err(format!("Answer failed: {}", e)))
+        })
     }
 
     /// Reject an incoming call
@@ -451,14 +489,18 @@ impl PySipRunner {
     ///     if event and event.is_incoming():
     ///         runner.reject(event.call_id, 486)  # Busy
     #[pyo3(signature = (call_id, status_code = 603))]
-    fn reject(&self, call_id: &str, status_code: u16) -> PyResult<()> {
+    fn reject(&self, py: Python<'_>, call_id: &str, status_code: u16) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
             PyRuntimeError::new_err("Runner not started")
         })?;
 
-        engine
-            .reject(call_id, status_code)
-            .map_err(|e| PyRuntimeError::new_err(format!("Reject failed: {}", e)))
+        // Bug #39: Release GIL to avoid deadlocks with other Python threads.
+        let call_id = call_id.to_string();
+        py.allow_threads(move || {
+            engine
+                .reject(&call_id, status_code)
+                .map_err(|e| PyRuntimeError::new_err(format!("Reject failed: {}", e)))
+        })
     }
 
     /// Send audio samples to a call
@@ -522,9 +564,11 @@ impl PySipRunner {
         };
 
         let timeout = Duration::from_millis(timeout_ms);
+        let runtime = self.runtime.clone();
 
         // Release GIL during blocking recv
         py.allow_threads(|| {
+            let _guard = runtime.enter();
             rtp.recv_audio_blocking(timeout)
                 .map_err(|e| PyRuntimeError::new_err(format!("Recv audio failed: {}", e)))
         })
@@ -599,13 +643,14 @@ impl PySipRunner {
     ///     if dtmf:
     ///         digit, duration = dtmf
     ///         print(f"Received DTMF: {digit}")
-    fn recv_dtmf(&self, call_id: &str) -> PyResult<Option<(char, u32)>> {
+    fn recv_dtmf(&self, py: Python<'_>, call_id: &str) -> PyResult<Option<(char, u32)>> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
             PyRuntimeError::new_err("Runner not started")
         })?;
 
-        engine
-            .recv_dtmf(call_id)
+        // Bug #R6-5: Release GIL during DTMF check
+        let call_id = call_id.to_string();
+        py.allow_threads(|| engine.recv_dtmf(&call_id))
             .map_err(|e| PyRuntimeError::new_err(format!("recv_dtmf failed: {}", e)))
     }
 
@@ -634,8 +679,10 @@ impl PySipRunner {
 
         let call_id = call_id.to_string();
         let timeout = Duration::from_millis(timeout_ms);
+        let runtime = self.runtime.clone();
 
         py.allow_threads(|| {
+            let _guard = runtime.enter();
             engine
                 .recv_dtmf_blocking(&call_id, timeout)
                 .map_err(|e| PyRuntimeError::new_err(format!("recv_dtmf_blocking failed: {}", e)))
@@ -653,15 +700,19 @@ impl PySipRunner {
     ///
     /// Returns:
     ///     DtmfMode enum value
-    fn get_dtmf_mode(&self, call_id: &str) -> PyResult<PyDtmfMode> {
+    fn get_dtmf_mode(&self, py: Python<'_>, call_id: &str) -> PyResult<PyDtmfMode> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
             PyRuntimeError::new_err("Runner not started")
         })?;
 
-        engine
-            .get_dtmf_mode(call_id)
-            .map(|m| m.into())
-            .map_err(|e| PyRuntimeError::new_err(format!("get_dtmf_mode failed: {}", e)))
+        // Bug #39: Release GIL to avoid deadlocks with other Python threads.
+        let call_id = call_id.to_string();
+        py.allow_threads(move || {
+            engine
+                .get_dtmf_mode(&call_id)
+                .map(|m| m.into())
+                .map_err(|e| PyRuntimeError::new_err(format!("get_dtmf_mode failed: {}", e)))
+        })
     }
 
     /// Set the DTMF mode for a call
@@ -671,14 +722,19 @@ impl PySipRunner {
     /// Args:
     ///     call_id: Call ID
     ///     mode: DtmfMode.Auto, DtmfMode.Rfc2833, or DtmfMode.Info
-    fn set_dtmf_mode(&self, call_id: &str, mode: PyDtmfMode) -> PyResult<()> {
+    fn set_dtmf_mode(&self, py: Python<'_>, call_id: &str, mode: PyDtmfMode) -> PyResult<()> {
         let engine = self.engine.lock().clone().ok_or_else(|| {
             PyRuntimeError::new_err("Runner not started")
         })?;
 
-        engine
-            .set_dtmf_mode(call_id, mode.into())
-            .map_err(|e| PyRuntimeError::new_err(format!("set_dtmf_mode failed: {}", e)))
+        // Bug #39: Release GIL to avoid deadlocks with other Python threads.
+        let call_id = call_id.to_string();
+        let mode: DtmfMode = mode.into();
+        py.allow_threads(move || {
+            engine
+                .set_dtmf_mode(&call_id, mode)
+                .map_err(|e| PyRuntimeError::new_err(format!("set_dtmf_mode failed: {}", e)))
+        })
     }
 
     /// Put call on hold
@@ -764,29 +820,48 @@ impl PySipRunner {
     /// Returns:
     ///     CallEvent or None if timeout
     fn next_event(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<PyCallEvent>> {
-        // Clone the receiver to avoid holding lock during GIL release
-        // broadcast::Receiver is clonable (each clone gets same messages)
-        let mut rx = {
-            let mut rx_guard = self.event_rx.lock();
-            rx_guard.as_mut().ok_or_else(|| {
-                PyRuntimeError::new_err("Runner not started")
-            })?.resubscribe()
+        // Bug #40 fix: Take the receiver out of the mutex, use it, then put it back.
+        // This preserves the receiver's position in the broadcast buffer across calls,
+        // preventing event loss between consecutive next_event() invocations.
+        //
+        // Bug R14-3 fix: Distinguish "not started" from "temporarily borrowed by another
+        // thread". If the runner is running but the receiver is None, another thread has
+        // it — return None instead of an error.
+        let mut rx = match self.event_rx.lock().take() {
+            Some(rx) => rx,
+            None => {
+                if *self.running.lock() {
+                    // Receiver temporarily borrowed by a concurrent next_event() call
+                    tracing::debug!("Event receiver temporarily borrowed by another thread");
+                    return Ok(None);
+                } else {
+                    return Err(PyRuntimeError::new_err("Runner not started"));
+                }
+            }
         };
 
         let runtime = self.runtime.clone();
         let timeout = Duration::from_millis(timeout_ms);
 
         // Release GIL during blocking wait - critical for multi-threaded Python
-        let result = py.allow_threads(move || {
+        let (result, rx) = py.allow_threads(move || {
             let _guard = runtime.enter();
-            runtime.block_on(async {
+            let result = runtime.block_on(async {
                 tokio::time::timeout(timeout, rx.recv()).await
-            })
+            });
+            (result, rx)
         });
+
+        // Put the receiver back for next call
+        *self.event_rx.lock() = Some(rx);
 
         match result {
             Ok(Ok(event)) => Ok(Some(event.into())),
-            Ok(Err(_)) => Ok(None), // Channel closed or lagged
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                tracing::warn!("Event receiver lagged, skipped {} events", n);
+                Ok(None)
+            }
+            Ok(Err(_)) => Ok(None), // Channel closed
             Err(_) => Ok(None),     // Timeout
         }
     }
@@ -882,9 +957,37 @@ impl PySipRunner {
     }
 }
 
+impl PySipRunner {
+    /// Internal stop without GIL release — used by Drop where no Python token is available.
+    /// During interpreter shutdown the GIL state is unpredictable, so we do direct blocking.
+    fn stop_inner(&self) {
+        if !*self.running.lock() {
+            return;
+        }
+
+        let _guard = self.runtime.enter();
+
+        if let Some(ref engine) = *self.engine.lock() {
+            let calls = engine.active_calls();
+            for call_id in calls {
+                let _ = self.runtime.block_on(engine.hangup(&call_id));
+            }
+            engine.stop();
+        }
+
+        *self.engine.lock() = None;
+        *self.event_rx.lock() = None;
+        *self.running.lock() = false;
+    }
+}
+
 impl Drop for PySipRunner {
     fn drop(&mut self) {
-        // Stop engine on drop
-        let _ = self.stop();
+        // Stop engine on drop. Wrap in catch_unwind to avoid panicking
+        // during Python interpreter shutdown when the runtime may already
+        // be partially torn down.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.stop_inner();
+        }));
     }
 }
