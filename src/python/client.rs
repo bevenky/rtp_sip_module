@@ -967,7 +967,10 @@ impl PySipRunner {
 
         let _guard = self.runtime.enter();
 
-        if let Some(ref engine) = *self.engine.lock() {
+        // R17: Clone the engine out of the lock before calling block_on
+        // to avoid holding the mutex across async operations.
+        let engine_opt = self.engine.lock().clone();
+        if let Some(ref engine) = engine_opt {
             let calls = engine.active_calls();
             for call_id in calls {
                 let _ = self.runtime.block_on(engine.hangup(&call_id));

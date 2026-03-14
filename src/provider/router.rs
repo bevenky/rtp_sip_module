@@ -126,6 +126,15 @@ impl ProviderRouter {
                         }
                     }
                 }
+                // R17: Skip providers that require registration but are not
+                // yet registered, matching the filter in route().
+                if p.register {
+                    if let Some(s) = stats.get(&p.id) {
+                        if !s.registered {
+                            return false;
+                        }
+                    }
+                }
                 true
             })
             .cloned()

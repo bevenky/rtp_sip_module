@@ -333,6 +333,9 @@ impl Sdp {
                             if let Ok(entry) = Self::parse_rtpmap(&value[7..]) {
                                 m.rtpmap.push(entry);
                             }
+                        } else if value.starts_with("ptime:") {
+                            // R17: Parse ptime attribute (packetization time)
+                            m.ptime = value[6..].trim().parse().ok();
                         } else if value.starts_with("fmtp:") {
                             // Bug #57: Parse fmtp lines (e.g., "fmtp:101 0-15")
                             if let Some((pt_str, params)) = value[5..].split_once(' ') {

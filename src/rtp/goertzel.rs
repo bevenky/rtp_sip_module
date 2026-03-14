@@ -309,6 +309,24 @@ impl GoertzelDtmfDetector {
                 if self.current_digit == Some(digit) {
                     self.detection_count += 1;
                 } else {
+                    // R17: On direct digit transition (no silence gap), emit
+                    // the previous digit if it was confirmed (digit_reported).
+                    // Without this, a direct transition like '1' -> '2' drops
+                    // digit '1' because it was never followed by silence.
+                    if self.digit_reported {
+                        if let Some(prev_digit) = self.current_digit {
+                            let duration_blocks = self.detection_count;
+                            let duration_ms = (duration_blocks as u64
+                                * self.block_size as u64
+                                * 1000
+                                / self.sample_rate as u64)
+                                as u32;
+                            self.detected.push(InbandDtmf {
+                                digit: prev_digit,
+                                duration_ms,
+                            });
+                        }
+                    }
                     // New digit or digit change
                     self.current_digit = Some(digit);
                     self.detection_count = 1;

@@ -264,6 +264,15 @@ impl JitterBuffer {
             }
         }
 
+        // R17: Duplicate detection BEFORE next_sequence update.
+        // Previously, the duplicate check was after the next_sequence update,
+        // which meant a duplicate packet would advance next_sequence even
+        // though it was discarded — corrupting gap/NACK calculations.
+        if self.packets.contains_key(&seq) {
+            self.stats.packets_duplicated += 1;
+            return;
+        }
+
         // Update next expected sequence
         // Bug #R10-2: Use !sequence_before instead of sequence_after so that
         // next_sequence is also updated when seq == next_sequence. Without this,
@@ -271,13 +280,6 @@ impl JitterBuffer {
         // spurious NACK requests for already-received packets.
         if self.next_sequence.is_none() || !Self::sequence_before(seq, self.next_sequence.unwrap()) {
             self.next_sequence = Some(seq.wrapping_add(1));
-        }
-
-        // P1-JB-3: Duplicate detection — if this sequence number is already
-        // in the buffer, discard the duplicate and count it.
-        if self.packets.contains_key(&seq) {
-            self.stats.packets_duplicated += 1;
-            return;
         }
 
         // Add to buffer
@@ -371,7 +373,9 @@ impl JitterBuffer {
             // Compare buffer fill vs target. If consistently high, the
             // remote clock is faster than ours (skip one packet to catch up).
             // If consistently low, remote clock is slower (insert PLC).
-            if self.stats.packets_received % 500 == 0 && self.stats.packets_received > 0 {
+            // R17: Use pop_count (playout cadence) instead of packets_received
+            // (arrival cadence) to detect drift relative to our own clock.
+            if self.pop_count % 500 == 0 && self.pop_count > 0 {
                 let fill = self.packets.len();
                 let target_pkts = (self.config.target_delay_ms as usize)
                     / ((self.config.samples_per_packet * 1000 / self.config.sample_rate) as usize).max(1);
@@ -382,7 +386,12 @@ impl JitterBuffer {
                     if self.drift_high_count >= 3 {
                         tracing::debug!("JB: clock drift detected (buffer overfull), skipping packet");
                         self.drift_high_count = 0;
-                        // The skipped packet will naturally be handled by the next pop
+                        // R17: Actually skip one packet by advancing last_played_sequence.
+                        // This causes the next pop() to target seq+2 instead of seq+1,
+                        // allowing playout to catch up with the remote clock.
+                        if let Some(lps) = self.last_played_sequence {
+                            self.last_played_sequence = Some(lps.wrapping_add(1));
+                        }
                     }
                 } else if fill < target_pkts.saturating_sub(2) && target_pkts > 2 {
                     self.drift_low_count += 1;

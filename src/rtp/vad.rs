@@ -1081,22 +1081,24 @@ mod tests {
 
     #[test]
     fn test_vad_single_sample_at_8khz() {
-        // Pure mean: sum=10000, n=1, energy=10000.
-        // But onset requires >1600 samples, so state stays None.
+        // Pure mean with DC correction: frame_avg=10000, dc_estimate=10000,
+        // dc_offset=10000/256=39, energy=|10000-39|=9961.
+        // Onset requires >1600 samples, so state stays None.
         let mut vad = VoiceActivityDetector::new(8000);
         let state = vad.process(&[10000]);
         assert_eq!(state, VadState::None);
-        assert_eq!(vad.last_energy(), 10000);
+        assert_eq!(vad.last_energy(), 9961);
     }
 
     #[test]
     fn test_vad_single_sample_at_16khz() {
-        // Pure mean: sum=10000, n=1, energy=10000 (same as 8kHz).
+        // Pure mean with DC correction: frame_avg=10000, dc_estimate=10000,
+        // dc_offset=10000/256=39, energy=|10000-39|=9961.
         // State stays None because onset needs >3200 samples.
         let mut vad = VoiceActivityDetector::new(16000);
         let state = vad.process(&[10000]);
         assert_eq!(state, VadState::None);
-        assert_eq!(vad.last_energy(), 10000);
+        assert_eq!(vad.last_energy(), 9961);
     }
 
     #[test]
@@ -1212,13 +1214,17 @@ mod tests {
     fn test_vad_energy_tracks_correctly() {
         let mut vad = VoiceActivityDetector::new(8000);
 
+        // DC correction: frame_avg=5000, dc_estimate=5000, dc_offset=5000/256=19.
+        // Energy = |5000 - 19| = 4981 for each sample.
         let loud = vec![5000i16; 160];
         vad.process(&loud);
-        assert_eq!(vad.last_energy(), 5000);
+        assert_eq!(vad.last_energy(), 4981);
 
+        // Second frame: dc_estimate = (5000*255)/256 + 50 = 4930+50 = 4980.
+        // dc_offset = 4980/256 = 19. Energy = |50 - 19| = 31.
         let quiet = vec![50i16; 160];
         vad.process(&quiet);
-        assert_eq!(vad.last_energy(), 50);
+        assert_eq!(vad.last_energy(), 31);
     }
 
     #[test]

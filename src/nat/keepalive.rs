@@ -194,12 +194,15 @@ impl NatKeepalive {
                                 // Bug #104: Read from shared state for consistency.
                                 if rebind_occurred.load(Ordering::SeqCst) {
                                     stable_count += 1;
-                                    // Bug #46: Sync shared stable count
-                                    *stable_count_since_rebind.lock() =
-                                        stable_count;
                                     if stable_count >= STABLE_THRESHOLD {
+                                        // R17: Lock effective_min BEFORE
+                                        // stable_count_since_rebind to match
+                                        // notify_stable() ordering and avoid
+                                        // deadlock.
                                         let mut eff =
                                             effective_min.lock();
+                                        let mut sc =
+                                            stable_count_since_rebind.lock();
                                         let increased =
                                             eff.mul_f64(1.25);
                                         *eff = increased
@@ -211,6 +214,8 @@ impl NatKeepalive {
                                             stable_count
                                         );
                                         stable_count = 0;
+                                        *sc = stable_count;
+                                    } else {
                                         // Bug #46: Sync shared stable count
                                         *stable_count_since_rebind.lock() =
                                             stable_count;

@@ -16,6 +16,9 @@ mod engine;
 mod jitter;
 mod packet;
 pub mod plc;
+pub mod goertzel;
+pub mod vad;
+pub mod media_tap;
 pub mod rtcp;
 pub mod srtp;
 

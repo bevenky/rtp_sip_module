@@ -155,6 +155,7 @@ impl StateValidator {
                 | (Trying, Answered)
                 | (Trying, Active)
                 | (Trying, Failed)
+                | (Trying, Terminating)
                 | (Trying, Terminated)
                 | (Trying, Ended)
                 | (Ringing, EarlyMedia)

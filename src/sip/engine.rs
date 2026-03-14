@@ -1588,14 +1588,25 @@ impl SipEngine {
                         });
                     }
                     DialogState::Info(_, request) => {
-                        // Incoming SIP INFO (DTMF)
-                        if let Ok(body_str) = std::str::from_utf8(request.body()) {
-                            if let Some((digit, duration)) = Self::parse_dtmf_relay(body_str) {
-                                let _ = engine.event_tx.send(CallEvent::DtmfReceived {
-                                    call_id: call_id_for_state.clone(),
-                                    digit,
-                                    duration,
-                                });
+                        // R17: Check Content-Type before parsing as DTMF
+                        let is_dtmf_content = request.headers.iter().any(|h| {
+                            if let rsip::Header::ContentType(ct) = h {
+                                let ct_lower = ct.to_string().to_ascii_lowercase();
+                                ct_lower.contains("dtmf")
+                            } else {
+                                false
+                            }
+                        });
+
+                        if is_dtmf_content {
+                            if let Ok(body_str) = std::str::from_utf8(request.body()) {
+                                if let Some((digit, duration)) = Self::parse_dtmf_relay(body_str) {
+                                    let _ = engine.event_tx.send(CallEvent::DtmfReceived {
+                                        call_id: call_id_for_state.clone(),
+                                        digit,
+                                        duration,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1639,12 +1650,31 @@ impl SipEngine {
                         }
                     }
                     DialogState::Terminated(_, reason) => {
+                        // R17: Release RTP port before removing the call
+                        let rtp_port = engine.calls.lock().get(&call_id_for_state)
+                            .and_then(|sess| {
+                                let sess = sess.lock();
+                                sess.rtp_engine.as_ref().map(|rtp| rtp.local_addr().port())
+                            });
+
+                        // R17: Stop session timer before removing the call
+                        if let Some(sess) = engine.calls.lock().get(&call_id_for_state) {
+                            let mut sess = sess.lock();
+                            if let Some(ref mut timer) = sess.session_timer {
+                                timer.stop();
+                            }
+                        }
+
                         // Bug #61 fix: Stop RTP engine before removing call from map
                         if let Some(sess) = engine.calls.lock().get(&call_id_for_state) {
                             let sess = sess.lock();
                             if let Some(ref rtp) = sess.rtp_engine {
                                 rtp.stop();
                             }
+                        }
+
+                        if let Some(port) = rtp_port {
+                            engine.release_rtp_port(port);
                         }
 
                         let reason_str = format!("{:?}", reason);
@@ -1862,7 +1892,7 @@ impl SipEngine {
             .cloned()
             .ok_or_else(|| RtpSipError::Session(format!("Call not found: {}", call_id)))?;
 
-        let server_dialog = {
+        let (server_dialog, rtp_port) = {
             let mut sess = session.lock();
 
             if sess.direction != Direction::Inbound {
@@ -1871,6 +1901,9 @@ impl SipEngine {
                 ));
             }
 
+            // R17: Extract RTP port before stopping for later release
+            let port = sess.rtp_engine.as_ref().map(|rtp| rtp.local_addr().port());
+
             // Stop RTP if started
             if let Some(ref rtp) = sess.rtp_engine {
                 rtp.stop();
@@ -1878,9 +1911,11 @@ impl SipEngine {
 
             sess.state = CallState::Ended;
 
-            sess.server_dialog.clone().ok_or_else(|| {
+            let dialog = sess.server_dialog.clone().ok_or_else(|| {
                 RtpSipError::Session("No server dialog for inbound call".to_string())
-            })?
+            })?;
+
+            (dialog, port)
         };
 
         // Convert status code to rsip StatusCode
@@ -1890,6 +1925,11 @@ impl SipEngine {
         server_dialog
             .reject(Some(sip_status), None)
             .map_err(|e| RtpSipError::Sip(format!("Failed to send rejection: {}", e)))?;
+
+        // R17: Release RTP port after rejection
+        if let Some(port) = rtp_port {
+            self.release_rtp_port(port);
+        }
 
         // Bug #97: Only remove from map after reject() succeeds
         self.calls.lock().remove(call_id);
@@ -2165,25 +2205,81 @@ impl SipEngine {
                                         tracing::debug!("Registration refreshed for provider {}", provider_id);
                                     }
                                 }
+                                // R17: Handle 401/407 by re-attempting with credentials
+                                Ok(resp) if resp.status_code == rsip::StatusCode::Unauthorized
+                                    || resp.status_code == rsip::StatusCode::ProxyAuthenticationRequired => {
+                                    tracing::warn!(
+                                        "Registration refresh got {} for provider {}, re-attempting with credentials",
+                                        resp.status_code, provider_id
+                                    );
+                                    // The Registration object already has credentials,
+                                    // so a simple retry should include auth headers.
+                                    let retry_result = reg.lock().await.register(registrar_uri_clone, None).await;
+                                    match retry_result {
+                                        Ok(retry_resp) if retry_resp.status_code == rsip::StatusCode::OK => {
+                                            engine.registration_states.lock().insert(provider_id.clone(), RegistrationState::Registered);
+                                            tracing::debug!("Registration refreshed after auth challenge for provider {}", provider_id);
+                                        }
+                                        Ok(retry_resp) => {
+                                            let err_msg = format!(
+                                                "Registration refresh retry after auth challenge failed with status: {}",
+                                                retry_resp.status_code
+                                            );
+                                            tracing::error!("{}", err_msg);
+                                            engine.registration_states.lock().insert(provider_id.clone(), RegistrationState::Failed(err_msg.clone()));
+                                            let _ = engine.event_tx.send(CallEvent::RegistrationChanged {
+                                                state: "failed".to_string(),
+                                                error: Some(err_msg),
+                                            });
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            let err_msg = format!("Registration refresh retry after auth challenge failed: {}", e);
+                                            tracing::error!("{}", err_msg);
+                                            engine.registration_states.lock().insert(provider_id.clone(), RegistrationState::Failed(err_msg.clone()));
+                                            let _ = engine.event_tx.send(CallEvent::RegistrationChanged {
+                                                state: "failed".to_string(),
+                                                error: Some(err_msg),
+                                            });
+                                            break;
+                                        }
+                                    }
+                                }
                                 Ok(resp) => {
-                                    let err_msg = format!("Registration refresh failed with status: {}", resp.status_code);
-                                    tracing::error!("{}", err_msg);
-                                    engine.registration_states.lock().insert(provider_id.clone(), RegistrationState::Failed(err_msg.clone()));
-                                    let _ = engine.event_tx.send(CallEvent::RegistrationChanged {
-                                        state: "failed".to_string(),
-                                        error: Some(err_msg),
-                                    });
-                                    break;
+                                    let status_num = u16::from(resp.status_code.clone());
+                                    // R17: 5xx responses are transient — use exponential backoff
+                                    if status_num >= 500 && status_num < 600 {
+                                        tracing::warn!(
+                                            "Registration refresh got {} for provider {}, will retry with backoff",
+                                            resp.status_code, provider_id
+                                        );
+                                        // Exponential backoff: 5s, 10s, 20s, up to 60s
+                                        let current = refresh_interval.lock().as_secs();
+                                        let backoff = (current.max(5) * 2).min(60);
+                                        *refresh_interval.lock() = std::time::Duration::from_secs(backoff);
+                                        // Don't break — continue the loop and retry
+                                    } else {
+                                        // 4xx (except 401/407/423 handled above) are definitive failures
+                                        let err_msg = format!("Registration refresh failed with status: {}", resp.status_code);
+                                        tracing::error!("{}", err_msg);
+                                        engine.registration_states.lock().insert(provider_id.clone(), RegistrationState::Failed(err_msg.clone()));
+                                        let _ = engine.event_tx.send(CallEvent::RegistrationChanged {
+                                            state: "failed".to_string(),
+                                            error: Some(err_msg),
+                                        });
+                                        break;
+                                    }
                                 }
                                 Err(e) => {
-                                    let err_msg = format!("Registration refresh failed: {}", e);
-                                    tracing::error!("{}", err_msg);
-                                    engine.registration_states.lock().insert(provider_id.clone(), RegistrationState::Failed(err_msg.clone()));
-                                    let _ = engine.event_tx.send(CallEvent::RegistrationChanged {
-                                        state: "failed".to_string(),
-                                        error: Some(err_msg),
-                                    });
-                                    break;
+                                    // R17: Transport/timeout errors are transient — exponential backoff
+                                    tracing::warn!(
+                                        "Registration refresh failed for provider {}: {}, will retry with backoff",
+                                        provider_id, e
+                                    );
+                                    let current = refresh_interval.lock().as_secs();
+                                    let backoff = (current.max(5) * 2).min(60);
+                                    *refresh_interval.lock() = std::time::Duration::from_secs(backoff);
+                                    // Don't break — continue the loop and retry
                                 }
                             }
                         } else {
@@ -2939,15 +3035,26 @@ impl SipEngine {
                         });
                     }
                     DialogState::Info(_, request) => {
-                        // Incoming SIP INFO (may contain DTMF)
-                        if let Ok(body_str) = std::str::from_utf8(request.body()) {
-                            // Parse DTMF relay format: Signal=X\r\nDuration=Y\r\n
-                            if let Some((digit, duration)) = Self::parse_dtmf_relay(body_str) {
-                                let _ = engine_for_state.event_tx.send(CallEvent::DtmfReceived {
-                                    call_id: call_id_for_state.clone(),
-                                    digit,
-                                    duration,
-                                });
+                        // R17: Check Content-Type before parsing as DTMF
+                        let is_dtmf_content = request.headers.iter().any(|h| {
+                            if let rsip::Header::ContentType(ct) = h {
+                                let ct_lower = ct.to_string().to_ascii_lowercase();
+                                ct_lower.contains("dtmf")
+                            } else {
+                                false
+                            }
+                        });
+
+                        if is_dtmf_content {
+                            if let Ok(body_str) = std::str::from_utf8(request.body()) {
+                                // Parse DTMF relay format: Signal=X\r\nDuration=Y\r\n
+                                if let Some((digit, duration)) = Self::parse_dtmf_relay(body_str) {
+                                    let _ = engine_for_state.event_tx.send(CallEvent::DtmfReceived {
+                                        call_id: call_id_for_state.clone(),
+                                        digit,
+                                        duration,
+                                    });
+                                }
                             }
                         }
                     }
@@ -3107,12 +3214,31 @@ impl SipEngine {
                         // by the redirect handler above, in which case the calls.get()
                         // below will return None and we'll just break.
 
+                        // R17: Release RTP port before removing the call
+                        let rtp_port = engine_for_state.calls.lock().get(&call_id_for_state)
+                            .and_then(|sess| {
+                                let sess = sess.lock();
+                                sess.rtp_engine.as_ref().map(|rtp| rtp.local_addr().port())
+                            });
+
+                        // R17: Stop session timer before removing the call
+                        if let Some(sess) = engine_for_state.calls.lock().get(&call_id_for_state) {
+                            let mut sess = sess.lock();
+                            if let Some(ref mut timer) = sess.session_timer {
+                                timer.stop();
+                            }
+                        }
+
                         // Bug #61 fix: Stop RTP engine before removing call from map
                         if let Some(sess) = engine_for_state.calls.lock().get(&call_id_for_state) {
                             let sess = sess.lock();
                             if let Some(ref rtp) = sess.rtp_engine {
                                 rtp.stop();
                             }
+                        }
+
+                        if let Some(port) = rtp_port {
+                            engine_for_state.release_rtp_port(port);
                         }
 
                         // Bug #96 fix: Send Hangup event BEFORE removing the call

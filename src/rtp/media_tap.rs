@@ -280,6 +280,7 @@ impl Default for MediaTapManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_tap_direction_includes() {
@@ -342,14 +343,16 @@ mod tests {
 
         // Rx tap should receive
         let frame1 = rx1.try_recv().unwrap();
-        assert_eq!(frame1.samples, vec![100, 200, 300]);
+        let expected: Arc<[i16]> = vec![100i16, 200, 300].into();
+        assert_eq!(frame1.samples, expected);
         assert_eq!(frame1.sample_rate, 8000);
         assert_eq!(frame1.timestamp, 1000);
         assert_eq!(frame1.direction, TapDirection::Rx);
 
         // Both tap should receive
         let frame2 = rx2.try_recv().unwrap();
-        assert_eq!(frame2.samples, vec![100, 200, 300]);
+        let expected2: Arc<[i16]> = vec![100i16, 200, 300].into();
+        assert_eq!(frame2.samples, expected2);
         assert_eq!(frame2.direction, TapDirection::Rx);
 
         // Tx-only tap should NOT receive Rx frames
@@ -372,12 +375,14 @@ mod tests {
 
         // Both tap should receive
         let frame2 = rx2.try_recv().unwrap();
-        assert_eq!(frame2.samples, vec![400, 500, 600]);
+        let expected_tx: Arc<[i16]> = vec![400i16, 500, 600].into();
+        assert_eq!(frame2.samples, expected_tx);
         assert_eq!(frame2.direction, TapDirection::Tx);
 
         // Tx tap should receive
         let frame3 = rx3.try_recv().unwrap();
-        assert_eq!(frame3.samples, vec![400, 500, 600]);
+        let expected_tx2: Arc<[i16]> = vec![400i16, 500, 600].into();
+        assert_eq!(frame3.samples, expected_tx2);
         assert_eq!(frame3.timestamp, 2000);
         assert_eq!(frame3.direction, TapDirection::Tx);
     }
@@ -411,15 +416,18 @@ mod tests {
 
         let f1 = rx.try_recv().unwrap();
         assert_eq!(f1.direction, TapDirection::Rx);
-        assert_eq!(f1.samples, vec![1, 2]);
+        let e1: Arc<[i16]> = vec![1i16, 2].into();
+        assert_eq!(f1.samples, e1);
 
         let f2 = rx.try_recv().unwrap();
         assert_eq!(f2.direction, TapDirection::Tx);
-        assert_eq!(f2.samples, vec![3, 4]);
+        let e2: Arc<[i16]> = vec![3i16, 4].into();
+        assert_eq!(f2.samples, e2);
 
         let f3 = rx.try_recv().unwrap();
         assert_eq!(f3.direction, TapDirection::Rx);
-        assert_eq!(f3.samples, vec![5, 6]);
+        let e3: Arc<[i16]> = vec![5i16, 6].into();
+        assert_eq!(f3.samples, e3);
     }
 
     #[test]

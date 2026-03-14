@@ -135,8 +135,21 @@ impl SessionManager {
     }
 
     /// Add a session
+    ///
+    /// R17: If a session with the same call_id already exists, stop its RTP
+    /// engine before replacing to avoid resource leaks.
     pub fn add_session(&self, session: CallSession) {
         let call_id = session.call_id.clone();
+        if let Some(existing) = self.sessions.get(&call_id) {
+            let sess = existing.lock();
+            if let Some(ref rtp) = sess.rtp_engine {
+                tracing::warn!(
+                    call_id = %call_id,
+                    "add_session: replacing existing session, stopping its RTP engine"
+                );
+                rtp.stop();
+            }
+        }
         self.sessions.insert(call_id, Arc::new(parking_lot::Mutex::new(session)));
     }
 
@@ -192,14 +205,15 @@ impl SessionManager {
             let mut sess = session.lock();
             let old_state = sess.state;
 
-            // P1-STATE-1: Validate transition
+            // P1-STATE-1: Validate transition — reject invalid ones
             if !StateValidator::can_transition(old_state, new_state) {
                 tracing::warn!(
                     call_id = call_id,
                     from = old_state.as_str(),
                     to = new_state.as_str(),
-                    "invalid state transition"
+                    "invalid state transition, ignoring"
                 );
+                return;
             }
 
             sess.set_state(new_state);

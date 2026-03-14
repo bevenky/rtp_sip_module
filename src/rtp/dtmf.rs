@@ -389,6 +389,12 @@ pub struct RtpBugFlags {
     /// Some Cisco devices do not set the marker bit on the first DTMF packet.
     /// When this flag is set, new-digit detection on receive uses timestamp
     /// change as the primary signal instead of the marker bit.
+    ///
+    /// R17 note: This flag is a documented no-op. The DtmfDetector already
+    /// uses timestamp-based new-digit detection as the default behavior
+    /// (see `process_rtp`: `if timestamp != self.last_in_digit_ts`). The
+    /// flag is retained for API compatibility and to document that Cisco
+    /// interop has been considered.
     pub cisco_skip_marker_2833: bool,
 
     /// P2-DTMF-7: Ignore the marker bit entirely on received audio packets.
@@ -475,6 +481,10 @@ impl RtpBugFlags {
         self.never_send_marker |= other.never_send_marker;
         self.ignore_duration |= other.ignore_duration;
         self.cisco_skip_marker_2833 |= other.cisco_skip_marker_2833;
+        // R17: Include the 3 fields that were missing from merge().
+        self.ignore_mark_bit |= other.ignore_mark_bit;
+        self.change_ssrc_on_marker |= other.change_ssrc_on_marker;
+        self.accept_any_payload |= other.accept_any_payload;
     }
 }
 

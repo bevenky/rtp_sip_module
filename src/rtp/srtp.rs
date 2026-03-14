@@ -350,18 +350,29 @@ pub struct SrtpContext {
     current_recv_ssrc: Option<u32>,
 }
 
+/// Securely zero a byte buffer using volatile writes + compiler fence
+/// to prevent the compiler from optimizing away the zeroing.
+fn secure_zero(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        unsafe { std::ptr::write_volatile(byte as *mut u8, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Bug #81: Zeroize SRTP key material on drop to prevent sensitive keys from
 /// lingering in memory after the context is no longer needed.
+/// P0-1: Uses secure_zero with write_volatile + compiler_fence to prevent
+/// the compiler from optimizing away the zeroing.
 impl Drop for SrtpContext {
     fn drop(&mut self) {
-        self.master_key.fill(0);
-        self.master_salt.fill(0);
-        self.rtp_keys.enc_key.fill(0);
-        self.rtp_keys.auth_key.fill(0);
-        self.rtp_keys.salt.fill(0);
-        self.rtcp_keys.enc_key.fill(0);
-        self.rtcp_keys.auth_key.fill(0);
-        self.rtcp_keys.salt.fill(0);
+        secure_zero(&mut self.master_key);
+        secure_zero(&mut self.master_salt);
+        secure_zero(&mut self.rtp_keys.enc_key);
+        secure_zero(&mut self.rtp_keys.auth_key);
+        secure_zero(&mut self.rtp_keys.salt);
+        secure_zero(&mut self.rtcp_keys.enc_key);
+        secure_zero(&mut self.rtcp_keys.auth_key);
+        secure_zero(&mut self.rtcp_keys.salt);
     }
 }
 
@@ -573,25 +584,14 @@ impl SrtpContext {
         let seq = u16::from_be_bytes([packet[2], packet[3]]);
         let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
 
-        // P1-SRTP-7: Detect SSRC change and reset receiver state.
-        // A new SSRC indicates a different media source (e.g., re-INVITE,
-        // transfer, or SSRC collision recovery). The old replay window and
-        // ROC are meaningless for the new SSRC.
-        if let Some(prev_ssrc) = self.current_recv_ssrc {
-            if ssrc != prev_ssrc {
-                tracing::info!(
-                    "SRTP: SSRC changed from {:#010x} to {:#010x}, resetting receiver state",
-                    prev_ssrc,
-                    ssrc
-                );
-                self.replay_window = 0;
-                self.replay_window_base = 0;
-                self.s_l = 0;
-                self.roc = 0;
-                self.initialized = false;
-            }
-        }
-        self.current_recv_ssrc = Some(ssrc);
+        // R17-SRTP-P1-4: SSRC change detection is performed AFTER authentication
+        // succeeds. Previously, SSRC change detection happened before auth, which
+        // allowed an attacker to reset the replay window by sending a single
+        // spoofed packet with a different SSRC. Now we:
+        // 1. First try auth with current state
+        // 2. If auth fails and SSRC changed, retry with reset state (legitimate change)
+        // 3. Only commit the SSRC change after successful authentication
+        let ssrc_changed = self.current_recv_ssrc.map_or(false, |prev| prev != ssrc);
 
         // Estimate ROC for incoming packet (RFC 3711 Section 3.3.1)
         let estimated_roc = self.estimate_roc(seq);
@@ -599,7 +599,8 @@ impl SrtpContext {
 
         // Replay protection (P1-SRTP-5: use generic error message,
         // P1-SRTP-6: do NOT count replay rejections toward error threshold)
-        if self.initialized && !self.check_replay(index) {
+        // Skip replay check if SSRC changed (will re-check after auth with reset state)
+        if self.initialized && !ssrc_changed && !self.check_replay(index) {
             return Err(RtpSipError::Rtp("SRTP packet rejected".to_string()));
         }
 
@@ -617,7 +618,29 @@ impl SrtpContext {
             auth_tag_len,
         );
 
-        if !constant_time_eq(&computed_tag, received_tag) {
+        let (auth_ok, final_index, final_roc) = if constant_time_eq(&computed_tag, received_tag) {
+            (true, index, estimated_roc)
+        } else if ssrc_changed {
+            // Auth failed with current state — try with reset ROC (SSRC changed,
+            // so the old ROC is meaningless). Use ROC=0 for the new SSRC.
+            let reset_roc = 0u32;
+            let reset_index = ((reset_roc as u64) << 16) | (seq as u64);
+            let retry_tag = compute_rtp_auth_tag(
+                &self.rtp_keys.auth_key,
+                auth_data,
+                reset_roc,
+                auth_tag_len,
+            );
+            if constant_time_eq(&retry_tag, received_tag) {
+                (true, reset_index, reset_roc)
+            } else {
+                (false, index, estimated_roc)
+            }
+        } else {
+            (false, index, estimated_roc)
+        };
+
+        if !auth_ok {
             self.handle_unprotect_error();
             return Err(RtpSipError::Rtp("SRTP packet rejected".to_string()));
         }
@@ -625,13 +648,31 @@ impl SrtpContext {
         // auth_data already excludes MKI, so it is the encrypted RTP data
         let encrypted_data = auth_data;
 
+        // P1-SRTP-7: Now that authentication has passed, commit SSRC change
+        // and reset receiver replay state. This is safe because only
+        // authenticated packets can trigger the reset.
+        if ssrc_changed {
+            let prev_ssrc = self.current_recv_ssrc.unwrap();
+            tracing::info!(
+                "SRTP: SSRC changed from {:#010x} to {:#010x}, resetting receiver state (authenticated)",
+                prev_ssrc,
+                ssrc
+            );
+            self.replay_window = 0;
+            self.replay_window_base = 0;
+            self.s_l = 0;
+            self.roc = 0;
+            self.initialized = false;
+        }
+        self.current_recv_ssrc = Some(ssrc);
+
         // Bug #14: Update ROC/s_l and replay window AFTER auth passes but BEFORE
         // header parsing. This prevents replay of authenticated packets if header
         // parsing fails (e.g., malformed extension headers). An authenticated
         // packet is genuine even if its header is unparseable, so it must be
         // consumed from the replay window.
-        self.update_roc_recv(seq, estimated_roc);
-        self.accept_replay(index);
+        self.update_roc_recv(seq, final_roc);
+        self.accept_replay(final_index);
 
         // Decrypt payload
         let header_len = rtp_header_len(encrypted_data)?;
@@ -641,7 +682,7 @@ impl SrtpContext {
             &self.rtp_keys.enc_key,
             &self.rtp_keys.salt,
             ssrc,
-            index,
+            final_index,
             payload,
         );
 

@@ -25,7 +25,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
@@ -219,15 +219,31 @@ const RTCP_PT_MIN: u8 = 200;
 /// Bug #25: Include RTCP-FB (205), PSFB (206), XR (207), and registered types up to 211
 const RTCP_PT_MAX_RANGE: u8 = 211;
 
-/// Check whether a packet is RTCP based on the second byte (payload type).
+/// Check whether a packet is RTCP based on the second byte (payload type)
+/// and RTCP length field consistency (P0-7).
+///
 /// RTCP uses the full 8-bit PT field in byte 1 (values 200-211 per RFC 5761 §4),
 /// including RTPFB (205, RFC 4585) and PSFB (206, RFC 4585).
+///
+/// P0-7: In addition to the PT range check, validate that the RTCP length field
+/// (bytes 2-3, in 32-bit words minus 1) is consistent with the actual packet
+/// size. This prevents misclassifying RTP packets whose payload type happens
+/// to fall in the 200-211 range.
 fn is_rtcp_packet(data: &[u8]) -> bool {
-    if data.len() < 2 {
+    if data.len() < 4 {
         return false;
     }
     let pt_byte = data[1];
-    pt_byte >= RTCP_PT_MIN && pt_byte <= RTCP_PT_MAX_RANGE
+    if pt_byte < RTCP_PT_MIN || pt_byte > RTCP_PT_MAX_RANGE {
+        return false;
+    }
+    // RTCP length field: number of 32-bit words in this packet minus 1.
+    // The total packet size should be (length + 1) * 4.
+    let rtcp_length = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let expected_bytes = (rtcp_length + 1) * 4;
+    // For compound RTCP, the first sub-packet's length should be <= total.
+    // Allow the packet to be larger (compound RTCP) but not smaller.
+    data.len() >= expected_bytes
 }
 
 /// RTP Engine configuration
@@ -406,6 +422,26 @@ pub struct RtpEngine {
     // === P1-RTP-9: Playout timer for PLC ===
     /// Timestamp of last playout tick (for timer-driven PLC)
     last_playout_tick: Mutex<Option<Instant>>,
+
+    // === P0-5: Symmetric RTP integration ===
+    /// Symmetric RTP handler for learning remote address from incoming packets
+    symmetric_rtp: Option<Mutex<crate::nat::SymmetricRtp>>,
+
+    // === P0-6: SRTP integration ===
+    /// SRTP context for send direction (encrypt outgoing)
+    srtp_send: Option<Mutex<crate::rtp::srtp::SrtpContext>>,
+    /// SRTP context for receive direction (decrypt incoming)
+    srtp_recv: Option<Mutex<crate::rtp::srtp::SrtpContext>>,
+
+    // === P0-8: ROC tracking ===
+    /// Rollover counter for sequence number wraparound detection
+    roc: AtomicU32,
+    /// Highest sequence number seen (for ROC wraparound detection)
+    highest_seq: AtomicU16,
+
+    // === P0-9: RTCP session ===
+    /// RTCP session for SR/RR/SDES/BYE/XR handling
+    rtcp_session: Arc<Mutex<crate::rtp::rtcp::RtcpSession>>,
 }
 
 impl RtpEngine {
@@ -479,6 +515,23 @@ impl RtpEngine {
             hold_media_timeout_ms,
             is_on_hold: AtomicBool::new(false),
             last_playout_tick: Mutex::new(None),
+
+            // P0-5: Symmetric RTP (threshold=3 for fast learning)
+            symmetric_rtp: Some(Mutex::new(crate::nat::SymmetricRtp::new(3))),
+
+            // P0-6: SRTP contexts (None until configured via set_srtp)
+            srtp_send: None,
+            srtp_recv: None,
+
+            // P0-8: ROC tracking
+            roc: AtomicU32::new(0),
+            highest_seq: AtomicU16::new(0),
+
+            // P0-9: RTCP session
+            rtcp_session: Arc::new(Mutex::new(crate::rtp::rtcp::RtcpSession::new(
+                ssrc,
+                format!("rtpsip-{}", ssrc),
+            ))),
         })
     }
 
@@ -681,6 +734,24 @@ impl RtpEngine {
         self.force_marker.store(true, Ordering::Relaxed);
     }
 
+    // ========== P0-6: SRTP ==========
+
+    /// Set SRTP contexts for send and receive directions.
+    /// Each direction must have its own SrtpContext instance.
+    pub fn set_srtp(
+        &mut self,
+        send_ctx: crate::rtp::srtp::SrtpContext,
+        recv_ctx: crate::rtp::srtp::SrtpContext,
+    ) {
+        self.srtp_send = Some(Mutex::new(send_ctx));
+        self.srtp_recv = Some(Mutex::new(recv_ctx));
+    }
+
+    /// Get a reference to the RTCP session (P0-9).
+    pub fn rtcp_session(&self) -> &Arc<Mutex<crate::rtp::rtcp::RtcpSession>> {
+        &self.rtcp_session
+    }
+
     // ========== Core Engine Methods ==========
 
     /// Start the receive loop
@@ -756,6 +827,22 @@ impl RtpEngine {
                             continue;
                         }
 
+                        // P0-5: Symmetric RTP — feed source address to learn remote
+                        // endpoint from incoming packets. If address changed, update
+                        // remote_addr so subsequent sends go to the right place.
+                        if let Some(ref sym_rtp) = engine.symmetric_rtp {
+                            let changed = sym_rtp.lock().process_incoming(src_addr);
+                            if changed {
+                                if let Some(learned) = sym_rtp.lock().effective_remote() {
+                                    *engine.remote_addr.lock() = Some(learned);
+                                    tracing::info!(
+                                        new_remote = %learned,
+                                        "Symmetric RTP learned new remote address"
+                                    );
+                                }
+                            }
+                        }
+
                         // P1-RTP-4: Source address validation — when symmetric RTP
                         // is not in use (remote_addr is set), validate that the
                         // source address matches the expected remote. Drop packets
@@ -777,18 +864,31 @@ impl RtpEngine {
                         // The full byte is used (no masking) because RTCP PT values (>=200)
                         // have bit 7 set and masking with 0x7F would prevent identification.
                         if engine.rtcp_mux.load(Ordering::Relaxed) && is_rtcp_packet(data) {
-                            // Bug #24: Log RTCP packet type instead of silently dropping.
-                            // TODO: Forward RTCP to RtcpSession for SR/RR/BYE processing
                             let rtcp_pt = data[1];
                             tracing::debug!(
                                 rtcp_payload_type = rtcp_pt,
                                 len = data.len(),
-                                "Received RTCP packet on muxed port (not yet processed)"
+                                "Received RTCP packet on muxed port"
                             );
+                            // P0-9: Forward RTCP to RtcpSession for SR/RR/BYE processing
+                            engine.rtcp_session.lock().process_incoming_rtcp(data);
                             continue;
                         }
 
-                        if let Ok(mut packet) = parse_rtp_packet(data) {
+                        // P0-6: SRTP decrypt — unprotect the packet before parsing
+                        let rtp_data = if let Some(ref srtp_recv) = engine.srtp_recv {
+                            match srtp_recv.lock().unprotect_rtp(data) {
+                                Ok(decrypted) => decrypted,
+                                Err(e) => {
+                                    tracing::debug!("SRTP unprotect failed: {}", e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            data.to_vec()
+                        };
+
+                        if let Ok(mut packet) = parse_rtp_packet(&rtp_data) {
                             // Bug #12: Reject packets with invalid RTP version
                             if packet.header.version != 2 {
                                 continue;
@@ -848,6 +948,26 @@ impl RtpEngine {
                                 }
                             }
 
+                            // P0-8: ROC tracking — detect sequence wraparound
+                            {
+                                let seq = packet.header.sequence_number;
+                                let prev_highest = engine.highest_seq.load(Ordering::Relaxed);
+                                if seq < prev_highest && (prev_highest - seq) > 0x8000 {
+                                    // Forward wraparound detected
+                                    engine.roc.fetch_add(1, Ordering::Relaxed);
+                                }
+                                if seq > prev_highest || (prev_highest > 0x8000 && seq < 0x8000 && (prev_highest - seq) > 0x8000) {
+                                    engine.highest_seq.store(seq, Ordering::Relaxed);
+                                }
+                            }
+
+                            // P0-9: Record RTP received in RTCP session
+                            engine.rtcp_session.lock().record_rtp_received(
+                                pkt_ssrc,
+                                packet.header.sequence_number,
+                                packet.header.timestamp,
+                            );
+
                             // Check if this is a DTMF packet (RFC 2833)
                             if dtmf_enabled && pt == dtmf_pt {
                                 // Route to DTMF detector
@@ -857,6 +977,11 @@ impl RtpEngine {
                                     packet.header.timestamp,
                                     &packet.payload,
                                 ) {
+                                    // R17: flush_jb_on_dtmf — reset jitter buffer when
+                                    // DTMF is detected to reduce delay for subsequent audio
+                                    if engine.config.flush_jb_on_dtmf {
+                                        engine.jitter_buffer.lock().reset();
+                                    }
                                     // P2-RTP-8: Warn when DTMF queue is full instead of
                                     // silently dropping the detected digit.
                                     if let Err(mpsc::error::TrySendError::Full(dropped)) = dtmf_tx.try_send(detected) {
@@ -1083,12 +1208,57 @@ impl RtpEngine {
             }
         });
 
+        // P0-9: Spawn RTCP send task — sends RTCP reports every ~5s
+        {
+            let engine_rtcp = self.clone();
+            tokio::spawn(async move {
+                while engine_rtcp.running.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if engine_rtcp.rtcp_session.lock().should_send_rtcp() {
+                        let mut rtcp_buf = vec![0u8; 512];
+                        let rtcp_len = engine_rtcp.rtcp_session.lock().build_rtcp(&mut rtcp_buf);
+                        if rtcp_len > 0 {
+                            if let Some(remote) = engine_rtcp.remote_addr() {
+                                let send_data = &rtcp_buf[..rtcp_len];
+                                // P0-6: SRTP protect RTCP if SRTP is configured
+                                let rtcp_data = if let Some(ref srtp_send) = engine_rtcp.srtp_send {
+                                    match srtp_send.lock().protect_rtcp(send_data) {
+                                        Ok(protected) => protected,
+                                        Err(e) => {
+                                            tracing::debug!("SRTCP protect failed: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    send_data.to_vec()
+                                };
+                                let _ = engine_rtcp.socket.send_to(&rtcp_data, remote).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
     /// Stop the engine
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+
+        // P0-9: Build RTCP BYE packet for graceful session teardown.
+        // Note: This is a sync context so we can't send it here. The BYE
+        // is built and logged; callers who need to send it should use
+        // stop_async() instead, or the RTCP task will detect running=false
+        // and stop sending.
+        {
+            let mut bye_buf = vec![0u8; 128];
+            let bye_len = self.rtcp_session.lock().build_bye(&mut bye_buf, Some("session ended"));
+            if bye_len > 0 {
+                tracing::debug!("RTCP BYE prepared ({} bytes)", bye_len);
+            }
+        }
 
         // === Fix 27: Release allocated port back to the pool ===
         // Bug #95: parking_lot::Mutex never poisons, so just .lock()
@@ -1132,7 +1302,20 @@ impl RtpEngine {
 
         // Serialize and send
         let data = serialize_rtp_packet(&packet)?;
-        self.socket.send_to(&data, remote).await?;
+
+        // P0-6: SRTP protect — encrypt outgoing RTP packet
+        let send_data: Vec<u8> = if let Some(ref srtp_send) = self.srtp_send {
+            srtp_send.lock().protect_rtp(&data)?
+        } else {
+            data.to_vec()
+        };
+        self.socket.send_to(&send_data, remote).await?;
+
+        // P0-9: Record RTP sent in RTCP session
+        self.rtcp_session.lock().record_rtp_sent(
+            packet.payload.len() as u32,
+            packet.header.timestamp,
+        );
 
         // Track last audio send time for silence-when-idle (Fix 14)
         *self.last_audio_sent.lock() = Some(Instant::now());
@@ -1159,7 +1342,20 @@ impl RtpEngine {
             .build_with_marker(Bytes::from(encoded), samples.len() as u32, effective_marker);
 
         let data = serialize_rtp_packet(&packet)?;
-        self.socket.send_to(&data, remote).await?;
+
+        // P0-6: SRTP protect — encrypt outgoing RTP packet
+        let send_data: Vec<u8> = if let Some(ref srtp_send) = self.srtp_send {
+            srtp_send.lock().protect_rtp(&data)?
+        } else {
+            data.to_vec()
+        };
+        self.socket.send_to(&send_data, remote).await?;
+
+        // P0-9: Record RTP sent in RTCP session
+        self.rtcp_session.lock().record_rtp_sent(
+            packet.payload.len() as u32,
+            packet.header.timestamp,
+        );
 
         // Track last audio send time for silence-when-idle (Fix 14)
         *self.last_audio_sent.lock() = Some(Instant::now());
@@ -1223,15 +1419,19 @@ impl RtpEngine {
         // instead of using the audio packet builder and retroactively changing PT.
         // Use the last audio timestamp rather than advancing the audio sequence,
         // so CN packets don't consume audio timestamp/sequence space.
+        // R17: Advance the sequence number so that CN packets don't reuse
+        // the same seq as the next audio packet. This prevents receivers from
+        // seeing duplicate sequence numbers.
         let cn_packet = {
-            let pb = self.packet_builder.lock();
+            let mut pb = self.packet_builder.lock();
+            let seq = pb.next_sequence();
             let header = rtp::header::Header {
                 version: 2,
                 padding: false,
                 extension: false,
                 marker: is_first_cn,
                 payload_type: CN_PAYLOAD_TYPE,
-                sequence_number: pb.sequence(),
+                sequence_number: seq,
                 timestamp: pb.timestamp(),
                 ssrc: pb.ssrc(),
                 csrc: vec![],

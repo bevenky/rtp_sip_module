@@ -1254,7 +1254,9 @@ impl RtcpSession {
         }
 
         self.last_rtcp_sent = Instant::now();
-        self.rtcp_interval = Self::randomized_interval(Duration::from_secs(5));
+        // R17: Use compute_bandwidth_interval() instead of hardcoded 5s base.
+        // This respects the configured bandwidth fraction and participant count.
+        self.rtcp_interval = self.compute_bandwidth_interval();
 
         // Save current counters for next loss calculation
         self.last_rr_packets_received = self.packets_received;
