@@ -37,12 +37,15 @@ use crate::error::{Result, RtpSipError};
 use md5::{Digest as Md5Digest, Md5};
 use sha2::Sha256;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// Hash algorithm for digest computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestAlgorithm {
     /// MD5 — RFC 2617 default, most common in SIP
     Md5,
+    /// MD5-sess — RFC 2617 session variant, HA1 includes nonce and cnonce
+    Md5Sess,
     /// SHA-256 — RFC 7616, preferred for new deployments
     Sha256,
 }
@@ -52,11 +55,11 @@ impl DigestAlgorithm {
     /// Returns `Md5` if absent or unrecognized (per RFC 2617 Section 3.2.1).
     fn parse(s: &str) -> Self {
         let lower = s.trim().to_ascii_lowercase();
-        // Match common representations
         if lower == "sha-256" || lower == "sha256" {
             DigestAlgorithm::Sha256
+        } else if lower == "md5-sess" {
+            DigestAlgorithm::Md5Sess
         } else {
-            // MD5 is the default per RFC 2617
             DigestAlgorithm::Md5
         }
     }
@@ -66,6 +69,7 @@ impl fmt::Display for DigestAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DigestAlgorithm::Md5 => write!(f, "MD5"),
+            DigestAlgorithm::Md5Sess => write!(f, "MD5-sess"),
             DigestAlgorithm::Sha256 => write!(f, "SHA-256"),
         }
     }
@@ -93,10 +97,29 @@ impl fmt::Display for Qop {
 /// Determines which response header to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthHeaderType {
-    /// 401 Unauthorized → respond with `Authorization`
+    /// 401 Unauthorized -> respond with `Authorization`
     Authorization,
-    /// 407 Proxy Authentication Required → respond with `Proxy-Authorization`
+    /// 407 Proxy Authentication Required -> respond with `Proxy-Authorization`
     ProxyAuthorization,
+}
+
+impl AuthHeaderType {
+    /// P2-AUTH-1: Get the SIP header name for this auth type.
+    /// Returns the header name that should be used in the response.
+    pub fn header_name(&self) -> &'static str {
+        match self {
+            AuthHeaderType::Authorization => "Authorization",
+            AuthHeaderType::ProxyAuthorization => "Proxy-Authorization",
+        }
+    }
+
+    /// Get the challenge header name that corresponds to this auth type.
+    pub fn challenge_header_name(&self) -> &'static str {
+        match self {
+            AuthHeaderType::Authorization => "WWW-Authenticate",
+            AuthHeaderType::ProxyAuthorization => "Proxy-Authenticate",
+        }
+    }
 }
 
 /// Parsed challenge from a `WWW-Authenticate` or `Proxy-Authenticate` header.
@@ -176,6 +199,8 @@ pub struct DigestCredentials {
     pub username: String,
     /// SIP password
     pub password: String,
+    /// Optional expected realm for validation (P1-AUTH-4)
+    pub expected_realm: Option<String>,
     /// Cached nonce from last successful challenge
     cached_nonce: Option<String>,
     /// Cached realm from last challenge
@@ -188,6 +213,10 @@ pub struct DigestCredentials {
     cached_algorithm: DigestAlgorithm,
     /// Nonce-count: number of times this nonce has been used (for qop=auth)
     nc: u32,
+    /// When the nonce was cached (P2-AUTH-2)
+    cached_at: Option<Instant>,
+    /// Nonce TTL — clear cache when expired (default 300s) (P2-AUTH-2)
+    pub nonce_ttl: Duration,
 }
 
 impl DigestCredentials {
@@ -196,12 +225,15 @@ impl DigestCredentials {
         Self {
             username: username.to_string(),
             password: password.to_string(),
+            expected_realm: None,
             cached_nonce: None,
             cached_realm: None,
             cached_opaque: None,
             cached_qop: None,
             cached_algorithm: DigestAlgorithm::Md5,
             nc: 0,
+            cached_at: None,
+            nonce_ttl: Duration::from_secs(300),
         }
     }
 
@@ -214,6 +246,17 @@ impl DigestCredentials {
     /// - Otherwise (new nonce from a fresh 401), all parameters are updated and
     ///   nc resets.
     pub fn update_challenge(&mut self, challenge: &DigestChallenge) {
+        // P1-AUTH-4: Validate realm if expected_realm is set
+        if let Some(ref expected) = self.expected_realm {
+            if challenge.realm != *expected {
+                tracing::warn!(
+                    expected_realm = %expected,
+                    actual_realm = %challenge.realm,
+                    "challenge realm does not match expected realm"
+                );
+            }
+        }
+
         if challenge.stale && self.cached_nonce.is_some() {
             // Stale nonce: just replace the nonce, reset nc, keep other params
             tracing::debug!(
@@ -222,6 +265,7 @@ impl DigestCredentials {
                 "nonce expired (stale=true), refreshing"
             );
             self.cached_nonce = Some(challenge.nonce.clone());
+            self.cached_at = Some(Instant::now());
             self.nc = 0;
         } else if self.cached_nonce.as_deref() == Some(&challenge.nonce) {
             // Same nonce — reusing cached challenge, don't reset nc.
@@ -233,12 +277,19 @@ impl DigestCredentials {
             self.cached_opaque = challenge.opaque.clone();
             self.cached_qop = challenge.qop.clone();
             self.cached_algorithm = challenge.algorithm;
+            self.cached_at = Some(Instant::now());
             self.nc = 0;
         }
     }
 
     /// Check whether we have a cached nonce that can be reused.
+    /// P2-AUTH-2: Returns false if the nonce TTL has expired.
     pub fn has_cached_nonce(&self) -> bool {
+        if let Some(cached_at) = self.cached_at {
+            if cached_at.elapsed() > self.nonce_ttl {
+                return false;
+            }
+        }
         self.cached_nonce.is_some()
     }
 
@@ -248,6 +299,7 @@ impl DigestCredentials {
         self.cached_realm = None;
         self.cached_opaque = None;
         self.cached_qop = None;
+        self.cached_at = None;
         self.nc = 0;
     }
 
@@ -274,11 +326,21 @@ impl DigestCredentials {
         uri: &str,
         header_type: AuthHeaderType,
     ) -> String {
+        // P2-AUTH-2: Clear expired nonce cache before updating
+        if let Some(cached_at) = self.cached_at {
+            if cached_at.elapsed() > self.nonce_ttl {
+                tracing::debug!("nonce TTL expired, clearing cache");
+                self.clear_cache();
+            }
+        }
+
         // Update cache with this challenge
         self.update_challenge(challenge);
 
-        // Increment nonce-count
-        self.nc += 1;
+        // P2-AUTH-3: Only increment nc when qop is present
+        if challenge.qop.is_some() {
+            self.nc += 1;
+        }
 
         // Generate cnonce
         let cnonce = generate_cnonce();
@@ -316,6 +378,15 @@ impl DigestCredentials {
         uri: &str,
         header_type: AuthHeaderType,
     ) -> Option<String> {
+        // P2-AUTH-2: Check nonce TTL before reusing
+        if let Some(cached_at) = self.cached_at {
+            if cached_at.elapsed() > self.nonce_ttl {
+                tracing::debug!("nonce TTL expired, clearing cache for authorize_cached");
+                self.clear_cache();
+                return None;
+            }
+        }
+
         let nonce = self.cached_nonce.clone()?;
         let realm = self.cached_realm.clone()?;
 
@@ -378,12 +449,19 @@ pub fn parse_challenge(header_value: &str) -> Result<DigestChallenge> {
 
     let qop = params.get("qop").and_then(|q| {
         // qop can be a comma-separated list like "auth,auth-int"
-        // We pick the best one we support: prefer auth over auth-int
+        // P1-AUTH-2: Prefer "auth" over "auth-int". If only auth-int is
+        // offered, fall back to no-qop since we don't have the body
+        // available to compute the entity hash.
         let lower = q.to_ascii_lowercase();
-        if lower.contains("auth-int") && !lower.contains("auth,") && lower != "auth" {
-            Some(Qop::AuthInt)
-        } else if lower.contains("auth") {
+        let has_auth = lower.split(',').any(|t| t.trim() == "auth");
+        let has_auth_int = lower.split(',').any(|t| t.trim() == "auth-int");
+        if has_auth {
             Some(Qop::Auth)
+        } else if has_auth_int {
+            tracing::warn!(
+                "server only offers qop=auth-int but body is unavailable for hashing; falling back to no-qop"
+            );
+            None
         } else {
             None
         }
@@ -433,10 +511,19 @@ pub fn compute_response(
     nc: u32,
     cnonce: &str,
 ) -> String {
-    let ha1 = hash(
+    // P1-AUTH-1: For MD5-sess, HA1 = H(H(user:realm:pass):nonce:cnonce)
+    let ha1_base = hash(
         challenge.algorithm,
         &format!("{}:{}:{}", username, challenge.realm, password),
     );
+    let ha1 = if challenge.algorithm == DigestAlgorithm::Md5Sess {
+        hash(
+            challenge.algorithm,
+            &format!("{}:{}:{}", ha1_base, challenge.nonce, cnonce),
+        )
+    } else {
+        ha1_base
+    };
 
     let ha2 = hash(
         challenge.algorithm,
@@ -474,8 +561,11 @@ pub fn build_auth_header(
 ) -> String {
     let _ = header_type; // Used by callers to decide which SIP header to set
 
+    // P1-AUTH-3: Escape backslash and double-quote in username
+    let escaped_username = username.replace('\\', "\\\\").replace('"', "\\\"");
+
     let mut parts = vec![
-        format!("Digest username=\"{}\"", username),
+        format!("Digest username=\"{}\"", escaped_username),
         format!("realm=\"{}\"", challenge.realm),
         format!("nonce=\"{}\"", challenge.nonce),
         format!("uri=\"{}\"", uri),
@@ -503,7 +593,7 @@ pub fn build_auth_header(
 /// Compute hex-encoded hash using the specified algorithm.
 fn hash(algorithm: DigestAlgorithm, input: &str) -> String {
     match algorithm {
-        DigestAlgorithm::Md5 => {
+        DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess => {
             let mut hasher = Md5::new();
             hasher.update(input.as_bytes());
             hex::encode(hasher.finalize())
@@ -679,10 +769,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_qop_auth_int() {
+    fn test_parse_qop_auth_int_only_falls_back_to_no_qop() {
+        // P1-AUTH-2: When only auth-int is offered and we don't have the body,
+        // fall back to no-qop
         let header = r#"Digest realm="test.com", nonce="abc", qop="auth-int""#;
         let challenge = parse_challenge(header).unwrap();
-        assert_eq!(challenge.qop, Some(Qop::AuthInt));
+        assert_eq!(challenge.qop, None);
     }
 
     #[test]

@@ -41,6 +41,18 @@ impl StunClient {
         self.binding_request_on(&socket, self.server).await
     }
 
+    /// Perform a STUN Binding Request and return the full STUN response message.
+    /// Unlike `binding_request_on`, this returns the complete parsed StunMessage
+    /// so the caller can inspect attributes like CHANGED-ADDRESS.
+    pub async fn binding_request_full(
+        &self,
+        socket: &UdpSocket,
+        server: SocketAddr,
+    ) -> Result<StunMessage> {
+        let request = StunMessage::new_binding_request();
+        self.execute_transaction(socket, server, request, None).await
+    }
+
     /// Perform a STUN Binding Request on a specific socket to a specific server.
     pub async fn binding_request_on(
         &self,
@@ -48,7 +60,7 @@ impl StunClient {
         server: SocketAddr,
     ) -> Result<SocketAddr> {
         let request = StunMessage::new_binding_request();
-        self.execute_transaction(socket, server, request).await?
+        self.execute_transaction(socket, server, request, None).await?
             .reflexive_address()
             .ok_or_else(|| {
                 RtpSipError::Sip("STUN response missing mapped address".to_string())
@@ -69,16 +81,22 @@ impl StunClient {
             change_ip,
             change_port,
         });
-        self.execute_transaction(socket, server, request).await
+        self.execute_transaction(socket, server, request, None).await
     }
 
     /// Execute a STUN transaction with retransmits.
     /// Returns the response or an error on timeout.
+    ///
+    /// When `non_stun_buffer` is provided, any non-STUN packets received on the
+    /// socket during the transaction are forwarded to that channel instead of
+    /// being silently discarded. This enables shared RTP/STUN socket usage
+    /// without losing media packets.
     async fn execute_transaction(
         &self,
         socket: &UdpSocket,
         server: SocketAddr,
         request: StunMessage,
+        non_stun_buffer: Option<&tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>>,
     ) -> Result<StunMessage> {
         let now = std::time::Instant::now();
         let mut txn = StunTransaction::new(&request, now);
@@ -107,7 +125,25 @@ impl StunClient {
 
             // Wait for response or timeout
             match tokio::time::timeout(timeout, socket.recv_from(&mut recv_buf)).await {
-                Ok(Ok((len, _from))) => {
+                Ok(Ok((len, from))) => {
+                    // P1-NAT-3: Validate that the response came from the expected
+                    // STUN server. Responses from unexpected sources could be
+                    // spoofed and must be discarded.
+                    if from != server {
+                        // Forward non-server packets if buffer is available
+                        if let Some(buf_tx) = non_stun_buffer {
+                            let _ = buf_tx.try_send((recv_buf[..len].to_vec(), from));
+                        }
+                        continue;
+                    }
+                    // Check if this is a STUN packet
+                    if !StunMessage::is_stun(&recv_buf[..len]) {
+                        // Non-STUN packet on shared socket -- forward to caller
+                        if let Some(buf_tx) = non_stun_buffer {
+                            let _ = buf_tx.try_send((recv_buf[..len].to_vec(), from));
+                        }
+                        continue;
+                    }
                     // Try to parse as STUN response
                     if let Ok(response) = StunMessage::unmarshal(&recv_buf[..len]) {
                         if txn.receive_response(response) {
@@ -144,13 +180,24 @@ impl StunClient {
     }
 
     /// Perform a binding request on a shared RTP socket.
-    /// The caller must ensure incoming STUN responses are routed here.
+    ///
+    /// Non-STUN packets received during the transaction are forwarded to
+    /// `non_stun_buffer` so the caller (e.g., the RTP media engine) does
+    /// not lose any media packets.
     pub async fn binding_request_shared(
         socket: &Arc<UdpSocket>,
         server: SocketAddr,
+        non_stun_buffer: Option<&tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>>,
     ) -> Result<SocketAddr> {
         let client = StunClient::new(server);
-        client.binding_request_on(socket, server).await
+        let request = StunMessage::new_binding_request();
+        client
+            .execute_transaction(socket, server, request, non_stun_buffer)
+            .await?
+            .reflexive_address()
+            .ok_or_else(|| {
+                RtpSipError::Sip("STUN response missing mapped address".to_string())
+            })
     }
 
     /// Send a STUN Binding Indication (keepalive, no response expected)

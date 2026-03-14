@@ -50,10 +50,14 @@ impl std::fmt::Display for TapDirection {
 }
 
 /// An audio frame delivered to a tap consumer
+///
+/// P2-DTMF-8: Uses `Arc<[i16]>` instead of `Vec<i16>` for the sample buffer.
+/// When multiple taps receive the same frame, the Arc allows sharing the
+/// underlying buffer across taps without per-tap allocation/copy.
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
-    /// Linear PCM samples (16-bit signed)
-    pub samples: Vec<i16>,
+    /// Linear PCM samples (16-bit signed), shared across taps via Arc
+    pub samples: std::sync::Arc<[i16]>,
     /// Sample rate in Hz (typically 8000)
     pub sample_rate: u32,
     /// RTP timestamp of this frame
@@ -176,10 +180,13 @@ impl MediaTapManager {
         let mut taps = self.taps.lock();
         let mut closed_taps: Vec<String> = Vec::new();
 
+        // P2-DTMF-8: Create Arc once, share across all taps
+        let shared_samples: std::sync::Arc<[i16]> = samples.into();
+
         for (id, tap) in taps.iter() {
             if tap.direction.includes_rx() {
                 let frame = AudioFrame {
-                    samples: samples.to_vec(),
+                    samples: shared_samples.clone(),
                     sample_rate,
                     timestamp,
                     direction: TapDirection::Rx,
@@ -216,10 +223,13 @@ impl MediaTapManager {
         let mut taps = self.taps.lock();
         let mut closed_taps: Vec<String> = Vec::new();
 
+        // P2-DTMF-8: Create Arc once, share across all taps
+        let shared_samples: std::sync::Arc<[i16]> = samples.into();
+
         for (id, tap) in taps.iter() {
             if tap.direction.includes_tx() {
                 let frame = AudioFrame {
-                    samples: samples.to_vec(),
+                    samples: shared_samples.clone(),
                     sample_rate,
                     timestamp,
                     direction: TapDirection::Tx,

@@ -408,12 +408,19 @@ impl From<crate::sip::engine::CallState> for PyCallState {
     fn from(state: crate::sip::engine::CallState) -> Self {
         use crate::sip::engine::CallState;
         match state {
+            // Direct mappings
             CallState::Trying => PyCallState::Trying,
             CallState::Ringing => PyCallState::Ringing,
             CallState::EarlyMedia => PyCallState::EarlyMedia,
             CallState::Active => PyCallState::Active,
             CallState::Hold => PyCallState::Hold,
             CallState::Ended => PyCallState::Ended,
+            // Internal states mapped to closest Python equivalent
+            CallState::Initializing | CallState::Calling => PyCallState::Trying,
+            CallState::Answered => PyCallState::Active,
+            CallState::Terminating | CallState::Terminated | CallState::Failed => {
+                PyCallState::Ended
+            }
         }
     }
 }

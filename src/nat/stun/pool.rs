@@ -145,6 +145,10 @@ impl StunServerPool {
     }
 
     /// Perform a STUN Binding Request on a specific socket, with failover.
+    ///
+    /// P1-NAT-11: Skips servers whose address family (IPv4/IPv6) doesn't match
+    /// the socket's bound address family. A single IPv4 socket cannot send to
+    /// IPv6 servers and vice versa.
     pub async fn binding_request_on(&self, socket: &UdpSocket) -> Result<SocketAddr> {
         let ordered = self.servers_by_priority();
         if ordered.is_empty() {
@@ -153,9 +157,23 @@ impl StunServerPool {
             ));
         }
 
+        // Determine socket address family
+        let socket_is_ipv6 = socket
+            .local_addr()
+            .map(|a| a.is_ipv6())
+            .unwrap_or(false);
+
         let mut last_err = None;
 
         for addr in &ordered {
+            // P1-NAT-11: Skip servers whose address family doesn't match the socket.
+            if addr.is_ipv6() != socket_is_ipv6 {
+                tracing::debug!(
+                    server = %addr,
+                    "Skipping STUN server: address family mismatch with socket"
+                );
+                continue;
+            }
             let start = Instant::now();
             let client = StunClient::new(*addr);
             match tokio::time::timeout(

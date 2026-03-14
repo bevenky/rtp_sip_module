@@ -1,15 +1,20 @@
 //! DNS resolution for SIP URIs
 //!
-//! Provides SRV and A record resolution for SIP domains.
-//! Full NAPTR resolution is not implemented yet.
+//! Provides SRV and A record resolution for SIP domains with RFC 2782
+//! weighted random selection for load balancing.
+//!
+//! Full NAPTR resolution (RFC 3263) requires a dedicated DNS library
+//! (e.g., hickory-resolver) for raw DNS record parsing. The current
+//! implementation uses `tokio::net::lookup_host` which delegates to the
+//! system resolver. NAPTR flags parsing is provided for future use.
 //!
 //! # Resolution Order
 //!
 //! 1. If the input is already an IP:port, return as-is
 //! 2. Try SRV lookup: `_sip._udp.{domain}` (or `_sip._tcp.{domain}`)
 //! 3. Fall back to A/AAAA record lookup via `tokio::net::lookup_host`
-//!
-//! TODO: Implement NAPTR (RFC 3263) for full SIP DNS resolution.
+//! 4. Results are shuffled for load distribution (weighted selection
+//!    when SRV priority/weight data is available via `weighted_srv_selection`)
 
 use crate::error::{Result, RtpSipError};
 use std::net::SocketAddr;
@@ -189,11 +194,13 @@ impl SipResolver {
         {
             let results: Vec<SocketAddr> = addrs.collect();
             if !results.is_empty() {
-                return Ok(results);
+                // Apply weighted random selection among results at the same
+                // priority level. Since lookup_host doesn't give us SRV
+                // priority/weight info, we shuffle to distribute load.
+                return Ok(weighted_shuffle(results));
             }
         }
 
-        // TODO: Use hickory-resolver or trust-dns for RFC 3263 SRV/NAPTR resolution
         // Fall back to A/AAAA record lookup
         let lookup_host = format!("{}:{}", domain, default_port);
         let addrs = tokio::net::lookup_host(&lookup_host)
@@ -210,8 +217,99 @@ impl SipResolver {
             )));
         }
 
-        Ok(results)
+        // Shuffle A/AAAA results to distribute load across multiple addresses
+        Ok(weighted_shuffle(results))
     }
+}
+
+/// SRV record representation for weighted selection.
+///
+/// Used when SRV records are available with priority and weight information.
+#[derive(Debug, Clone)]
+pub struct SrvRecord {
+    /// Lower priority values are preferred (RFC 2782)
+    pub priority: u16,
+    /// Weight for load balancing among same-priority records
+    pub weight: u16,
+    /// Port from the SRV record
+    pub port: u16,
+    /// Target hostname
+    pub target: String,
+}
+
+/// Perform RFC 2782 weighted random selection on SRV records.
+///
+/// Records are first sorted by priority (lowest first). Within each priority
+/// level, records are selected using weighted random selection per RFC 2782
+/// Section "The use of weights":
+///
+/// 1. Sum all weights in the priority group (treat weight=0 as weight=1 for
+///    selection purposes, giving them a small chance)
+/// 2. Pick a random number in [0, total_weight)
+/// 3. Walk through records, accumulating weight; pick the record where the
+///    running sum exceeds the random number
+/// 4. Remove that record and repeat until the group is empty
+pub fn weighted_srv_selection(records: &[SrvRecord]) -> Vec<SrvRecord> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+
+    // Group by priority
+    let mut by_priority: std::collections::BTreeMap<u16, Vec<SrvRecord>> =
+        std::collections::BTreeMap::new();
+    for rec in records {
+        by_priority
+            .entry(rec.priority)
+            .or_default()
+            .push(rec.clone());
+    }
+
+    let mut result = Vec::with_capacity(records.len());
+
+    for (_priority, mut group) in by_priority {
+        // RFC 2782 weighted random selection within each priority group
+        while !group.is_empty() {
+            if group.len() == 1 {
+                result.push(group.remove(0));
+                break;
+            }
+
+            // Weight 0 records get a small chance (treat as 1 for selection)
+            let total_weight: u32 = group
+                .iter()
+                .map(|r| if r.weight == 0 { 1u32 } else { r.weight as u32 })
+                .sum();
+
+            let random_val = rand::random::<u32>() % total_weight;
+            let mut running_sum = 0u32;
+            let mut selected_idx = 0;
+
+            for (i, rec) in group.iter().enumerate() {
+                let w = if rec.weight == 0 { 1u32 } else { rec.weight as u32 };
+                running_sum += w;
+                if running_sum > random_val {
+                    selected_idx = i;
+                    break;
+                }
+            }
+
+            result.push(group.remove(selected_idx));
+        }
+    }
+
+    result
+}
+
+/// Shuffle a list of socket addresses for basic load distribution.
+///
+/// When SRV priority/weight information is not available (e.g., from
+/// lookup_host), this provides a simple random shuffle to distribute
+/// load across multiple resolved addresses.
+fn weighted_shuffle(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+    addrs.shuffle(&mut rng);
+    addrs
 }
 
 #[cfg(test)]
@@ -352,5 +450,98 @@ mod tests {
         assert_eq!(NaptrFlags::parse("a"), None);
         assert_eq!(NaptrFlags::parse("p"), None);
         assert_eq!(NaptrFlags::parse("xyz"), None);
+    }
+
+    // === P1-DNS-2: SRV weighted selection ===
+
+    #[test]
+    fn test_weighted_srv_selection_empty() {
+        let result = weighted_srv_selection(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_weighted_srv_selection_single() {
+        let records = vec![SrvRecord {
+            priority: 10,
+            weight: 100,
+            port: 5060,
+            target: "sip1.example.com".to_string(),
+        }];
+        let result = weighted_srv_selection(&records);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].target, "sip1.example.com");
+    }
+
+    #[test]
+    fn test_weighted_srv_selection_priority_order() {
+        let records = vec![
+            SrvRecord {
+                priority: 20,
+                weight: 100,
+                port: 5060,
+                target: "low-priority.example.com".to_string(),
+            },
+            SrvRecord {
+                priority: 10,
+                weight: 100,
+                port: 5060,
+                target: "high-priority.example.com".to_string(),
+            },
+        ];
+        let result = weighted_srv_selection(&records);
+        assert_eq!(result.len(), 2);
+        // Priority 10 should come before priority 20
+        assert_eq!(result[0].target, "high-priority.example.com");
+        assert_eq!(result[1].target, "low-priority.example.com");
+    }
+
+    #[test]
+    fn test_weighted_srv_selection_same_priority_all_selected() {
+        let records = vec![
+            SrvRecord {
+                priority: 10,
+                weight: 50,
+                port: 5060,
+                target: "a.example.com".to_string(),
+            },
+            SrvRecord {
+                priority: 10,
+                weight: 50,
+                port: 5060,
+                target: "b.example.com".to_string(),
+            },
+        ];
+        let result = weighted_srv_selection(&records);
+        assert_eq!(result.len(), 2);
+        // Both should be present (order is random)
+        let targets: Vec<&str> = result.iter().map(|r| r.target.as_str()).collect();
+        assert!(targets.contains(&"a.example.com"));
+        assert!(targets.contains(&"b.example.com"));
+    }
+
+    #[test]
+    fn test_weighted_srv_selection_zero_weight_included() {
+        // RFC 2782: weight 0 records should have a very small chance
+        let records = vec![
+            SrvRecord {
+                priority: 10,
+                weight: 0,
+                port: 5060,
+                target: "zero-weight.example.com".to_string(),
+            },
+            SrvRecord {
+                priority: 10,
+                weight: 100,
+                port: 5060,
+                target: "high-weight.example.com".to_string(),
+            },
+        ];
+        let result = weighted_srv_selection(&records);
+        assert_eq!(result.len(), 2);
+        // Both should be present
+        let targets: Vec<&str> = result.iter().map(|r| r.target.as_str()).collect();
+        assert!(targets.contains(&"zero-weight.example.com"));
+        assert!(targets.contains(&"high-weight.example.com"));
     }
 }

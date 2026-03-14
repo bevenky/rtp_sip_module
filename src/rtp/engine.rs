@@ -18,7 +18,8 @@
 use crate::error::{Result, RtpSipError};
 use crate::rtp::codec::{CodecType, G711Codec};
 use crate::rtp::dtmf::{DetectedDtmf, DtmfDetector, DtmfSender, RtpBugFlags, TELEPHONE_EVENT_PT};
-use crate::rtp::jitter::{JitterBuffer, JitterConfig, JitterStats, PacketLossConcealer};
+use crate::rtp::jitter::{JitterBuffer, JitterConfig, JitterStats};
+use crate::rtp::plc::PacketLossConcealer;
 use crate::rtp::packet::{parse_rtp_packet, serialize_rtp_packet, RtpPacketBuilder};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -138,7 +139,9 @@ impl TimestampNormalizer {
     }
 
     /// Feed a remote timestamp and return the normalized timestamp.
-    fn normalize(&mut self, remote_ts: u32) -> u32 {
+    /// P1-RTP-6: Returns `(normalized_ts, discontinuity_detected)` so the
+    /// caller can reset the jitter buffer when a timestamp discontinuity occurs.
+    fn normalize(&mut self, remote_ts: u32) -> (u32, bool) {
         // 5 seconds worth of samples — anything larger is a discontinuity.
         let max_delta: u32 = self.sample_rate * 5;
 
@@ -148,9 +151,11 @@ impl TimestampNormalizer {
                 self.remote_base_ts = Some(remote_ts);
                 self.ts_offset = self.local_base_ts as i64 - remote_ts as i64;
                 self.last_remote_ts = Some(remote_ts);
-                ((remote_ts as i64).wrapping_add(self.ts_offset)) as u32
+                (((remote_ts as i64).wrapping_add(self.ts_offset)) as u32, false)
             }
             Some(_) => {
+                let mut discontinuity = false;
+
                 // Check for discontinuity against the last seen timestamp.
                 if let Some(last) = self.last_remote_ts {
                     let fwd_delta = remote_ts.wrapping_sub(last);
@@ -176,11 +181,12 @@ impl TimestampNormalizer {
                             .wrapping_add(self.samples_per_packet());
                         self.ts_offset = self.local_base_ts as i64 - remote_ts as i64;
                         self.remote_base_ts = Some(remote_ts);
+                        discontinuity = true;
                     }
                 }
 
                 self.last_remote_ts = Some(remote_ts);
-                ((remote_ts as i64).wrapping_add(self.ts_offset)) as u32
+                (((remote_ts as i64).wrapping_add(self.ts_offset)) as u32, discontinuity)
             }
         }
     }
@@ -259,6 +265,10 @@ pub struct RtpEngineConfig {
     /// are silently dropped (with a warning logged on the first mismatch).
     /// `None` means no filtering — accept any audio PT.
     pub audio_payload_type: Option<u8>,
+    /// P2-DTMF-1: Reset jitter buffer when DTMF is detected.
+    /// Some systems need the jitter buffer flushed at DTMF boundaries
+    /// to reduce delay for subsequent audio. Default false.
+    pub flush_jb_on_dtmf: bool,
 }
 
 impl Default for RtpEngineConfig {
@@ -278,6 +288,7 @@ impl Default for RtpEngineConfig {
             send_silence_when_idle: false,
             hold_media_timeout_ms: 1_800_000,
             audio_payload_type: None,
+            flush_jb_on_dtmf: false,
         }
     }
 }
@@ -391,6 +402,10 @@ pub struct RtpEngine {
     // === Bug #94: Rate-limited warning for recv_tx.try_send drops ===
     /// Counter for dropped audio frames due to full recv channel
     recv_drop_count: AtomicU64,
+
+    // === P1-RTP-9: Playout timer for PLC ===
+    /// Timestamp of last playout tick (for timer-driven PLC)
+    last_playout_tick: Mutex<Option<Instant>>,
 }
 
 impl RtpEngine {
@@ -447,7 +462,9 @@ impl RtpEngine {
             last_cn_timestamp: Mutex::new(None),
             rtcp_mux: AtomicBool::new(rtcp_mux),
             remote_ssrc: Mutex::new(None),
-            force_marker: AtomicBool::new(false),
+            // P2-RTP-7: Initialize to true so the very first RTP packet
+            // carries the marker bit, signaling a new stream.
+            force_marker: AtomicBool::new(true),
             ptime_ms: AtomicU32::new(ptime_ms),
             timestamp_normalizer: Mutex::new(TimestampNormalizer::with_ptime(sample_rate, ptime_ms)),
             send_silence_when_idle,
@@ -461,6 +478,7 @@ impl RtpEngine {
             timeout_fired: AtomicBool::new(false),
             hold_media_timeout_ms,
             is_on_hold: AtomicBool::new(false),
+            last_playout_tick: Mutex::new(None),
         })
     }
 
@@ -494,12 +512,15 @@ impl RtpEngine {
         *self.remote_addr.lock()
     }
 
-    /// Set RTP bug workaround flags for DTMF sender
+    /// Set RTP bug workaround flags for both DTMF sender and detector.
     ///
     /// Called after User-Agent header is detected to enable device-specific
     /// workarounds (Sonus, Cisco, etc). See `RtpBugFlags::detect_from_user_agent()`.
     pub fn set_rtp_bug_flags(&self, flags: RtpBugFlags) {
         self.dtmf_sender.lock().set_rtp_bugs(flags);
+        // P1-DTMF-1/P1-DTMF-2: Also propagate bug flags to the detector
+        // for receive-side workarounds (ignore_duration, cisco_skip_marker_2833).
+        self.dtmf_detector.set_rtp_bugs(flags);
     }
 
     /// Get current RTP bug flags
@@ -674,28 +695,9 @@ impl RtpEngine {
         let dtmf_enabled = self.config.enable_dtmf;
         let dtmf_pt = self.config.dtmf_payload_type;
 
-        // === Fix 4: Spawn media timeout check task ===
-        // === Bug #2/#50 fix: dynamically read the effective timeout
-        // based on current hold state instead of using a captured value. ===
-        {
-            let engine_timeout = self.clone();
-            let timeout_tx = self.timeout_tx.clone();
-            tokio::spawn(async move {
-                let check_interval = Duration::from_secs(5);
-                while engine_timeout.running.load(Ordering::Relaxed) {
-                    tokio::time::sleep(check_interval).await;
-                    let effective_timeout = engine_timeout.effective_media_timeout();
-                    if let Some(last) = *engine_timeout.last_rtp_received.lock() {
-                        if last.elapsed() >= effective_timeout {
-                            // Bug #24: Only broadcast on transition from not-fired to fired
-                            if !engine_timeout.timeout_fired.swap(true, Ordering::SeqCst) {
-                                let _ = timeout_tx.send(());
-                            }
-                        }
-                    }
-                }
-            });
-        }
+        // P1-RTP-8: Media timeout check has been moved into the receive loop's
+        // 100ms timeout branch for ~100ms precision instead of 5s. The
+        // separate 5s polling task is no longer needed.
 
         // === Fix 14: Spawn silence-when-idle task ===
         // Bug #36: Note: Silence task and user send_audio both acquire packet_builder lock,
@@ -716,7 +718,9 @@ impl RtpEngine {
                             None => true, // No audio ever sent — send silence
                         }
                     };
-                    if should_send {
+                    // P2-RTP-9: Don't send silence packets while on hold — the
+                    // remote side has asked us to stop sending media.
+                    if should_send && !engine_silence.is_on_hold() {
                         if engine_silence.remote_addr().is_some() {
                             let silence = vec![0i16; samples_per_pkt];
                             let _ = engine_silence.send_audio(&silence).await;
@@ -728,21 +732,43 @@ impl RtpEngine {
 
         // Spawn receive task
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
+            // P2-RTP-6: Increase receive buffer from 4096 to 8192 bytes.
+            // 4096 is too small for SRTP-protected packets with extensions or
+            // high-bitrate codecs.
+            let mut buf = vec![0u8; 8192];
 
             while engine.running.load(Ordering::Relaxed) {
+                // P1-RTP-9: Use ptime as the recv timeout so that playout ticks
+                // fire at the correct cadence for PLC generation when packets
+                // stop arriving. Fall back to 20ms minimum to avoid tight loops.
+                let recv_timeout_ms = engine.ptime_ms.load(Ordering::Relaxed).max(20) as u64;
                 match tokio::time::timeout(
-                    Duration::from_millis(100),
+                    Duration::from_millis(recv_timeout_ms),
                     engine.socket.recv_from(&mut buf),
                 )
                 .await
                 {
-                    Ok(Ok((len, _addr))) => {
+                    Ok(Ok((len, src_addr))) => {
                         let data = &buf[..len];
 
                         // Minimum RTP header size check (12 bytes per RFC 3550)
                         if data.len() < 12 {
                             continue;
+                        }
+
+                        // P1-RTP-4: Source address validation — when symmetric RTP
+                        // is not in use (remote_addr is set), validate that the
+                        // source address matches the expected remote. Drop packets
+                        // from unexpected sources to prevent injection attacks.
+                        if let Some(expected_remote) = *engine.remote_addr.lock() {
+                            if src_addr != expected_remote {
+                                tracing::warn!(
+                                    expected = %expected_remote,
+                                    actual = %src_addr,
+                                    "Dropping RTP packet from unexpected source address"
+                                );
+                                continue;
+                            }
                         }
 
                         // === Fix 6: RTCP-mux discrimination ===
@@ -831,7 +857,14 @@ impl RtpEngine {
                                     packet.header.timestamp,
                                     &packet.payload,
                                 ) {
-                                    let _ = dtmf_tx.try_send(detected);
+                                    // P2-RTP-8: Warn when DTMF queue is full instead of
+                                    // silently dropping the detected digit.
+                                    if let Err(mpsc::error::TrySendError::Full(dropped)) = dtmf_tx.try_send(detected) {
+                                        tracing::warn!(
+                                            digit = %dropped.digit,
+                                            "DTMF channel full, dropping detected digit"
+                                        );
+                                    }
                                 }
                                 continue; // Don't process as audio
                             }
@@ -885,11 +918,21 @@ impl RtpEngine {
                             }
 
                             // === Fix 13: Normalize remote timestamp before jitter buffer ===
+                            // P1-RTP-6: If the normalizer detects a timestamp
+                            // discontinuity, reset the jitter buffer so it doesn't
+                            // hold stale packets from the old timestamp epoch.
                             let mut packet = packet;
-                            packet.header.timestamp = engine
+                            let (normalized_ts, ts_discontinuity) = engine
                                 .timestamp_normalizer
                                 .lock()
                                 .normalize(packet.header.timestamp);
+                            packet.header.timestamp = normalized_ts;
+                            if ts_discontinuity {
+                                tracing::info!(
+                                    "Timestamp discontinuity detected, resetting jitter buffer"
+                                );
+                                engine.jitter_buffer.lock().reset();
+                            }
 
                             // Bug #40: Acquire jitter buffer lock once for marker-bit
                             // reset, duplicate detection, push, and pop instead of
@@ -898,6 +941,24 @@ impl RtpEngine {
                             // multiple ready packets, preventing buffer growth under burst.
                             let popped_packets: Vec<rtp::packet::Packet> = {
                                 let mut jb = engine.jitter_buffer.lock();
+
+                                // P1-RTP-1: Large sequence gap detection — if the gap
+                                // exceeds 3000, treat it as a stream reset (e.g. far-end
+                                // restarted). Reset the jitter buffer to avoid buffering
+                                // packets with stale sequence expectations.
+                                if let Some(last_seq) = jb.last_played_sequence() {
+                                    let seq = packet.header.sequence_number;
+                                    let fwd_gap = seq.wrapping_sub(last_seq);
+                                    if fwd_gap > 3000 && fwd_gap < 60000 {
+                                        tracing::warn!(
+                                            last_seq,
+                                            new_seq = seq,
+                                            gap = fwd_gap,
+                                            "Large sequence gap detected (>3000), resetting jitter buffer"
+                                        );
+                                        jb.reset();
+                                    }
+                                }
 
                                 // Bug #18: Marker bit on incoming — reset jitter buffer
                                 // initial buffering state to reduce latency on stream restart
@@ -961,7 +1022,62 @@ impl RtpEngine {
                         tracing::warn!("RTP receive error: {}", e);
                     }
                     Err(_) => {
-                        // Timeout - continue loop
+                        // P1-RTP-9: Playout tick — pop from jitter buffer on
+                        // ptime intervals even when no new packets arrive.
+                        // This decouples PLC from the receive path so concealment
+                        // frames are generated at the correct cadence.
+                        {
+                            let ptime = Duration::from_millis(
+                                engine.ptime_ms.load(Ordering::Relaxed).max(20) as u64,
+                            );
+                            let should_tick = {
+                                let last_tick = engine.last_playout_tick.lock();
+                                match *last_tick {
+                                    Some(t) => t.elapsed() >= ptime,
+                                    None => engine.jitter_buffer.lock().is_ready(),
+                                }
+                            };
+                            if should_tick {
+                                *engine.last_playout_tick.lock() = Some(Instant::now());
+                                let popped = engine.jitter_buffer.lock().pop();
+                                if let Some(jb_packet) = popped {
+                                    let samples = engine.recv_codec.lock().decode(&jb_packet.payload);
+                                    engine.plc.lock().update(&samples);
+                                    if let Err(mpsc::error::TrySendError::Full(_)) = engine.recv_tx.try_send(samples) {
+                                        let count = engine.recv_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if count % 100 == 1 {
+                                            tracing::warn!(
+                                                total_drops = count,
+                                                "recv_tx channel full, dropping audio frame"
+                                            );
+                                        }
+                                    }
+                                } else if engine.jitter_buffer.lock().is_ready() {
+                                    // Buffer is ready but empty — generate PLC
+                                    let audio = engine.plc.lock().conceal();
+                                    if let Err(mpsc::error::TrySendError::Full(_)) = engine.recv_tx.try_send(audio) {
+                                        let count = engine.recv_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if count % 100 == 1 {
+                                            tracing::warn!(
+                                                total_drops = count,
+                                                "recv_tx channel full, dropping audio frame"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // P1-RTP-8: Check media timeout
+                        let effective_timeout = engine.effective_media_timeout();
+                        if let Some(last) = *engine.last_rtp_received.lock() {
+                            if last.elapsed() >= effective_timeout {
+                                // Bug #24: Only broadcast on transition from not-fired to fired
+                                if !engine.timeout_fired.swap(true, Ordering::SeqCst) {
+                                    let _ = engine.timeout_tx.send(());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1060,14 +1176,19 @@ impl RtpEngine {
     /// (e.g. 1200ms at 20ms ptime).
     ///
     /// If we previously received a CN packet from the remote (Fix 31), we
-    /// echo that noise level; otherwise we compute from the supplied PCM samples.
+    /// echo that noise level; otherwise we use the default (65 dBov).
+    ///
+    /// P1-RTP-2: CN packets are built with their own dedicated method using
+    /// the CN payload type (13) from the start. They do not advance the audio
+    /// timestamp — the last audio timestamp is reused so that audio sequencing
+    /// is not disrupted by CN packets.
     ///
     /// Sets the `in_cn_silence` flag so that the next `send_audio()` call
     /// will automatically set the marker bit (RFC 3389 §4.1).
     ///
     /// Returns `Ok(true)` if a packet was actually sent, `Ok(false)` if
     /// pacing suppressed the send.
-    pub async fn send_comfort_noise(&self, samples: &[i16]) -> Result<bool> {
+    pub async fn send_comfort_noise(&self, _samples: &[i16]) -> Result<bool> {
         let remote = self
             .remote_addr
             .lock()
@@ -1083,13 +1204,10 @@ impl RtpEngine {
                     return Ok(false);
                 }
             }
-            // Bug #R8-3: Don't update timestamp here — update after successful send
-            // to avoid suppressing retries when socket.send_to() fails.
         }
 
         // Fix 31: If we have a received CN level, echo it back; otherwise
         // use the default of 65 dBov.
-        // Bug #95: parking_lot::Mutex never poisons, so just .lock()
         let dbov = match *self.last_cn_level.lock() {
             Some(level) => level,
             None => CN_DEFAULT_NOISE_LEVEL,
@@ -1101,21 +1219,36 @@ impl RtpEngine {
         // Bug #13: Set marker=true on the first CN packet of a silence period
         let is_first_cn = !self.in_cn_silence.load(Ordering::Relaxed);
 
-        // Bug #14: Use samples_per_packet() for timestamp increment instead of
-        // samples.len(), which may not match the configured ptime
-        let mut packet = self.packet_builder.lock().build_with_marker(
-            Bytes::from(cn_payload),
-            self.samples_per_packet(),
-            is_first_cn,
-        );
+        // P1-RTP-2: Build CN packet directly with the CN payload type (13)
+        // instead of using the audio packet builder and retroactively changing PT.
+        // Use the last audio timestamp rather than advancing the audio sequence,
+        // so CN packets don't consume audio timestamp/sequence space.
+        let cn_packet = {
+            let pb = self.packet_builder.lock();
+            let header = rtp::header::Header {
+                version: 2,
+                padding: false,
+                extension: false,
+                marker: is_first_cn,
+                payload_type: CN_PAYLOAD_TYPE,
+                sequence_number: pb.sequence(),
+                timestamp: pb.timestamp(),
+                ssrc: pb.ssrc(),
+                csrc: vec![],
+                extension_profile: 0,
+                extensions: vec![],
+                extensions_padding: 0,
+            };
+            rtp::packet::Packet {
+                header,
+                payload: Bytes::from(cn_payload),
+            }
+        };
 
-        // Set the correct payload type for Comfort Noise before serialization
-        packet.header.payload_type = CN_PAYLOAD_TYPE;
-
-        let data = serialize_rtp_packet(&packet)?;
+        let data = serialize_rtp_packet(&cn_packet)?;
         self.socket.send_to(&data, remote).await?;
 
-        // Bug #R8-3: Update CN pacing timestamp only after successful send
+        // Update CN pacing timestamp only after successful send
         *self.last_cn_timestamp.lock() = Some(Instant::now());
 
         // Mark that we're in CN silence — next voice packet gets marker bit
@@ -1136,24 +1269,55 @@ impl RtpEngine {
 
     /// Receive audio samples with timeout (blocking version for sync API)
     ///
+    /// P1-RTP-3: Uses `blocking_recv` on a tokio mpsc channel via a
+    /// one-shot runtime, avoiding the previous busy-wait poll loop that
+    /// wasted CPU with 10ms sleeps.
+    ///
     /// Note: This method blocks the thread. Only call from synchronous/blocking
     /// context, never from async tasks.
     pub fn recv_audio_blocking(&self, timeout: Duration) -> Result<Option<Vec<i16>>> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            match self.recv_rx.lock().try_recv() {
-                Ok(samples) => return Ok(Some(samples)),
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(RtpSipError::ChannelClosed)
-                }
+        // Use a short-lived tokio runtime to do an async recv with timeout.
+        // This avoids spin-and-sleep while still supporting the blocking API.
+        let mut rx = self.recv_rx.lock();
+        // Try a non-blocking recv first to avoid the overhead of spawning a
+        // runtime when data is already available.
+        match rx.try_recv() {
+            Ok(samples) => return Ok(Some(samples)),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(RtpSipError::ChannelClosed);
             }
+            Err(mpsc::error::TryRecvError::Empty) => {}
         }
+
+        // Use std::sync::mpsc channel as a bridge: the tokio recv with timeout
+        // sends the result through a std channel that we can block on.
+        let (bridge_tx, bridge_rx) = std::sync::mpsc::channel();
+        let recv_rx_ptr = &mut *rx as *mut mpsc::Receiver<Vec<i16>>;
+        // SAFETY: We hold the mutex lock for the entire duration of this call,
+        // so the receiver cannot be accessed concurrently. The pointer is used
+        // to move the receiver into the async block without lifetime issues.
+        let recv_rx_ref = unsafe { &mut *recv_rx_ptr };
+
+        // Spawn a thread that runs the async recv with timeout
+        let timeout_dur = timeout;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("Failed to build tokio runtime for blocking recv");
+                let result = rt.block_on(async {
+                    match tokio::time::timeout(timeout_dur, recv_rx_ref.recv()).await {
+                        Ok(Some(samples)) => Ok(Some(samples)),
+                        Ok(None) => Err(RtpSipError::ChannelClosed),
+                        Err(_) => Ok(None), // timeout
+                    }
+                });
+                let _ = bridge_tx.send(result);
+            });
+        });
+
+        bridge_rx.recv().unwrap_or(Ok(None))
     }
 
     /// Get jitter buffer statistics
@@ -1187,7 +1351,7 @@ impl RtpEngine {
             (pb.sequence(), pb.timestamp())
         };
 
-        // Bug #R6-7: Use actual ptime instead of hardcoded 20ms, matching FreeSWITCH
+        // Use actual ptime instead of hardcoded 20ms
         let ptime = self.ptime_ms.load(Ordering::Relaxed);
         // Generate all packets for this digit using configured ptime intervals
         // Uses shared sequence space per RFC 4733 §2.5
@@ -1202,16 +1366,33 @@ impl RtpEngine {
             pb.set_sequence(seq);
         }
 
-        // Send packets with proper timing
+        // P1-RTP-10: Use tokio::time::interval instead of repeated sleep
+        // to prevent DTMF timing drift accumulation. interval() compensates
+        // for processing time between ticks.
+        let ptime = self.ptime_ms.load(Ordering::Relaxed) as u64;
+        let end_start = packets.len().saturating_sub(3);
+        let mut interval = tokio::time::interval(Duration::from_millis(ptime));
+        // Consume the first tick immediately (interval fires once on creation)
+        interval.tick().await;
+
         for (i, packet) in packets.iter().enumerate() {
             let data = packet.to_rtp_bytes();
             self.socket.send_to(&data, remote).await?;
 
-            // Wait between packets (except for end packets which are sent rapidly)
-            // Bug #R9-3: Use configured ptime instead of hardcoded 20ms
-            if i < packets.len().saturating_sub(3) {
-                let ptime = self.ptime_ms.load(Ordering::Relaxed) as u64;
-                tokio::time::sleep(Duration::from_millis(ptime)).await;
+            // Wait between packets:
+            // - Normal (non-END) packets: wait one ptime interval
+            // - END packets: wait ptime/2 between them (slightly faster than
+            //   normal cadence but not a burst, giving the network time to
+            //   deliver each copy before the next one arrives)
+            // - No delay after the very last packet
+            if i < packets.len() - 1 {
+                if i < end_start {
+                    interval.tick().await;
+                } else {
+                    // END packets use half-ptime spacing; use sleep here since
+                    // the interval period doesn't change for just 3 packets.
+                    tokio::time::sleep(Duration::from_millis(ptime / 2)).await;
+                }
             }
         }
 
@@ -1252,22 +1433,42 @@ impl RtpEngine {
     }
 
     /// Receive detected DTMF digit with timeout (blocking)
+    ///
+    /// P1-RTP-3: Uses proper blocking recv instead of busy-wait polling.
     pub fn recv_dtmf_blocking(&self, timeout: Duration) -> Result<Option<DetectedDtmf>> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            match self.dtmf_rx.lock().try_recv() {
-                Ok(dtmf) => return Ok(Some(dtmf)),
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(RtpSipError::ChannelClosed)
-                }
+        let mut rx = self.dtmf_rx.lock();
+        // Try non-blocking first
+        match rx.try_recv() {
+            Ok(dtmf) => return Ok(Some(dtmf)),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(RtpSipError::ChannelClosed);
             }
+            Err(mpsc::error::TryRecvError::Empty) => {}
         }
+
+        let (bridge_tx, bridge_rx) = std::sync::mpsc::channel();
+        let recv_rx_ptr = &mut *rx as *mut mpsc::Receiver<DetectedDtmf>;
+        let recv_rx_ref = unsafe { &mut *recv_rx_ptr };
+
+        let timeout_dur = timeout;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("Failed to build tokio runtime for blocking recv");
+                let result = rt.block_on(async {
+                    match tokio::time::timeout(timeout_dur, recv_rx_ref.recv()).await {
+                        Ok(Some(dtmf)) => Ok(Some(dtmf)),
+                        Ok(None) => Err(RtpSipError::ChannelClosed),
+                        Err(_) => Ok(None),
+                    }
+                });
+                let _ = bridge_tx.send(result);
+            });
+        });
+
+        bridge_rx.recv().unwrap_or(Ok(None))
     }
 
     /// Check if DTMF detection is enabled
@@ -1642,7 +1843,11 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let engine = RtpEngine::with_defaults(addr).await.unwrap();
 
-        // Initially false
+        // P2-RTP-7: Initially true so the first packet gets the marker bit
+        assert!(engine.force_marker.load(Ordering::Relaxed));
+
+        // After consuming it (e.g., via send_audio), request_marker sets it again
+        engine.force_marker.store(false, Ordering::Relaxed);
         assert!(!engine.force_marker.load(Ordering::Relaxed));
 
         engine.request_marker();
@@ -1704,9 +1909,11 @@ mod tests {
         let mut norm = TimestampNormalizer::new(8000);
 
         // First packet establishes baseline — normalized output is predictable
-        let n1 = norm.normalize(50000);
+        let (n1, disc1) = norm.normalize(50000);
+        assert!(!disc1);
         // Second packet is one ptime later (160 samples = 20ms at 8kHz)
-        let n2 = norm.normalize(50160);
+        let (n2, disc2) = norm.normalize(50160);
+        assert!(!disc2);
         assert_eq!(n2.wrapping_sub(n1), 160, "Sequential packets must differ by exactly 160");
     }
 
@@ -1718,13 +1925,16 @@ mod tests {
         let mut norm = TimestampNormalizer::new(8000);
 
         // Establish baseline with a few packets
-        let n1 = norm.normalize(1000);
-        let n2 = norm.normalize(1160);
+        let (n1, _) = norm.normalize(1000);
+        let (n2, _) = norm.normalize(1160);
         assert_eq!(n2.wrapping_sub(n1), 160);
 
         // Simulate call transfer: remote timestamps jump by 10 seconds
         let jump_ts = 1160 + 80_000; // 10 seconds at 8kHz
-        let n3 = norm.normalize(jump_ts);
+        let (n3, disc) = norm.normalize(jump_ts);
+
+        // P1-RTP-6: Discontinuity flag should be set
+        assert!(disc, "Large timestamp jump should signal discontinuity");
 
         // After reset, the normalizer should place n3 right after n2
         // (n2 + one ptime = n2 + 160 for the assumed 20ms gap)
@@ -1732,7 +1942,8 @@ mod tests {
             "After discontinuity, normalizer must re-anchor seamlessly");
 
         // Further packets should continue smoothly from the new base
-        let n4 = norm.normalize(jump_ts + 160);
+        let (n4, disc4) = norm.normalize(jump_ts + 160);
+        assert!(!disc4);
         assert_eq!(n4.wrapping_sub(n3), 160);
     }
 
@@ -1746,12 +1957,12 @@ mod tests {
 
         // After reset, next packet should re-establish the mapping
         // (remote_base_ts is None again).
-        let n = norm.normalize(90000);
+        let (n, _) = norm.normalize(90000);
         // Just verify it doesn't panic and returns a value
         let _ = n;
 
         // Next sequential packet should still be smooth
-        let n2 = norm.normalize(90160);
+        let (n2, _) = norm.normalize(90160);
         assert_eq!(n2.wrapping_sub(n), 160);
     }
 
@@ -1763,7 +1974,7 @@ mod tests {
         // release it, then re-allocate — the same port should come back because
         // the range only has one slot.
         let start: u16 = 40000;
-        let end: u16 = 40002; // range has exactly one even port: 40000
+        let end: u16 = 40001; // range has exactly one even port: 40000
 
         let port = allocate_rtp_port(start, end);
         assert_eq!(port, Some(start), "Should allocate the only available even port");
@@ -1990,8 +2201,8 @@ mod tests {
             "audio_pt_mismatch_warned should be reset");
 
         // After reset, normalizer should re-establish mapping from scratch
-        let n1 = engine.timestamp_normalizer.lock().normalize(90000);
-        let n2 = engine.timestamp_normalizer.lock().normalize(90160);
+        let (n1, _) = engine.timestamp_normalizer.lock().normalize(90000);
+        let (n2, _) = engine.timestamp_normalizer.lock().normalize(90160);
         assert_eq!(n2.wrapping_sub(n1), 160,
             "After reset, normalizer should produce smooth timestamps");
     }
@@ -2031,20 +2242,21 @@ mod tests {
         // 240 samples (8000 * 30 / 1000), not 160 (20ms)
         let mut norm = TimestampNormalizer::with_ptime(8000, 30);
 
-        let n1 = norm.normalize(1000);
-        let n2 = norm.normalize(1240); // 30ms at 8kHz = 240 samples
+        let (n1, _) = norm.normalize(1000);
+        let (n2, _) = norm.normalize(1240); // 30ms at 8kHz = 240 samples
         assert_eq!(n2.wrapping_sub(n1), 240);
 
         // Simulate a large discontinuity (>5 sec)
         let jump_ts = 1240 + 80_000;
-        let n3 = norm.normalize(jump_ts);
+        let (n3, disc) = norm.normalize(jump_ts);
+        assert!(disc, "Should detect discontinuity on 10s jump");
 
         // After discontinuity, the gap should be one ptime (240 samples for 30ms)
         assert_eq!(n3.wrapping_sub(n2), 240,
             "Bug #49: discontinuity recovery should use 30ms ptime (240 samples), not 20ms (160)");
 
         // Continue normally
-        let n4 = norm.normalize(jump_ts + 240);
+        let (n4, _) = norm.normalize(jump_ts + 240);
         assert_eq!(n4.wrapping_sub(n3), 240);
     }
 
@@ -2054,13 +2266,13 @@ mod tests {
         // 80 samples (8000 * 10 / 1000)
         let mut norm = TimestampNormalizer::with_ptime(8000, 10);
 
-        let n1 = norm.normalize(2000);
-        let n2 = norm.normalize(2080); // 10ms = 80 samples
+        let (n1, _) = norm.normalize(2000);
+        let (n2, _) = norm.normalize(2080); // 10ms = 80 samples
         assert_eq!(n2.wrapping_sub(n1), 80);
 
         // Large jump
         let jump_ts = 2080 + 80_000;
-        let n3 = norm.normalize(jump_ts);
+        let (n3, _) = norm.normalize(jump_ts);
         assert_eq!(n3.wrapping_sub(n2), 80,
             "Bug #49: discontinuity recovery should use 10ms ptime (80 samples)");
     }
@@ -2071,8 +2283,8 @@ mod tests {
         // subsequent discontinuity recovery
         let mut norm = TimestampNormalizer::with_ptime(8000, 20);
 
-        let n1 = norm.normalize(1000);
-        let n2 = norm.normalize(1160);
+        let (n1, _) = norm.normalize(1000);
+        let (n2, _) = norm.normalize(1160);
         assert_eq!(n2.wrapping_sub(n1), 160);
 
         // Change ptime to 30ms
@@ -2080,7 +2292,7 @@ mod tests {
 
         // Next discontinuity should use 30ms step (240 samples)
         let jump_ts = 1160 + 80_000;
-        let n3 = norm.normalize(jump_ts);
+        let (n3, _) = norm.normalize(jump_ts);
         assert_eq!(n3.wrapping_sub(n2), 240,
             "After set_ptime(30), discontinuity recovery should use 240 samples");
     }

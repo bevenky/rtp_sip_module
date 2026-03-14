@@ -168,18 +168,18 @@ impl StunAttribute {
                 Some(StunAttribute::Software(String::from_utf8_lossy(data).to_string()))
             }
             _ => {
-                // RFC 5389 Section 15: Attributes with type 0x0000-0x7FFF are
-                // comprehension-required. If we don't recognize one, the message
-                // cannot be processed correctly — return None so the caller
-                // knows to reject or ignore this attribute.
+                // Preserve unknown attributes (both comprehension-required and
+                // comprehension-optional) as Unknown so TURN and other extensions
+                // that define their own attribute types in the 0x0000-0x7FFF range
+                // (e.g., LIFETIME 0x000D, REQUESTED-TRANSPORT 0x0019, REALM 0x0014,
+                // NONCE 0x0015, USERNAME 0x0006, MESSAGE-INTEGRITY 0x0008) can be
+                // round-tripped through marshal/unmarshal.
                 if attr_type < 0x8000 {
-                    tracing::warn!(
+                    tracing::debug!(
                         attr_type = format!("0x{:04X}", attr_type),
-                        "Unknown comprehension-required STUN attribute, ignoring"
+                        "Unknown comprehension-required STUN attribute, preserving as Unknown"
                     );
-                    return None;
                 }
-                // Comprehension-optional (>= 0x8000): safe to ignore
                 Some(StunAttribute::Unknown(attr_type, data.to_vec()))
             }
         }

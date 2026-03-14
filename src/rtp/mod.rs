@@ -15,6 +15,7 @@ pub mod dtmf;
 mod engine;
 mod jitter;
 mod packet;
+pub mod plc;
 pub mod rtcp;
 pub mod srtp;
 
@@ -24,7 +25,8 @@ pub use dtmf::{
     TELEPHONE_EVENT_PT, TELEPHONE_EVENT_RATE,
 };
 pub use engine::{RtpEngine, RtpEngineConfig};
-pub use jitter::{JitterBuffer, JitterConfig, JitterStats, PacketLossConcealer};
+pub use jitter::{JitterBuffer, JitterConfig, JitterStats};
 pub use packet::{parse_rtp_packet, serialize_rtp_packet, RtpPacket, RtpPacketBuilder};
+pub use plc::PacketLossConcealer;
 pub use rtcp::VoipMetrics;
 pub use srtp::{CryptoAttribute, SrtpCipherSuite, SrtpContext};

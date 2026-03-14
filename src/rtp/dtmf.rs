@@ -374,6 +374,37 @@ pub struct RtpBugFlags {
     /// Also enabled when `sonus_dtmf_timestamp` is enabled (Sonus also
     /// requires no marker bit).
     pub never_send_marker: bool,
+
+    /// P1-DTMF-1: Ignore DTMF duration — report the digit immediately on
+    /// the first DTMF packet instead of waiting for the END bit.
+    ///
+    /// Some VoIP equipment sends DTMF without reliable END packets or with
+    /// corrupt duration fields. When this flag is set, digits are reported
+    /// as soon as they are detected (on the first packet with a new timestamp),
+    /// using a fixed minimum duration.
+    pub ignore_duration: bool,
+
+    /// P1-DTMF-2: Cisco skip marker bit for RFC 2833 receive handling.
+    ///
+    /// Some Cisco devices do not set the marker bit on the first DTMF packet.
+    /// When this flag is set, new-digit detection on receive uses timestamp
+    /// change as the primary signal instead of the marker bit.
+    pub cisco_skip_marker_2833: bool,
+
+    /// P2-DTMF-7: Ignore the marker bit entirely on received audio packets.
+    /// Some endpoints set the marker bit on every packet or at random,
+    /// causing spurious jitter buffer resets. When set, marker bit is
+    /// not used for stream restart detection.
+    pub ignore_mark_bit: bool,
+
+    /// P2-DTMF-7: Change SSRC when a marker bit is sent. Some legacy
+    /// systems expect a new SSRC when the stream restarts (marker bit).
+    pub change_ssrc_on_marker: bool,
+
+    /// P2-DTMF-7: Accept any payload type for DTMF detection, not just
+    /// the negotiated telephone-event PT. Useful for interop with systems
+    /// that use non-standard payload types.
+    pub accept_any_payload: bool,
 }
 
 impl RtpBugFlags {
@@ -422,6 +453,9 @@ impl RtpBugFlags {
         // Cisco devices may skip marker bit handling
         if ua_lower.contains("cisco") {
             flags.never_send_marker = true;
+            // P1-DTMF-2: Cisco devices often omit the marker bit on DTMF packets,
+            // so use timestamp change as the new-digit signal on receive.
+            flags.cisco_skip_marker_2833 = true;
         }
 
         flags
@@ -430,12 +464,17 @@ impl RtpBugFlags {
     /// Check if any workarounds are enabled
     pub fn has_workarounds(&self) -> bool {
         self.sonus_dtmf_timestamp || self.never_send_marker
+            || self.ignore_duration || self.cisco_skip_marker_2833
+            || self.ignore_mark_bit || self.change_ssrc_on_marker
+            || self.accept_any_payload
     }
 
     /// Merge with another set of flags (OR operation)
     pub fn merge(&mut self, other: &Self) {
         self.sonus_dtmf_timestamp |= other.sonus_dtmf_timestamp;
         self.never_send_marker |= other.never_send_marker;
+        self.ignore_duration |= other.ignore_duration;
+        self.cisco_skip_marker_2833 |= other.cisco_skip_marker_2833;
     }
 }
 
@@ -563,7 +602,7 @@ impl DtmfSender {
     /// RTP timestamp at the moment the digit starts — per RFC 4733 §2.5 the
     /// DTMF event timestamp must be drawn from the audio stream.
     /// `interval_ms` is the ptime in milliseconds (typically 20ms) — the initial
-    /// packet duration matches one ptime interval, just like FreeSWITCH.
+    /// packet duration matches one ptime interval, per RFC 4733.
     ///
     /// Returns the packets to send immediately (first packet with marker bit).
     /// If a digit is already in progress, it is properly ended first (Bug #30).
@@ -601,7 +640,14 @@ impl DtmfSender {
         // carry one interval worth of duration rather than 0, which some
         // receivers interpret as an empty/invalid digit.
         // Bug #R6-7: Derive from actual ptime instead of hardcoding 160 (20ms).
-        // FreeSWITCH uses samples_per_interval for this, matching the ptime.
+        // Derive from actual ptime (samples_per_interval) per RFC 4733.
+        // P2-DTMF-10: The initial DTMF packet carries a non-zero duration equal
+        // to one ptime interval. This is intentional — per RFC 4733 Section 2.5.1.1,
+        // "the duration field... is updated by each new packet." The first packet
+        // reports the duration that has elapsed so far, which is one ptime interval
+        // (typically 20ms = 160 timestamp units at 8kHz). Starting at 0 would be
+        // misleading since the digit has already been active for one interval when
+        // the first packet is sent.
         let initial_duration = DtmfPayload::ms_to_timestamp(interval_ms.max(1));
         let payload = DtmfPayload::new(event, false, initial_duration);
         let packet = self.build_packet(&payload, true, seq);
@@ -665,11 +711,16 @@ impl DtmfSender {
             let payload = DtmfPayload::new(digit, true, actual_dur.min(u16::MAX as u32) as u16);
 
             if self.rtp_bugs.sonus_dtmf_timestamp {
-                // Bug #R6-8: In Sonus mode, each END packet gets its own
+                // Bug #R6-8 / P2-DTMF-2: In Sonus mode, each END packet gets its own
                 // incrementing timestamp and sequence number, matching
-                // FreeSWITCH's rtp_common_write() behavior for Sonus devices.
+                // Sonus compatibility: each END packet gets unique seq/timestamp.
                 // Sonus expects every RTP packet (including END redundancy)
                 // to have a unique, incrementing timestamp.
+                //
+                // This differs from RFC 4733 which requires all 3 redundant END
+                // packets to share the same timestamp and sequence number. The
+                // Sonus behavior is INCORRECT per the RFC but necessary for
+                // interoperability with Sonus SBCs and gateways.
                 for _ in 0..3 {
                     packets.push(self.build_packet(&payload, false, seq));
                 }
@@ -910,6 +961,8 @@ pub struct DtmfDetector {
     /// packets arrive (the RTP-timestamp-based check only runs when a new
     /// packet is processed).
     digit_start_time: Mutex<Option<Instant>>,
+    /// P1-DTMF-1/P1-DTMF-2: RTP bug flags for receive-side workarounds.
+    rtp_bugs: Mutex<RtpBugFlags>,
 }
 
 impl DtmfDetector {
@@ -931,7 +984,13 @@ impl DtmfDetector {
             first_packet_ts: AtomicU32::new(0),
             end_timeout_ms: DTMF_END_TIMEOUT_MS,
             digit_start_time: Mutex::new(None),
+            rtp_bugs: Mutex::new(RtpBugFlags::default()),
         }
+    }
+
+    /// Set RTP bug flags for receive-side workarounds (P1-DTMF-1, P1-DTMF-2).
+    pub fn set_rtp_bugs(&self, bugs: RtpBugFlags) {
+        *self.rtp_bugs.lock() = bugs;
     }
 
     /// Create with specific payload type (0 = accept any dynamic PT)
@@ -993,6 +1052,15 @@ impl DtmfDetector {
     /// Process incoming RTP packet
     ///
     /// Call this for every RTP packet. Returns detected digit on END packet.
+    ///
+    /// # Thread Safety
+    ///
+    /// This method uses a mix of atomic operations and mutexes for state.
+    /// **It must be called from a single thread** (or with external
+    /// serialization). Concurrent calls from multiple threads may produce
+    /// incorrect duration tracking or missed digits because the atomic
+    /// loads and stores across `in_digit_ts`, `last_duration`, `prev_seq`,
+    /// and `duration_flip` are not performed as a single atomic transaction.
     ///
     /// # Edge Cases Handled
     ///
@@ -1185,6 +1253,23 @@ impl DtmfDetector {
             self.first_packet_ts.store(timestamp, Ordering::Relaxed);
             // Bug #33: record wall-clock time for secondary timeout
             *self.digit_start_time.lock() = Some(Instant::now());
+
+            // P1-DTMF-1: When ignore_duration is set, report the digit
+            // immediately on the first packet instead of waiting for END.
+            if self.rtp_bugs.lock().ignore_duration {
+                let digit = current.take().unwrap();
+                let result = DetectedDtmf {
+                    digit: digit.to_char(),
+                    event: digit,
+                    duration_ms: DTMF_MIN_DURATION_MS,
+                    is_end: false,
+                };
+                self.last_end_timestamp.store(timestamp, Ordering::Relaxed);
+                self.first_packet_ts.store(0, Ordering::Relaxed);
+                *self.digit_start_time.lock() = None;
+                self.detected_queue.lock().push_back(result.clone());
+                return Some(result);
+            }
         } else if let Some(ref current_event) = *current {
             // Bug #63: Same timestamp but different event code — this is corrupt
             // or malformed. Log a warning and reject the packet.
@@ -1204,18 +1289,14 @@ impl DtmfDetector {
         // Bug #40: Detect wraparound with reordering guard.
         // Only trigger wraparound if:
         //   1. Duration actually decreased (dtmf.duration < last_dur), AND
-        //   2. The old duration was in the upper half of the 16-bit range
-        //      (last_dur > 0x8000 ~= 4 seconds), making a wrap plausible, AND
-        //   3. The new duration is dramatically smaller (new < old/2),
-        //      distinguishing a genuine wrap from out-of-order packets with
-        //      slightly decreasing durations.
-        // The old threshold (last_dur > 0xFC17) was too conservative and too
-        // narrow — it only caught wraps from ~7.9s+.  The new guard catches
-        // wraps from 4s+ while rejecting reordering artifacts.
-        // Bug #R9-2: Use >= to catch wraparound when last_dur is exactly 0x8000
+        //   2. The old duration was near the top of the 16-bit range
+        //      (last_dur >= 0xFC17 ~= 7.9 seconds), making a wrap plausible.
+        // The threshold of 0xFC17 matches production behavior where wraps
+        // only occur near the top of the 16-bit range. Using a lower
+        // threshold (e.g. 0x8000) causes false wraparound detection when
+        // reordered packets arrive with slightly lower durations.
         if dtmf.duration < last_dur
-            && last_dur >= 0x8000
-            && dtmf.duration < last_dur / 2
+            && last_dur >= 0xFC17
         {
             // Duration wrapped around, accumulate 0xFFFF
             self.duration_flip.fetch_add(0xFFFF, Ordering::Relaxed);

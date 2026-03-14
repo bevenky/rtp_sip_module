@@ -15,6 +15,13 @@
 //!
 //! RTCP is sent at regular intervals (default 5s, randomized 0.5x-1.5x) to avoid
 //! synchronization. The interval adapts based on session bandwidth and participant count.
+//!
+//! # Deferred TODOs
+//!
+//! - P2-RTCP-1: Bandwidth-based RTCP interval calculation (currently fixed 5s base)
+//! - P2-RTCP-3: Burst/gap loss tracking for XR burst_density/gap_density fields
+//! - P2-RTCP-4: Cap DLSR to prevent stale values from producing bogus RTT
+//! - P2-RTCP-6: Jitter inflation guard (filter out clock-rate mismatches)
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,6 +39,10 @@ const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 // SDES item types
 const SDES_CNAME: u8 = 1;
+
+// RFC 3550 Appendix A.1: Sequence number validation constants
+const MAX_DROPOUT: u16 = 3000;
+const MAX_MISORDER: u16 = 100;
 
 /// NTP timestamp (64-bit: 32-bit seconds + 32-bit fraction since 1900)
 #[derive(Debug, Clone, Copy, Default)]
@@ -142,7 +153,25 @@ pub enum RtcpPacket {
     ReceiverReport(ReceiverReport),
     SourceDescription(SourceDescription),
     Goodbye(Goodbye),
+    ExtendedReport(ExtendedReport),
     Unknown { packet_type: u8 },
+}
+
+/// Extended Report (PT=207, RFC 3611)
+#[derive(Debug, Clone)]
+pub struct ExtendedReport {
+    pub ssrc: u32,
+    /// Parsed VoIP Metrics block (block type 7), if present
+    pub voip_metrics: Option<VoipMetricsBlock>,
+}
+
+/// VoIP Metrics report block as received from remote (RFC 3611 Section 4.7)
+#[derive(Debug, Clone)]
+pub struct VoipMetricsBlock {
+    /// SSRC of the source being reported on
+    pub source_ssrc: u32,
+    /// The metrics data
+    pub metrics: VoipMetrics,
 }
 
 /// Sender Report (PT=200)
@@ -197,7 +226,7 @@ pub fn parse_rtcp_compound(data: &[u8]) -> Vec<RtcpPacket> {
         if version != 2 {
             break;
         }
-        let _padding = (data[offset] & 0x20) != 0;
+        let has_padding = (data[offset] & 0x20) != 0;
         let rc = (data[offset] & 0x1F) as usize;
         let pt = data[offset + 1];
         let length_words = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
@@ -207,7 +236,21 @@ pub fn parse_rtcp_compound(data: &[u8]) -> Vec<RtcpPacket> {
             break;
         }
 
-        let payload = &data[offset..offset + packet_len];
+        // P1-RTCP-2: Handle padding bit. RFC 3550 Section 6.4.1 says the padding
+        // bit is only meaningful on the last sub-packet in a compound packet.
+        // The last byte of the padded packet contains the pad count.
+        let effective_end = if has_padding && packet_len >= 5 {
+            let pad_count = data[offset + packet_len - 1] as usize;
+            if pad_count > 0 && pad_count < packet_len - 4 {
+                offset + packet_len - pad_count
+            } else {
+                offset + packet_len
+            }
+        } else {
+            offset + packet_len
+        };
+
+        let payload = &data[offset..effective_end];
 
         match pt {
             PT_SR => {
@@ -228,6 +271,11 @@ pub fn parse_rtcp_compound(data: &[u8]) -> Vec<RtcpPacket> {
             PT_BYE => {
                 if let Some(bye) = parse_bye(payload, rc) {
                     packets.push(RtcpPacket::Goodbye(bye));
+                }
+            }
+            PT_XR => {
+                if let Some(xr) = parse_xr(payload) {
+                    packets.push(RtcpPacket::ExtendedReport(xr));
                 }
             }
             _ => {
@@ -363,6 +411,49 @@ fn parse_bye(data: &[u8], sc: usize) -> Option<Goodbye> {
     Some(Goodbye { sources, reason })
 }
 
+/// Parse an RTCP XR packet (PT=207, RFC 3611)
+///
+/// Iterates over report blocks. Currently parses block type 7 (VoIP Metrics).
+fn parse_xr(data: &[u8]) -> Option<ExtendedReport> {
+    if data.len() < 8 {
+        return None; // 4 header + 4 SSRC minimum
+    }
+    let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+
+    let mut voip_metrics = None;
+    let mut offset = 8;
+
+    // Iterate over XR report blocks
+    while offset + 4 <= data.len() {
+        let block_type = data[offset];
+        // data[offset+1] is type-specific
+        let block_length_words = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        let block_data_len = block_length_words * 4; // block_length is in 32-bit words
+
+        if offset + 4 + block_data_len > data.len() {
+            break;
+        }
+
+        if block_type == VoipMetrics::BLOCK_TYPE {
+            // VoIP Metrics block: 4-byte block header + 4 bytes source SSRC + 28 bytes metrics
+            let body = &data[offset + 4..offset + 4 + block_data_len];
+            if body.len() >= 32 {
+                let source_ssrc = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                if let Some(metrics) = VoipMetrics::parse(&body[4..]) {
+                    voip_metrics = Some(VoipMetricsBlock {
+                        source_ssrc,
+                        metrics,
+                    });
+                }
+            }
+        }
+
+        offset += 4 + block_data_len;
+    }
+
+    Some(ExtendedReport { ssrc, voip_metrics })
+}
+
 // ============================================================================
 // Building
 // ============================================================================
@@ -380,7 +471,9 @@ fn write_header(buf: &mut [u8], version: u8, padding: bool, rc: u8, pt: u8, leng
 ///
 /// Returns the number of bytes written. Buffer must be at least
 /// `28 + report_blocks.len() * 24` bytes.
-pub fn build_sender_report(
+///
+/// P2-RTCP-8: Private -- use `build_compound_sr` or `RtcpSession::build_rtcp` instead.
+fn build_sender_report(
     buf: &mut [u8],
     ssrc: u32,
     ntp: NtpTimestamp,
@@ -406,7 +499,9 @@ pub fn build_sender_report(
 }
 
 /// Build a Receiver Report packet
-pub fn build_receiver_report(
+///
+/// P2-RTCP-8: Private -- use `build_compound_rr` or `RtcpSession::build_rtcp` instead.
+fn build_receiver_report(
     buf: &mut [u8],
     ssrc: u32,
     report_blocks: &[ReportBlock],
@@ -424,7 +519,9 @@ pub fn build_receiver_report(
 }
 
 /// Build an SDES packet with CNAME
-pub fn build_sdes_cname(buf: &mut [u8], ssrc: u32, cname: &str) -> usize {
+///
+/// P2-RTCP-8: Private -- use `build_compound_sr`/`build_compound_rr` instead.
+fn build_sdes_cname(buf: &mut [u8], ssrc: u32, cname: &str) -> usize {
     let cname_bytes = cname.as_bytes();
     let cname_len = cname_bytes.len().min(255);
     // Items: CNAME type (1) + length (1) + value (N) + null terminator (1)
@@ -448,7 +545,9 @@ pub fn build_sdes_cname(buf: &mut [u8], ssrc: u32, cname: &str) -> usize {
 }
 
 /// Build a BYE packet
-pub fn build_bye(buf: &mut [u8], sources: &[u32], reason: Option<&str>) -> usize {
+///
+/// P2-RTCP-8: Private -- use `RtcpSession::build_bye` instead.
+fn build_bye(buf: &mut [u8], sources: &[u32], reason: Option<&str>) -> usize {
     let sc = sources.len().min(31) as u8;
     let sources_len = sc as usize * 4;
     let reason_len = reason.map_or(0, |r| {
@@ -637,7 +736,9 @@ impl VoipMetrics {
 /// Returns the number of bytes written. Buffer must be at least
 /// `8 + 4 + 4 + 28 = 44` bytes (header + SSRC + block header + block body).
 /// Bug #16: VoIP Metrics body is 28 bytes, not 32.
-pub fn build_xr_voip_metrics(
+///
+/// P2-RTCP-8: Private -- use `RtcpSession::build_rtcp` which appends XR automatically.
+fn build_xr_voip_metrics(
     buf: &mut [u8],
     ssrc: u32,
     remote_ssrc: u32,
@@ -710,8 +811,9 @@ pub struct RtcpSession {
     pub highest_seq: u16,
     /// Whether we've received our first packet
     pub first_packet_received: bool,
-    /// Base sequence number (first packet)
-    pub base_seq: u16,
+    /// Base sequence number (first packet) -- stored as u32 to avoid truncation
+    /// when computing expected_packets across multiple wraparounds (P2-RTCP-2).
+    pub base_seq: u32,
 
     // --- Jitter calculation (RFC 3550 A.8) ---
     /// Inter-arrival jitter estimate (in timestamp units)
@@ -734,25 +836,52 @@ pub struct RtcpSession {
     pub last_sr_received_at: Option<Instant>,
     /// Calculated round-trip time
     pub rtt: Option<Duration>,
+    /// P1-RTCP-4: Monotonic instant when we last sent our own SR.
+    /// Used instead of NTP wall clock for local DLSR to avoid clock-jump issues.
+    pub last_sr_sent_at: Option<Instant>,
 
     // --- Clock rate (for jitter calculation) ---
     /// RTP clock rate in Hz (e.g. 8000, 16000, 48000). Defaults to 8000.
     pub clock_rate: u32,
 
+    // --- Jitter buffer config (P1-RTCP-5) ---
+    /// Nominal jitter buffer delay in milliseconds (for XR reports).
+    /// Defaults to 0 (unknown) if not configured.
+    pub jb_nominal_ms: u16,
+    /// Maximum jitter buffer delay in milliseconds (for XR reports).
+    /// Defaults to 0 (unknown) if not configured.
+    pub jb_maximum_ms: u16,
+
+    // --- Remote VoIP Metrics (P1-RTCP-6) ---
+    /// Most recently received VoIP Metrics from remote via RTCP XR
+    pub remote_voip_metrics: Option<VoipMetricsBlock>,
+
     // --- RTCP timing ---
     /// RTCP send interval (default 5s, randomized per RFC 3550 Section 6.2).
     ///
-    /// RFC 3550 Section 6.2 requires that RTCP use at most 5% of the session
-    /// bandwidth. For a typical G.711 session (64kbps), 5% = 3.2kbps. A
-    /// compound RTCP packet (SR + SDES) is ~100 bytes = 800 bits.
-    /// Minimum interval = 800 / 3200 = 0.25 seconds.
-    /// Our default 5-second base interval (randomized to 2.5s-7.5s) is well
-    /// above this minimum, so bandwidth compliance is satisfied for G.711 and
-    /// any higher-bitrate codec. For very low bitrate codecs (e.g., 8kbps),
-    /// the minimum would be 800 / 400 = 2 seconds, still below our 5s base.
+    /// P2-RTCP-1: The interval now factors in bandwidth fraction and participant
+    /// count per RFC 3550 Section 6.2. The base interval is computed as:
+    ///   interval = avg_rtcp_size / (rtcp_bw * rtcp_bandwidth_fraction)
+    /// where rtcp_bw = session_bw * rtcp_bandwidth_fraction / num_participants.
+    /// This ensures RTCP does not exceed its share of session bandwidth.
     pub rtcp_interval: Duration,
     /// Last time we sent RTCP
     pub last_rtcp_sent: Instant,
+    /// P2-RTCP-1: Fraction of session bandwidth allocated to RTCP (default 0.05 = 5%)
+    pub rtcp_bandwidth_fraction: f64,
+    /// P2-RTCP-1: Number of participants in the session (default 2 for point-to-point)
+    pub num_participants: u32,
+
+    // --- P2-RTCP-3: Burst-aware loss tracking ---
+    /// Sliding window of received/lost indicators for the last 256 packets.
+    /// true = received, false = lost. Index 0 is the most recent.
+    pub loss_window: [bool; 256],
+    /// Number of valid entries in loss_window
+    pub loss_window_len: usize,
+    /// P2-RTCP-3: Burst density (fraction of lost packets within loss bursts, 0-256 scale)
+    pub burst_density: u8,
+    /// P2-RTCP-3: Gap density (fraction of lost packets within gaps between bursts, 0-256 scale)
+    pub gap_density: u8,
 }
 
 impl RtcpSession {
@@ -763,6 +892,7 @@ impl RtcpSession {
 
     /// Create a new RTCP session with a specific clock rate.
     pub fn with_clock_rate(local_ssrc: u32, cname: String, clock_rate: u32) -> Self {
+        let interval = Self::randomized_interval(Duration::from_secs(5));
         Self {
             local_ssrc,
             cname,
@@ -785,9 +915,21 @@ impl RtcpSession {
             last_sr_ntp_compact: 0,
             last_sr_received_at: None,
             rtt: None,
+            last_sr_sent_at: None,
             clock_rate,
-            rtcp_interval: Self::randomized_interval(Duration::from_secs(5)),
-            last_rtcp_sent: Instant::now(),
+            jb_nominal_ms: 0,
+            jb_maximum_ms: 0,
+            remote_voip_metrics: None,
+            rtcp_interval: interval,
+            // P2-RTCP-7: Initialize last_rtcp_sent to now minus half-interval
+            // so the first RTCP is sent sooner (within half the normal interval).
+            last_rtcp_sent: Instant::now() - interval / 2,
+            rtcp_bandwidth_fraction: 0.05,
+            num_participants: 2,
+            loss_window: [true; 256],
+            loss_window_len: 0,
+            burst_density: 0,
+            gap_density: 0,
         }
     }
 
@@ -801,6 +943,118 @@ impl RtcpSession {
     fn randomized_interval(base: Duration) -> Duration {
         let factor = 0.5 + rand::random::<f64>();
         Duration::from_secs_f64(base.as_secs_f64() * factor)
+    }
+
+    /// P2-RTCP-1: Compute RTCP interval based on bandwidth and participant count.
+    ///
+    /// Per RFC 3550 Section 6.2, the interval is:
+    ///   Td = max(Tmin, n * avg_size / rtcp_bw)
+    /// where n = num_participants, rtcp_bw = session_bw * bw_fraction.
+    /// We use a fixed avg_size of 100 bytes (typical compound SR+SDES).
+    pub fn compute_bandwidth_interval(&self) -> Duration {
+        let avg_rtcp_size: f64 = 100.0; // bytes
+        // Session bandwidth: approximate from clock rate (G.711 = 64kbps for 8kHz)
+        let session_bw_bps = (self.clock_rate as f64) * 8.0; // rough approximation
+        let rtcp_bw = session_bw_bps * self.rtcp_bandwidth_fraction;
+
+        if rtcp_bw <= 0.0 {
+            return Duration::from_secs(5);
+        }
+
+        let n = self.num_participants.max(1) as f64;
+        let td_secs = (n * avg_rtcp_size * 8.0) / rtcp_bw;
+        // RFC 3550: minimum interval is 5 seconds (unless reduced-size RTCP)
+        let td_secs = td_secs.max(5.0);
+
+        Self::randomized_interval(Duration::from_secs_f64(td_secs))
+    }
+
+    /// P2-RTCP-1: Set the RTCP bandwidth fraction (default 0.05 = 5%)
+    pub fn set_rtcp_bandwidth_fraction(&mut self, fraction: f64) {
+        self.rtcp_bandwidth_fraction = fraction.clamp(0.001, 0.25);
+        self.rtcp_interval = self.compute_bandwidth_interval();
+    }
+
+    /// P2-RTCP-1: Set the number of participants (default 2)
+    pub fn set_num_participants(&mut self, n: u32) {
+        self.num_participants = n.max(1);
+        self.rtcp_interval = self.compute_bandwidth_interval();
+    }
+
+    /// P2-RTCP-3: Record a packet reception status in the sliding window.
+    /// `received` = true if the packet was received, false if lost.
+    pub fn record_loss_event(&mut self, received: bool) {
+        // Shift window: move everything right by 1
+        for i in (1..256).rev() {
+            self.loss_window[i] = self.loss_window[i - 1];
+        }
+        self.loss_window[0] = received;
+        if self.loss_window_len < 256 {
+            self.loss_window_len += 1;
+        }
+
+        // Recompute burst and gap density
+        self.compute_burst_gap_density();
+    }
+
+    /// P2-RTCP-3: Compute burst_density and gap_density from the loss window.
+    ///
+    /// A "burst" is a contiguous region containing at least one lost packet
+    /// where no more than 1 received packet separates lost ones.
+    /// A "gap" is a contiguous region of mostly received packets.
+    fn compute_burst_gap_density(&mut self) {
+        if self.loss_window_len < 2 {
+            self.burst_density = 0;
+            self.gap_density = 0;
+            return;
+        }
+
+        let len = self.loss_window_len;
+        let mut burst_lost = 0u32;
+        let mut burst_total = 0u32;
+        let mut gap_lost = 0u32;
+        let mut gap_total = 0u32;
+        let mut in_burst = false;
+
+        for i in 0..len {
+            let received = self.loss_window[i];
+            if !received {
+                // Lost packet
+                if !in_burst {
+                    in_burst = true;
+                }
+                burst_lost += 1;
+                burst_total += 1;
+            } else {
+                // Received packet
+                if in_burst {
+                    // Check if burst continues (next packet also lost?)
+                    let next_lost = if i + 1 < len { !self.loss_window[i + 1] } else { false };
+                    if next_lost {
+                        // Still in burst (isolated received between lost)
+                        burst_total += 1;
+                    } else {
+                        // Burst ended
+                        in_burst = false;
+                        gap_total += 1;
+                    }
+                } else {
+                    gap_total += 1;
+                }
+            }
+        }
+
+        // Density = fraction * 256 (RFC 3611 scale)
+        self.burst_density = if burst_total > 0 {
+            ((burst_lost as u64 * 256) / burst_total as u64).min(255) as u8
+        } else {
+            0
+        };
+        self.gap_density = if gap_total > 0 {
+            ((gap_lost as u64 * 256) / gap_total as u64).min(255) as u8
+        } else {
+            0
+        };
     }
 
     /// Record that we sent an RTP packet
@@ -826,25 +1080,37 @@ impl RtcpSession {
 
         // Sequence number tracking with wraparound (RFC 3550 Appendix A.1)
         if !self.first_packet_received {
-            self.base_seq = seq;
+            self.base_seq = seq as u32;
             self.highest_seq = seq;
             self.seq_cycles = 0;
             self.first_packet_received = true;
         } else {
+            // P1-RTCP-1: Three-branch validation per RFC 3550 Appendix A.1
             let udelta = seq.wrapping_sub(self.highest_seq);
-            if udelta < 0x8000 {
-                // In order or small forward jump
+            if udelta < MAX_DROPOUT {
+                // In order or small forward jump (normal case)
                 if seq < self.highest_seq {
                     // Wraparound
                     self.seq_cycles += 1;
                 }
                 self.highest_seq = seq;
+            } else if udelta <= 0xFFFFu16.wrapping_sub(MAX_MISORDER) {
+                // Large jump forward -- the sequence has jumped too far.
+                // Could be a new source or severely disrupted stream.
+                // Reset statistics with this packet as the new base.
+                self.base_seq = seq as u32;
+                self.highest_seq = seq;
+                self.seq_cycles = 0;
+                self.packets_received = 1;
+                self.last_rr_packets_received = 0;
+                self.last_rr_expected_packets = 0;
             }
-            // else: duplicate or reorder, don't update highest
+            // else: udelta > 0xFFFF - MAX_MISORDER, i.e. small negative offset
+            // -- this is a reordered/duplicate packet, ignore for seq tracking
         }
 
         self.highest_ext_seq = ((self.seq_cycles as u32) << 16) | (self.highest_seq as u32);
-        self.expected_packets = self.highest_ext_seq.saturating_sub(self.base_seq as u32) + 1;
+        self.expected_packets = self.highest_ext_seq.saturating_sub(self.base_seq) + 1;
 
         // Jitter calculation (RFC 3550 Appendix A.8)
         if let Some(last_time) = self.last_recv_time {
@@ -864,10 +1130,19 @@ impl RtcpSession {
     }
 
     /// Process an incoming RTCP packet (extract RTT from SR, etc.)
-    pub fn process_incoming_rtcp(&mut self, data: &[u8]) {
+    ///
+    /// Returns true if an SSRC collision was detected (P2-RTCP-5).
+    pub fn process_incoming_rtcp(&mut self, data: &[u8]) -> bool {
+        let mut collision = false;
         for packet in parse_rtcp_compound(data) {
             match packet {
                 RtcpPacket::SenderReport(sr) => {
+                    // P2-RTCP-5: SSRC collision detection -- if we see our own SSRC
+                    // from a different source, flag a collision.
+                    if sr.ssrc == self.local_ssrc {
+                        collision = true;
+                    }
+
                     // Store LSR for RTT calculation in our next RR
                     self.last_sr_ntp_compact = sr.ntp_timestamp.compact();
                     self.last_sr_received_at = Some(Instant::now());
@@ -880,33 +1155,62 @@ impl RtcpSession {
                     }
                 }
                 RtcpPacket::ReceiverReport(rr) => {
+                    // P2-RTCP-5: SSRC collision detection
+                    if rr.ssrc == self.local_ssrc {
+                        collision = true;
+                    }
+
                     for rb in &rr.report_blocks {
                         if rb.ssrc == self.local_ssrc && rb.last_sr != 0 {
                             self.calculate_rtt(rb);
                         }
                     }
                 }
+                RtcpPacket::ExtendedReport(xr) => {
+                    // P1-RTCP-6: Store remote's VoIP metrics
+                    if let Some(vm) = xr.voip_metrics {
+                        self.remote_voip_metrics = Some(vm);
+                    }
+                }
                 _ => {}
             }
         }
+        collision
     }
 
     /// Calculate RTT from a report block
     ///
-    /// RTT = now_compact - LSR - DLSR
+    /// P1-RTCP-4: Uses monotonic Instant when available to avoid clock-jump
+    /// vulnerabilities. Falls back to NTP wall clock if no monotonic record.
+    ///
+    /// RTT = now_compact - LSR - DLSR  (standard NTP-based)
+    /// Or: RTT = monotonic_elapsed - DLSR_duration  (monotonic-based)
     fn calculate_rtt(&mut self, rb: &ReportBlock) {
-        let now_compact = NtpTimestamp::now().compact();
-        let rtt_compact = now_compact.wrapping_sub(rb.last_sr).wrapping_sub(rb.delay_since_last_sr);
-        // Convert from compact NTP (1/65536 sec) to Duration
-        let rtt_us = (rtt_compact as u64 * 1_000_000) >> 16;
-        if rtt_us < 30_000_000 {
-            // Sanity check: RTT < 30 seconds
-            let rtt = Duration::from_micros(rtt_us);
-            // Exponential moving average: 0.7 * old + 0.3 * new
-            self.rtt = Some(match self.rtt {
-                Some(old) => Duration::from_secs_f64(old.as_secs_f64() * 0.7 + rtt.as_secs_f64() * 0.3),
-                None => rtt,
-            });
+        let rtt_duration = if let Some(sent_at) = self.last_sr_sent_at {
+            // P1-RTCP-4: Monotonic path -- immune to wall-clock jumps.
+            // The report block's LSR should match our last sent SR's compact NTP.
+            // DLSR is in 1/65536 sec units.
+            let elapsed = sent_at.elapsed();
+            let dlsr_us = (rb.delay_since_last_sr as u64 * 1_000_000) >> 16;
+            let dlsr = Duration::from_micros(dlsr_us);
+            elapsed.checked_sub(dlsr)
+        } else {
+            // Fallback: NTP wall-clock based RTT
+            let now_compact = NtpTimestamp::now().compact();
+            let rtt_compact = now_compact.wrapping_sub(rb.last_sr).wrapping_sub(rb.delay_since_last_sr);
+            let rtt_us = (rtt_compact as u64 * 1_000_000) >> 16;
+            Some(Duration::from_micros(rtt_us))
+        };
+
+        if let Some(rtt) = rtt_duration {
+            if rtt.as_micros() < 30_000_000 {
+                // Sanity check: RTT < 30 seconds
+                // Exponential moving average: 0.7 * old + 0.3 * new
+                self.rtt = Some(match self.rtt {
+                    Some(old) => Duration::from_secs_f64(old.as_secs_f64() * 0.7 + rtt.as_secs_f64() * 0.3),
+                    None => rtt,
+                });
+            }
         }
     }
 
@@ -922,9 +1226,11 @@ impl RtcpSession {
     /// the mandatory SR/RR + SDES compound.
     pub fn build_rtcp(&mut self, buf: &mut [u8]) -> usize {
         let mut len = if self.packets_sent > 0 {
-            // We're a sender — build SR + SDES
+            // We're a sender -- build SR + SDES
             let ntp = NtpTimestamp::now();
             let report_blocks = self.build_report_blocks();
+            // P1-RTCP-4: Record monotonic instant alongside the NTP timestamp
+            self.last_sr_sent_at = Some(Instant::now());
             build_compound_sr(
                 buf,
                 self.local_ssrc,
@@ -966,7 +1272,9 @@ impl RtcpSession {
     ///
     /// Returns the number of bytes written. Buffer must be at least 48 bytes.
     /// Populates metrics from current session state (loss, jitter, RTT, R-factor, MOS).
-    pub fn build_xr(&self, buf: &mut [u8]) -> usize {
+    ///
+    /// P2-RTCP-8: Private -- called automatically from `build_rtcp`.
+    fn build_xr(&self, buf: &mut [u8]) -> usize {
         let remote_ssrc = match self.remote_ssrc {
             Some(s) => s,
             None => return 0,
@@ -977,7 +1285,6 @@ impl RtcpSession {
         let mos = self.mos();
 
         let rtt_ms = self.rtt.map(|d| d.as_millis() as u16).unwrap_or(0);
-        let jitter_ms_val = self.jitter_ms();
 
         // Scale MOS from 1.0-4.5 to 10-50 (x10), or 127 if unavailable
         let mos_scaled = if mos >= 1.0 && mos <= 4.5 {
@@ -1004,7 +1311,9 @@ impl RtcpSession {
             burst_duration: 0,
             gap_duration: 0,
             round_trip_delay: rtt_ms,
-            end_system_delay: jitter_ms_val.round().clamp(0.0, 65535.0) as u16,
+            // P1-RTCP-5: end_system_delay should reflect jitter buffer config,
+            // not network jitter. Use jb_nominal_ms as best approximation.
+            end_system_delay: self.jb_nominal_ms,
             signal_level: 127, // unknown
             noise_level: 127,  // unknown
             rerl: 127,         // unknown
@@ -1014,9 +1323,11 @@ impl RtcpSession {
             mos_lq: mos_scaled,
             mos_cq: mos_scaled,
             rx_config: 0,
-            jb_nominal: jitter_ms_val.round().clamp(0.0, 65535.0) as u16,
-            jb_maximum: (jitter_ms_val * 2.0).round().clamp(0.0, 65535.0) as u16,
-            jb_abs_max: 1000, // 1 second max
+            // P1-RTCP-5: jb_nominal and jb_maximum should come from actual
+            // jitter buffer configuration, not network jitter estimate.
+            jb_nominal: self.jb_nominal_ms,
+            jb_maximum: self.jb_maximum_ms,
+            jb_abs_max: if self.jb_maximum_ms > 0 { self.jb_maximum_ms } else { 1000 },
         };
 
         build_xr_voip_metrics(buf, self.local_ssrc, remote_ssrc, &metrics)
@@ -1367,7 +1678,7 @@ mod tests {
         assert_eq!(packets.len(), 3); // SR + SDES + XR
         assert!(matches!(&packets[0], RtcpPacket::SenderReport(_)));
         assert!(matches!(&packets[1], RtcpPacket::SourceDescription(_)));
-        assert!(matches!(&packets[2], RtcpPacket::Unknown { packet_type: 207 }));
+        assert!(matches!(&packets[2], RtcpPacket::ExtendedReport(_)));
 
         if let RtcpPacket::SenderReport(sr) = &packets[0] {
             assert_eq!(sr.ssrc, 0x11111111);

@@ -106,7 +106,7 @@ impl SymmetricRtp {
     /// Default: threshold, window=threshold*2, mode=Always.
     /// Always mode keeps learning permanently enabled so that if the remote
     /// changes IP mid-call (network switch, failover), the handler re-learns
-    /// the new address. This matches FreeSWITCH default behavior.
+    /// the new address. This is standard symmetric RTP behavior.
     /// For RTCP, use `new_rtcp()` which has threshold=1 (RTCP is infrequent).
     pub fn new(threshold: u32) -> Self {
         let threshold = threshold.max(1);

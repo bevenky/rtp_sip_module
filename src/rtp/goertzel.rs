@@ -4,7 +4,7 @@
 //! Uses the Goertzel algorithm (efficient single-frequency DFT)
 //! to detect the 8 DTMF frequencies.
 //!
-//! FreeSWITCH uses similar Goertzel-based detection in its
+//! The Goertzel algorithm is the standard approach for
 //! `start_dtmf` dialplan application.
 
 use std::f64::consts::PI;
@@ -22,10 +22,14 @@ const POWER_THRESHOLD: f64 = 4.0e5;
 /// Normal twist: row > col allowed up to 8dB, reverse twist: col > row up to 4dB
 const NORMAL_TWIST_DB: f64 = 8.0;
 const REVERSE_TWIST_DB: f64 = 4.0;
-/// Minimum number of consecutive frames with same digit before reporting
-const MIN_DETECTION_FRAMES: u32 = 2;
-/// Minimum frames of silence between digits
-const MIN_SILENCE_FRAMES: u32 = 1;
+/// Minimum number of consecutive frames with same digit before reporting.
+/// 3 frames (~38ms at 102-sample blocks / 8kHz) reduces false positives
+/// from transient noise or speech harmonics.
+const MIN_DETECTION_FRAMES: u32 = 3;
+/// Minimum frames of silence between digits.
+/// 3 frames (~38ms) prevents a brief amplitude dip mid-digit from
+/// splitting it into two detections.
+const MIN_SILENCE_FRAMES: u32 = 3;
 
 /// Goertzel state for a single frequency
 struct GoertzelBin {
@@ -68,16 +72,26 @@ impl GoertzelBin {
     }
 }
 
+/// P2-DTMF-3: Second harmonic frequencies for DTMF row frequencies (Hz).
+/// Used to reject false detections from speech harmonics per ITU-T Q.24.
+const ROW_HARMONIC_FREQS: [f64; 4] = [1394.0, 1540.0, 1704.0, 1882.0];
+
 /// Inband DTMF detector using Goertzel algorithm
 pub struct GoertzelDtmfDetector {
     /// Goertzel bins for row frequencies
     row_bins: [GoertzelBin; 4],
     /// Goertzel bins for column frequencies
     col_bins: [GoertzelBin; 4],
+    /// P2-DTMF-3: Goertzel bins for second harmonics of row frequencies
+    row_harmonic_bins: [GoertzelBin; 4],
     /// Block size (number of samples per analysis window)
     block_size: usize,
     /// Sample rate
     sample_rate: u32,
+    /// P2-DTMF-9: Expected sample count per block for rate validation
+    expected_samples_per_block: usize,
+    /// P2-DTMF-9: Whether we've warned about sample rate mismatch
+    rate_warned: bool,
     /// Current sample position within block
     sample_pos: usize,
     /// Currently detected digit (None if silence)
@@ -122,6 +136,14 @@ impl GoertzelDtmfDetector {
             GoertzelBin::new(COL_FREQS[3], sample_rate, block_size),
         ];
 
+        // P2-DTMF-3: Second harmonic bins for row frequencies
+        let row_harmonic_bins = [
+            GoertzelBin::new(ROW_HARMONIC_FREQS[0], sample_rate, block_size),
+            GoertzelBin::new(ROW_HARMONIC_FREQS[1], sample_rate, block_size),
+            GoertzelBin::new(ROW_HARMONIC_FREQS[2], sample_rate, block_size),
+            GoertzelBin::new(ROW_HARMONIC_FREQS[3], sample_rate, block_size),
+        ];
+
         // Bug #73: Scale the power threshold by block_size^2 so it matches
         // the normalized power values computed in analyze_block.
         let scaled_threshold = POWER_THRESHOLD / (block_size * block_size) as f64;
@@ -129,8 +151,11 @@ impl GoertzelDtmfDetector {
         Self {
             row_bins,
             col_bins,
+            row_harmonic_bins,
             block_size,
             sample_rate,
+            expected_samples_per_block: block_size,
+            rate_warned: false,
             sample_pos: 0,
             current_digit: None,
             detection_count: 0,
@@ -154,6 +179,21 @@ impl GoertzelDtmfDetector {
     pub fn process(&mut self, samples: &[i16]) -> Vec<InbandDtmf> {
         self.detected.clear();
 
+        // P2-DTMF-9: Warn if sample count suggests rate mismatch
+        if !self.rate_warned && !samples.is_empty() {
+            let expected_20ms = self.sample_rate as usize / 50;
+            if samples.len() > expected_20ms * 3 {
+                tracing::warn!(
+                    frame_len = samples.len(),
+                    sample_rate = self.sample_rate,
+                    "Goertzel: fed {} samples but expected ~{} for configured rate; \
+                     possible sample rate mismatch",
+                    samples.len(), expected_20ms
+                );
+                self.rate_warned = true;
+            }
+        }
+
         for &sample in samples {
             let s = sample as f64;
 
@@ -161,6 +201,10 @@ impl GoertzelDtmfDetector {
                 bin.process_sample(s);
             }
             for bin in &mut self.col_bins {
+                bin.process_sample(s);
+            }
+            // P2-DTMF-3: Feed second harmonic bins
+            for bin in &mut self.row_harmonic_bins {
                 bin.process_sample(s);
             }
 
@@ -173,6 +217,9 @@ impl GoertzelDtmfDetector {
                     bin.reset();
                 }
                 for bin in &mut self.col_bins {
+                    bin.reset();
+                }
+                for bin in &mut self.row_harmonic_bins {
                     bin.reset();
                 }
             }
@@ -237,10 +284,16 @@ impl GoertzelDtmfDetector {
 
                 // Primary must be at least 6dB above second
                 if max_row_power > second_row * 4.0 && max_col_power > second_col * 4.0 {
-                    // TODO: Add second-harmonic Goertzel bins for row frequencies
-                    // (1394, 1540, 1710, 1882 Hz) and reject when harmonic energy
-                    // exceeds 50% of fundamental per ITU-T Q.24
-                    Some(dtmf_char(max_row_idx, max_col_idx))
+                    // P2-DTMF-3: Second harmonic rejection per ITU-T Q.24.
+                    // Reject when the 2nd harmonic of the detected row frequency
+                    // exceeds 50% of the fundamental's power. This prevents
+                    // speech harmonics from triggering false DTMF detections.
+                    let harmonic_power = self.row_harmonic_bins[max_row_idx].power() / norm;
+                    if harmonic_power > max_row_power * 0.5 {
+                        None // Second harmonic too strong — likely speech, not DTMF
+                    } else {
+                        Some(dtmf_char(max_row_idx, max_col_idx))
+                    }
                 } else {
                     None
                 }
@@ -319,6 +372,9 @@ impl GoertzelDtmfDetector {
             bin.reset();
         }
         for bin in &mut self.col_bins {
+            bin.reset();
+        }
+        for bin in &mut self.row_harmonic_bins {
             bin.reset();
         }
     }

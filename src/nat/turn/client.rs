@@ -114,8 +114,11 @@ struct TrackedChannelBinding {
 pub struct TurnClient {
     /// TURN server address
     server: SocketAddr,
-    /// Authentication credentials
-    auth: TurnAuth,
+    /// P1-NAT-6: Authentication credentials stored in Arc<Mutex<>> so the
+    /// background refresh loop can update the nonce in-place when it
+    /// receives a 438 Stale Nonce response, propagating the new nonce to
+    /// subsequent permission and channel binding refreshes.
+    auth: Arc<Mutex<TurnAuth>>,
     /// Current state
     state: Arc<Mutex<TurnState>>,
     /// Current allocation info (if allocated)
@@ -139,12 +142,12 @@ impl TurnClient {
     pub fn new(server: SocketAddr, username: &str, password: &str, realm: &str) -> Self {
         Self {
             server,
-            auth: TurnAuth {
+            auth: Arc::new(Mutex::new(TurnAuth {
                 username: username.to_string(),
                 password: password.to_string(),
                 realm: realm.to_string(),
                 nonce: None,
-            },
+            })),
             state: Arc::new(Mutex::new(TurnState::Init)),
             allocation: Arc::new(Mutex::new(None)),
             refresh_handle: Mutex::new(None),
@@ -204,8 +207,11 @@ impl TurnClient {
             if let Some(401) = response.error_code() {
                 // Extract realm and nonce from the error response
                 let (realm, nonce) = extract_auth_challenge(&response)?;
-                self.auth.realm = realm;
-                self.auth.nonce = Some(nonce);
+                {
+                    let mut auth = self.auth.lock();
+                    auth.realm = realm;
+                    auth.nonce = Some(nonce);
+                }
 
                 // Step 3: Retry with authentication
                 request = self.build_allocate_request();
@@ -228,7 +234,7 @@ impl TurnClient {
                     // matching the pattern used in refresh().
                     if code == 438 {
                         if let Some(new_nonce) = extract_nonce(&auth_response) {
-                            self.auth.nonce = Some(new_nonce);
+                            self.auth.lock().nonce = Some(new_nonce);
                             let mut retry_request = self.build_allocate_request();
                             self.add_auth_attributes(&mut retry_request);
                             let retry_response = match self
@@ -262,8 +268,9 @@ impl TurnClient {
 
                     *self.state.lock() = TurnState::Init;
                     return Err(RtpSipError::Auth(format!(
-                        "TURN Allocate failed with error {}",
-                        code
+                        "TURN Allocate failed with error {}: {}",
+                        code,
+                        turn_error_description(code)
                     )));
                 }
 
@@ -275,8 +282,9 @@ impl TurnClient {
                 *self.state.lock() = TurnState::Init;
                 let code = response.error_code().unwrap_or(0);
                 return Err(RtpSipError::Sip(format!(
-                    "TURN Allocate failed with error {}",
-                    code
+                    "TURN Allocate failed with error {}: {}",
+                    code,
+                    turn_error_description(code)
                 )));
             }
         }
@@ -308,8 +316,9 @@ impl TurnClient {
         if response.is_error() {
             let code = response.error_code().unwrap_or(0);
             return Err(RtpSipError::Sip(format!(
-                "TURN CreatePermission failed with error {}",
-                code
+                "TURN CreatePermission failed with error {}: {}",
+                code,
+                turn_error_description(code)
             )));
         }
 
@@ -357,8 +366,9 @@ impl TurnClient {
         if response.is_error() {
             let code = response.error_code().unwrap_or(0);
             return Err(RtpSipError::Sip(format!(
-                "TURN ChannelBind failed with error {}",
-                code
+                "TURN ChannelBind failed with error {}: {}",
+                code,
+                turn_error_description(code)
             )));
         }
 
@@ -407,7 +417,7 @@ impl TurnClient {
             // Bug #47: Handle 438 Stale Nonce
             if code == 438 {
                 if let Some(new_nonce) = extract_nonce(&response) {
-                    self.auth.nonce = Some(new_nonce);
+                    self.auth.lock().nonce = Some(new_nonce);
                     let mut retry_request = self.build_refresh_request(lifetime);
                     self.add_auth_attributes(&mut retry_request);
                     let retry_response = self.send_request(socket, &retry_request).await?;
@@ -482,7 +492,9 @@ impl TurnClient {
         let permissions = Arc::clone(&self.permissions);
         let channel_bindings = Arc::clone(&self.channel_bindings);
         let server = self.server;
-        let auth = self.auth.clone();
+        // P1-NAT-6: Clone the Arc so the refresh loop shares the same auth
+        // state and can propagate nonce updates from 438 responses.
+        let auth_arc = Arc::clone(&self.auth);
 
         let handle = tokio::spawn(async move {
             // Bug #33 fix: Track time for permission and channel binding refresh.
@@ -491,6 +503,10 @@ impl TurnClient {
             let mut next_alloc_refresh = tokio::time::Instant::now();
 
             loop {
+                // P1-NAT-6: Snapshot the auth state at the start of each loop
+                // iteration so we use the latest nonce (which may have been
+                // updated by a 438 retry in a previous iteration).
+                let auth = auth_arc.lock().clone();
                 let lifetime = {
                     let alloc = allocation.lock();
                     match alloc.as_ref() {
@@ -561,6 +577,8 @@ impl TurnClient {
                                          extracting new nonce and retrying"
                                     );
                                     if let Some(new_nonce) = extract_nonce(&response) {
+                                        // P1-NAT-6: Propagate updated nonce to shared auth
+                                        auth_arc.lock().nonce = Some(new_nonce.clone());
                                         let mut retry_auth = auth.clone();
                                         retry_auth.nonce = Some(new_nonce);
                                         let mut retry_request =
@@ -661,10 +679,58 @@ impl TurnClient {
                         }
                         Ok(response) => {
                             let code = response.error_code().unwrap_or(0);
-                            tracing::warn!(
-                                peer = %peer_addr, error_code = code,
-                                "TURN permission refresh failed"
-                            );
+                            // P1-NAT-12: Handle 438 Stale Nonce for permission refresh.
+                            // Extract the new nonce and retry the request.
+                            if code == 438 {
+                                tracing::info!(
+                                    peer = %peer_addr,
+                                    "TURN permission refresh received 438 Stale Nonce, retrying"
+                                );
+                                if let Some(new_nonce) = extract_nonce(&response) {
+                                    // P1-NAT-6: Propagate updated nonce to shared auth
+                                    auth_arc.lock().nonce = Some(new_nonce.clone());
+                                    let mut retry_auth = auth.clone();
+                                    retry_auth.nonce = Some(new_nonce);
+                                    let mut retry_req = build_create_permission_request_static(peer_addr);
+                                    add_auth_attributes_static(&retry_auth, &mut retry_req);
+                                    let retry_key = retry_auth.compute_key();
+                                    match send_request_static(&socket, server, &retry_req, Some(&retry_key)).await {
+                                        Ok(retry_resp) if retry_resp.is_success() => {
+                                            let mut perms = permissions.lock();
+                                            if let Some(p) = perms.iter_mut().find(|p| p.peer_addr == peer_addr) {
+                                                p.created = std::time::Instant::now();
+                                            }
+                                            tracing::debug!(
+                                                peer = %peer_addr,
+                                                "TURN permission refreshed after stale nonce retry"
+                                            );
+                                        }
+                                        Ok(retry_resp) => {
+                                            let c = retry_resp.error_code().unwrap_or(0);
+                                            tracing::warn!(
+                                                peer = %peer_addr, error_code = c,
+                                                "TURN permission refresh retry after 438 failed"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                peer = %peer_addr, error = %e,
+                                                "TURN permission refresh retry after 438 failed"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        peer = %peer_addr,
+                                        "438 response missing NONCE for permission refresh"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    peer = %peer_addr, error_code = code,
+                                    "TURN permission refresh failed"
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -704,10 +770,58 @@ impl TurnClient {
                         }
                         Ok(response) => {
                             let code = response.error_code().unwrap_or(0);
-                            tracing::warn!(
-                                peer = %peer_addr, channel = channel, error_code = code,
-                                "TURN channel binding refresh failed"
-                            );
+                            // P1-NAT-13: Handle 438 Stale Nonce for channel binding refresh.
+                            // Extract the new nonce and retry the request.
+                            if code == 438 {
+                                tracing::info!(
+                                    peer = %peer_addr, channel = channel,
+                                    "TURN channel binding refresh received 438 Stale Nonce, retrying"
+                                );
+                                if let Some(new_nonce) = extract_nonce(&response) {
+                                    // P1-NAT-6: Propagate updated nonce to shared auth
+                                    auth_arc.lock().nonce = Some(new_nonce.clone());
+                                    let mut retry_auth = auth.clone();
+                                    retry_auth.nonce = Some(new_nonce);
+                                    let mut retry_req = build_channel_bind_request_static(peer_addr, channel);
+                                    add_auth_attributes_static(&retry_auth, &mut retry_req);
+                                    let retry_key = retry_auth.compute_key();
+                                    match send_request_static(&socket, server, &retry_req, Some(&retry_key)).await {
+                                        Ok(retry_resp) if retry_resp.is_success() => {
+                                            let mut bindings = channel_bindings.lock();
+                                            if let Some(b) = bindings.iter_mut().find(|b| b.channel == channel) {
+                                                b.created = std::time::Instant::now();
+                                            }
+                                            tracing::debug!(
+                                                peer = %peer_addr, channel = channel,
+                                                "TURN channel binding refreshed after stale nonce retry"
+                                            );
+                                        }
+                                        Ok(retry_resp) => {
+                                            let c = retry_resp.error_code().unwrap_or(0);
+                                            tracing::warn!(
+                                                peer = %peer_addr, channel = channel, error_code = c,
+                                                "TURN channel binding refresh retry after 438 failed"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                peer = %peer_addr, channel = channel, error = %e,
+                                                "TURN channel binding refresh retry after 438 failed"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        peer = %peer_addr, channel = channel,
+                                        "438 response missing NONCE for channel binding refresh"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    peer = %peer_addr, channel = channel, error_code = code,
+                                    "TURN channel binding refresh failed"
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -790,7 +904,8 @@ impl TurnClient {
 
     /// Add authentication attributes (USERNAME, REALM, NONCE, MESSAGE-INTEGRITY)
     fn add_auth_attributes(&self, msg: &mut StunMessage) {
-        add_auth_attributes_static(&self.auth, msg);
+        let auth = self.auth.lock();
+        add_auth_attributes_static(&auth, msg);
     }
 
     /// Parse a successful Allocate response to extract allocation info
@@ -826,7 +941,7 @@ impl TurnClient {
         socket: &UdpSocket,
         request: &StunMessage,
     ) -> Result<StunMessage> {
-        let key = self.auth.compute_key();
+        let key = self.auth.lock().compute_key();
         send_request_static(socket, self.server, request, Some(&key)).await
     }
 }
@@ -838,6 +953,23 @@ impl Drop for TurnClient {
 }
 
 // --- Static helper functions (usable from both methods and background tasks) ---
+
+/// P2-NAT-7: Format a descriptive TURN error message for known error codes.
+fn turn_error_description(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden (credentials valid but operation not permitted)",
+        420 => "Unknown Attribute",
+        437 => "Allocation Mismatch (5-tuple already has an allocation)",
+        438 => "Stale Nonce",
+        441 => "Wrong Credentials",
+        442 => "Unsupported Transport Protocol (server does not support requested transport)",
+        486 => "Allocation Quota Reached (too many allocations for this user)",
+        508 => "Insufficient Capacity (server is overloaded)",
+        _ => "Unknown error",
+    }
+}
 
 /// Build a Refresh request with a given lifetime (static version)
 /// Bug #33: Build a CreatePermission request (static version for refresh loop)
@@ -1255,29 +1387,38 @@ fn decode_xor_address(data: &[u8], txn_id: &TransactionId) -> Option<SocketAddr>
 /// Compute MESSAGE-INTEGRITY (HMAC-SHA1) for a STUN message.
 ///
 /// Per RFC 5389 Section 15.4:
-/// - The message is serialized with the MESSAGE-INTEGRITY attribute length included
-///   in the message header length, but without the actual attribute value.
-/// - HMAC-SHA1 is computed over this partial serialization using the key.
+/// The HMAC is computed over the STUN message up to and including the attribute
+/// preceding the MESSAGE-INTEGRITY attribute, with the message header length
+/// adjusted to include the MESSAGE-INTEGRITY TLV (24 bytes: 4 header + 20 HMAC).
+///
+/// FINGERPRINT is NOT included in the HMAC input because it comes after
+/// MESSAGE-INTEGRITY in the attribute ordering (RFC 5389 Section 15.5).
 fn compute_message_integrity(msg: &StunMessage, key: &[u8]) -> Vec<u8> {
+    use crate::nat::stun::message::HEADER_SIZE;
     use hmac::{Hmac, Mac};
     use sha1::Sha1;
 
-    // Serialize the message as-is (without MESSAGE-INTEGRITY)
-    let current_bytes = msg.marshal();
+    // Encode user attributes only (no FINGERPRINT, no MESSAGE-INTEGRITY)
+    let mut attr_bytes = Vec::new();
+    for attr in &msg.attributes {
+        attr_bytes.extend_from_slice(&attr.encode(&msg.transaction_id));
+    }
 
-    // The MESSAGE-INTEGRITY attribute will add 24 bytes (4 header + 20 HMAC value).
-    // We need to adjust the STUN message length in the header to include it.
-    let mut adjusted = current_bytes;
-    let current_attr_len = adjusted.len() - 20; // current attribute bytes length
-    let new_attr_len = current_attr_len + 24; // add MESSAGE-INTEGRITY (4 + 20)
-    let len_bytes = (new_attr_len as u16).to_be_bytes();
-    adjusted[2] = len_bytes[0];
-    adjusted[3] = len_bytes[1];
+    // Build the HMAC input: header + user_attrs, with header length adjusted
+    // to include the MESSAGE-INTEGRITY TLV (24 bytes) that will follow.
+    let mi_adjusted_attr_len = attr_bytes.len() + 24;
 
-    // Compute HMAC-SHA1 over the adjusted message
+    let mut hmac_input = Vec::with_capacity(HEADER_SIZE + attr_bytes.len());
+    hmac_input.extend_from_slice(&msg.msg_type.to_be_bytes());
+    hmac_input.extend_from_slice(&(mi_adjusted_attr_len as u16).to_be_bytes());
+    hmac_input.extend_from_slice(&crate::nat::stun::message::MAGIC_COOKIE.to_be_bytes());
+    hmac_input.extend_from_slice(&msg.transaction_id);
+    hmac_input.extend_from_slice(&attr_bytes);
+
+    // Compute HMAC-SHA1
     let mut mac =
         Hmac::<Sha1>::new_from_slice(key).expect("HMAC can take key of any size");
-    mac.update(&adjusted);
+    mac.update(&hmac_input);
     let result = mac.finalize();
     result.into_bytes().to_vec()
 }
@@ -1984,7 +2125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_rejects_when_not_allocated() {
-        let client = TurnClient::new(
+        let mut client = TurnClient::new(
             "127.0.0.1:3478".parse().unwrap(),
             "user",
             "pass",

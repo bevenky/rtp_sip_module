@@ -68,7 +68,9 @@ impl RtpPacketBuilder {
         // Increment sequence (wraps at 65535)
         self.sequence = self.sequence.wrapping_add(1);
         // Increment timestamp by number of samples
-        debug_assert!(samples > 0, "timestamp advance with zero samples");
+        // P2-RTP-2: Use a regular assert (not debug_assert) so this check
+        // fires in release builds too — zero-sample advances corrupt timestamps.
+        assert!(samples > 0, "timestamp advance with zero samples");
         self.timestamp = self.timestamp.wrapping_add(samples);
 
         packet
@@ -138,8 +140,27 @@ impl RtpPacketBuilder {
 }
 
 /// Parse an RTP packet from bytes
+///
+/// P2-RTP-1: After the 12-byte minimum check, extract the CC (CSRC count) field
+/// and verify the packet is at least 12 + CC*4 bytes long.
 pub fn parse_rtp_packet(data: &[u8]) -> Result<Packet> {
-    Packet::unmarshal(&mut data.to_vec().as_slice())
+    // P2-RTP-1: CSRC-aware validation — the fixed header is 12 bytes, but if
+    // the CC field (bits 0-3 of byte 0) is nonzero, each CSRC adds 4 bytes.
+    if data.len() >= 12 {
+        let cc = (data[0] & 0x0F) as usize;
+        let min_len = 12 + cc * 4;
+        if data.len() < min_len {
+            return Err(RtpSipError::Rtp(format!(
+                "RTP packet too short for CC={}: {} bytes, need at least {}",
+                cc, data.len(), min_len
+            )));
+        }
+    }
+
+    // P1-RTP-7: Avoid unnecessary Vec allocation — borrow the slice directly
+    // instead of copying to a Vec via data.to_vec().
+    let mut buf: &[u8] = data;
+    Packet::unmarshal(&mut buf)
         .map_err(|e| RtpSipError::Rtp(format!("Failed to parse RTP packet: {}", e)))
 }
 

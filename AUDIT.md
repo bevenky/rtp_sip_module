@@ -1,7 +1,7 @@
 # Comprehensive Audit Report: rtp_sip_module
 
 **Date:** 2026-03-11
-**Sources:** Internal codebase, plivo-mediaserver (FreeSWITCH), agent-stack (plivo-voice-core), 8 open-source Rust repos, viska/rvoip issue trackers
+**Sources:** Internal codebase, plivo-mediaserver (reference implementation), agent-stack (plivo-voice-core), 8 open-source Rust repos, viska/rvoip issue trackers
 
 ---
 
@@ -94,7 +94,7 @@ We never check `version == 2`. Non-RTP packets on the same port (STUN, DTLS) wou
 
 ### Comparison Matrix
 
-| Feature | Ours (jitter.rs) | agent-stack (adaptive_jitter_buffer.rs) | plivo-mediaserver (FreeSWITCH) | rvoip |
+| Feature | Ours (jitter.rs) | agent-stack (adaptive_jitter_buffer.rs) | plivo-mediaserver (reference implementation) | rvoip |
 |---------|-------------------|----------------------------------------|-------------------------------|-------|
 | **Lines of code** | 295 | 935 | 2,632 | ~500 |
 | **Data structure** | BTreeMap<u16, Packet> | Circular buffer (Vec) | Linked list + hashtable | BTreeMap<u32, Packet> |
@@ -169,7 +169,7 @@ We delegate to `audio-codec-algorithms` (karip's crate), which is ITU G.191 refe
 
 ### Comparison with plivo-mediaserver
 
-| Feature | Ours | plivo-mediaserver (FreeSWITCH) |
+| Feature | Ours | plivo-mediaserver (reference implementation) |
 |---------|------|-------------------------------|
 | Basic REFER | Yes (dialog.refer()) | Yes (nua_refer) |
 | Referred-By header | **No** | Yes (SIPTAG_REFERRED_BY_STR) |
@@ -186,7 +186,7 @@ We delegate to `audio-codec-algorithms` (karip's crate), which is ITU G.191 refe
 
 1. **No REFER subscription timeout:** If the remote never sends NOTIFY after accepting REFER, `refer_pending` stays true forever. We need a 30-second timeout (RFC 3515 Section 2.4.7 recommends the subscription duration from Expires header, defaulting to implicit dialog lifetime).
 
-2. **No Referred-By header (RFC 3892):** Some PBXes (Asterisk, FreeSWITCH) use this to identify who initiated the transfer. We should include it in REFER requests.
+2. **No Referred-By header (RFC 3892):** Some PBXes (Asterisk, reference implementation) use this to identify who initiated the transfer. We should include it in REFER requests.
 
 3. **Consultation call validation:** `attended_transfer()` doesn't verify the consultation call is still active before sending REFER. If it hung up, we'll send a REFER with a dead Replaces header, causing a 481.
 
@@ -207,7 +207,7 @@ RFC 3550 Section 6 makes RTCP **mandatory**. Without it:
 - No congestion feedback
 - Some endpoints may drop calls without RTCP
 
-### What plivo-mediaserver Has (FreeSWITCH)
+### What plivo-mediaserver Has (reference implementation)
 
 Full RTCP stack: SR, RR, SDES, BYE, APP, XR, feedback (PLI, FIR, NACK, TWCC), FEC/RED, RTT calculation, loss reporting, jitter statistics, event-driven stats exposure.
 
@@ -618,4 +618,4 @@ trait RtpTransport: Send + Sync {
 | **siphon-rs** | SIP stack | 15-crate separation, nom parser, transaction state machines |
 | **rvoip** | Full SIP/RTP | Adaptive jitter, RTCP, SRTP, MediaSync, congestion detection, RtpTransport trait |
 | **agent-stack** | Production voice | Best jitter buffer, ITU PLC, comfort noise, codecs, VAD, resampler |
-| **plivo-mediaserver** | FreeSWITCH | Industrial RTCP, FEC/RED, NACK, time-skew detection, full transfer support |
+| **plivo-mediaserver** | reference implementation | Industrial RTCP, FEC/RED, NACK, time-skew detection, full transfer support |

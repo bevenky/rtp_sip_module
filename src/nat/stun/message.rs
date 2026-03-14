@@ -25,6 +25,9 @@ pub const MAGIC_COOKIE: u32 = 0x2112_A442;
 /// STUN header size
 pub const HEADER_SIZE: usize = 20;
 
+/// MESSAGE-INTEGRITY attribute type (RFC 5389 Section 15.4)
+pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+
 /// FINGERPRINT attribute type (RFC 5389 Section 15.5)
 pub const ATTR_FINGERPRINT: u16 = 0x8028;
 
@@ -178,7 +181,13 @@ impl StunMessage {
                 &transaction_id,
             ) {
                 attributes.push(attr);
+            } else if attr_type < 0x8000 {
+                // P1-NAT-14: Comprehension-required attribute (type < 0x8000)
+                // that we cannot decode. Per RFC 5389 Section 7.3.1, the
+                // message must be rejected.
+                return Err(StunError::UnknownComprehensionRequired(attr_type));
             }
+            // Comprehension-optional (>= 0x8000): safe to skip
 
             // Advance past attribute value, padded to 4-byte boundary
             offset += (attr_len + 3) & !3;
@@ -216,14 +225,12 @@ impl StunMessage {
         })
     }
 
-    /// Serialize this message to bytes
+    /// Serialize this message to bytes.
     ///
-    /// TODO(Bug #102): For strict RFC 5389 compliance, this should append a
-    /// FINGERPRINT attribute (CRC-32 XOR'd with 0x5354554E) as the last
-    /// attribute. The unmarshal path already validates FINGERPRINT when
-    /// present. Omitting it is interoperable with most STUN implementations
-    /// since FINGERPRINT is optional, but some strict middleboxes may
-    /// require it for reliable STUN-vs-data demultiplexing.
+    /// Appends a FINGERPRINT attribute (RFC 5389 Section 15.5) as the last
+    /// attribute. The CRC-32 is computed over the STUN message with the header
+    /// length adjusted to include the 8-byte FINGERPRINT TLV, then XOR'd with
+    /// 0x5354554E.
     pub fn marshal(&self) -> Vec<u8> {
         // Encode all attributes first to compute total length
         let mut attr_bytes = Vec::new();
@@ -231,16 +238,102 @@ impl StunMessage {
             attr_bytes.extend_from_slice(&attr.encode(&self.transaction_id));
         }
 
-        let mut buf = Vec::with_capacity(HEADER_SIZE + attr_bytes.len());
+        // Total attribute length including the FINGERPRINT TLV (8 bytes: 4 header + 4 value)
+        let total_attr_len = attr_bytes.len() + 8;
 
-        // Header
+        let mut buf = Vec::with_capacity(HEADER_SIZE + total_attr_len);
+
+        // Header -- message length includes the FINGERPRINT attribute
         buf.extend_from_slice(&self.msg_type.to_be_bytes());
-        buf.extend_from_slice(&(attr_bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&(total_attr_len as u16).to_be_bytes());
         buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
         buf.extend_from_slice(&self.transaction_id);
 
-        // Attributes
+        // Attributes (before FINGERPRINT)
         buf.extend_from_slice(&attr_bytes);
+
+        // Compute CRC-32 over the message so far (header + attributes),
+        // with the header length already adjusted to include FINGERPRINT.
+        let crc = crc32fast::hash(&buf) ^ FINGERPRINT_XOR;
+
+        // Append FINGERPRINT attribute: type 0x8028, length 4, value = crc
+        buf.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&crc.to_be_bytes());
+
+        buf
+    }
+
+    /// Serialize this message to bytes with MESSAGE-INTEGRITY (HMAC-SHA1).
+    ///
+    /// Per RFC 5389 Section 15.4:
+    /// 1. Serialize the message with the header length adjusted to include
+    ///    the MESSAGE-INTEGRITY TLV (24 bytes: 4 header + 20 HMAC-SHA1).
+    /// 2. Compute HMAC-SHA1 over those bytes using the provided key.
+    /// 3. Append MESSAGE-INTEGRITY as attribute type 0x0008.
+    /// 4. Then append FINGERPRINT after MESSAGE-INTEGRITY.
+    ///
+    /// The key depends on the credential mechanism:
+    /// - Short-term: key = SASLprep(password)
+    /// - Long-term: key = MD5(username:realm:password)
+    pub fn marshal_with_integrity(&self, integrity_key: &[u8]) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+
+        // Encode all user attributes first
+        let mut attr_bytes = Vec::new();
+        for attr in &self.attributes {
+            attr_bytes.extend_from_slice(&attr.encode(&self.transaction_id));
+        }
+
+        // Step 1: Build the message with header length adjusted to include
+        // MESSAGE-INTEGRITY (24 bytes) but NOT yet FINGERPRINT.
+        // The HMAC is computed over: header + user_attrs, where header.length
+        // = user_attrs.len() + 24 (for the MI TLV itself).
+        let mi_adjusted_attr_len = attr_bytes.len() + 24; // includes MI TLV
+
+        let mut hmac_input = Vec::with_capacity(HEADER_SIZE + attr_bytes.len());
+        hmac_input.extend_from_slice(&self.msg_type.to_be_bytes());
+        hmac_input.extend_from_slice(&(mi_adjusted_attr_len as u16).to_be_bytes());
+        hmac_input.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        hmac_input.extend_from_slice(&self.transaction_id);
+        hmac_input.extend_from_slice(&attr_bytes);
+
+        // Step 2: Compute HMAC-SHA1
+        let mut mac = Hmac::<Sha1>::new_from_slice(integrity_key)
+            .expect("HMAC can take key of any size");
+        mac.update(&hmac_input);
+        let hmac_result = mac.finalize().into_bytes();
+
+        // Step 3: Build final message with MI + FINGERPRINT.
+        // Total attr length = user_attrs + MI(24) + FINGERPRINT(8)
+        let total_attr_len = attr_bytes.len() + 24 + 8;
+
+        let mut buf = Vec::with_capacity(HEADER_SIZE + total_attr_len);
+
+        // Header -- length includes MI + FINGERPRINT
+        buf.extend_from_slice(&self.msg_type.to_be_bytes());
+        buf.extend_from_slice(&(total_attr_len as u16).to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&self.transaction_id);
+
+        // User attributes
+        buf.extend_from_slice(&attr_bytes);
+
+        // MESSAGE-INTEGRITY attribute: type 0x0008, length 20, value = HMAC-SHA1
+        buf.extend_from_slice(&ATTR_MESSAGE_INTEGRITY.to_be_bytes());
+        buf.extend_from_slice(&20u16.to_be_bytes());
+        buf.extend_from_slice(&hmac_result);
+
+        // Now compute FINGERPRINT over everything so far (header + attrs + MI),
+        // but first adjust header length to include FINGERPRINT (already done above).
+        // The CRC input needs the header length set to total_attr_len (which it already is).
+        let crc = crc32fast::hash(&buf) ^ FINGERPRINT_XOR;
+
+        // FINGERPRINT attribute: type 0x8028, length 4, value = CRC32 XOR
+        buf.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&crc.to_be_bytes());
 
         buf
     }
@@ -336,6 +429,11 @@ pub enum StunError {
     TruncatedAttribute,
     /// FINGERPRINT attribute CRC-32 check failed
     FingerprintMismatch,
+    /// P1-NAT-14: Unknown comprehension-required attribute (type < 0x8000)
+    /// that we cannot decode. Per RFC 5389 Section 7.3.1, if an agent receives
+    /// a STUN message containing comprehension-required attributes that it
+    /// doesn't understand, the message must be rejected.
+    UnknownComprehensionRequired(u16),
 }
 
 impl std::fmt::Display for StunError {
@@ -352,6 +450,13 @@ impl std::fmt::Display for StunError {
             StunError::FingerprintMismatch => {
                 write!(f, "FINGERPRINT CRC-32 verification failed")
             }
+            StunError::UnknownComprehensionRequired(attr_type) => {
+                write!(
+                    f,
+                    "unknown comprehension-required STUN attribute 0x{:04X}",
+                    attr_type
+                )
+            }
         }
     }
 }
@@ -367,7 +472,8 @@ mod tests {
         let data = msg.marshal();
 
         assert!(StunMessage::is_stun(&data));
-        assert_eq!(data.len(), HEADER_SIZE); // no attributes
+        // P1-NAT-1: marshal now appends FINGERPRINT (8 bytes)
+        assert_eq!(data.len(), HEADER_SIZE + 8); // no user attributes + 8-byte FINGERPRINT
 
         let parsed = StunMessage::unmarshal(&data).unwrap();
         assert_eq!(parsed.msg_type, BINDING_REQUEST);
@@ -735,5 +841,74 @@ mod tests {
         let data = msg.marshal();
         let parsed = StunMessage::unmarshal(&data).unwrap();
         assert_eq!(parsed.xor_mapped_address(), Some(addr));
+    }
+
+    // --- P1-NAT-2 tests: marshal_with_integrity ---
+
+    #[test]
+    fn test_marshal_with_integrity_includes_message_integrity() {
+        let key = b"test-key-for-hmac";
+        let msg = StunMessage::new_binding_request();
+        let data = msg.marshal_with_integrity(key);
+
+        // Should be: header(20) + MI(24) + FINGERPRINT(8) = 52 bytes
+        assert_eq!(data.len(), HEADER_SIZE + 24 + 8);
+
+        // Verify it's still valid STUN
+        assert!(StunMessage::is_stun(&data));
+
+        // Verify MESSAGE-INTEGRITY attribute is present (type 0x0008)
+        // Starts right after header (byte 20)
+        let mi_type = u16::from_be_bytes([data[20], data[21]]);
+        assert_eq!(mi_type, ATTR_MESSAGE_INTEGRITY);
+        let mi_len = u16::from_be_bytes([data[22], data[23]]);
+        assert_eq!(mi_len, 20); // HMAC-SHA1 = 20 bytes
+
+        // Verify FINGERPRINT is after MI (starts at 20 + 24 = 44)
+        let fp_type = u16::from_be_bytes([data[44], data[45]]);
+        assert_eq!(fp_type, ATTR_FINGERPRINT);
+    }
+
+    #[test]
+    fn test_marshal_with_integrity_deterministic() {
+        let key = b"deterministic-key";
+        let msg = StunMessage {
+            msg_type: BINDING_REQUEST,
+            transaction_id: [0xAA; 12],
+            attributes: vec![],
+        };
+        let data1 = msg.marshal_with_integrity(key);
+        let data2 = msg.marshal_with_integrity(key);
+        assert_eq!(data1, data2);
+    }
+
+    #[test]
+    fn test_marshal_with_integrity_different_keys_differ() {
+        let msg = StunMessage {
+            msg_type: BINDING_REQUEST,
+            transaction_id: [0xBB; 12],
+            attributes: vec![],
+        };
+        let data1 = msg.marshal_with_integrity(b"key-one");
+        let data2 = msg.marshal_with_integrity(b"key-two");
+        // The HMAC values at bytes 24..44 should differ
+        assert_ne!(data1[24..44], data2[24..44]);
+    }
+
+    #[test]
+    fn test_marshal_with_integrity_with_attributes() {
+        let key = b"attr-key";
+        let addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let msg = StunMessage {
+            msg_type: BINDING_REQUEST,
+            transaction_id: [0xCC; 12],
+            attributes: vec![StunAttribute::XorMappedAddress(addr)],
+        };
+        let data = msg.marshal_with_integrity(key);
+
+        // XOR-MAPPED-ADDRESS is 12 bytes (4 header + 8 value for IPv4)
+        // Total = 20 (header) + 12 (XMA) + 24 (MI) + 8 (FP) = 64
+        assert_eq!(data.len(), 64);
+        assert!(StunMessage::is_stun(&data));
     }
 }

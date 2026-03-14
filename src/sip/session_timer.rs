@@ -59,11 +59,11 @@ impl Default for SessionTimerConfig {
     }
 }
 
-/// Grace period added to the session expiry before declaring the session dead.
-/// RFC 4028 Section 10 recommends a value of at least one third of the
-/// Session-Expires interval, but a fixed 32-second grace is a widely adopted
-/// practical default.
-const EXPIRY_GRACE_SECONDS: u64 = 32;
+/// P1-TIMER-1: Compute the grace period for a given session_expires value.
+/// Uses min(32, session_expires / 3) instead of a fixed 32s.
+fn grace_seconds(session_expires: u32) -> u64 {
+    std::cmp::min(32, u64::from(session_expires) / 3)
+}
 
 /// Active session timer state for a single call.
 ///
@@ -134,8 +134,8 @@ impl SessionTimer {
         if !self.active || self.role != RefreshRole::Local {
             return false;
         }
-        let half_interval = Duration::from_secs(u64::from(self.session_expires) / 2);
-        self.last_refresh.elapsed() >= half_interval
+        let refresh_interval = self.refresh_interval();
+        self.last_refresh.elapsed() >= refresh_interval
     }
 
     /// Check if the session has expired (no refresh received within interval).
@@ -147,8 +147,8 @@ impl SessionTimer {
         if !self.active {
             return false;
         }
-        let expiry =
-            Duration::from_secs(u64::from(self.session_expires) + EXPIRY_GRACE_SECONDS);
+        let grace = grace_seconds(self.session_expires);
+        let expiry = Duration::from_secs(u64::from(self.session_expires) + grace);
         self.last_refresh.elapsed() >= expiry
     }
 
@@ -161,9 +161,9 @@ impl SessionTimer {
         if !self.active || self.role != RefreshRole::Local {
             return None;
         }
-        let half_interval = Duration::from_secs(u64::from(self.session_expires) / 2);
+        let refresh_interval = self.refresh_interval();
         let elapsed = self.last_refresh.elapsed();
-        Some(half_interval.saturating_sub(elapsed))
+        Some(refresh_interval.saturating_sub(elapsed))
     }
 
     /// Time until session expiry (including the grace period).
@@ -174,8 +174,8 @@ impl SessionTimer {
         if !self.active {
             return Duration::ZERO;
         }
-        let expiry =
-            Duration::from_secs(u64::from(self.session_expires) + EXPIRY_GRACE_SECONDS);
+        let grace = grace_seconds(self.session_expires);
+        let expiry = Duration::from_secs(u64::from(self.session_expires) + grace);
         let elapsed = self.last_refresh.elapsed();
         expiry.saturating_sub(elapsed)
     }
@@ -184,16 +184,16 @@ impl SessionTimer {
     ///
     /// Format: `<seconds>;refresher=<uac|uas>`
     ///
-    /// The `refresher` parameter uses UAC/UAS terminology per RFC 4028:
-    /// - `Local` maps to `uac` (we originated the dialog)
-    /// - `Remote` maps to `uas`
-    ///
-    /// Callers that are the UAS side of the dialog should swap the mapping
-    /// accordingly when constructing the final header.
-    pub fn build_session_expires_header(&self) -> String {
-        let refresher = match self.role {
-            RefreshRole::Local => "uac",
-            RefreshRole::Remote => "uas",
+    /// P1-TIMER-4: `is_uac` indicates whether *we* are the UAC side of the
+    /// dialog. The mapping of Local/Remote to uac/uas depends on this:
+    /// - If we are UAC: Local -> uac, Remote -> uas
+    /// - If we are UAS: Local -> uas, Remote -> uac
+    pub fn build_session_expires_header(&self, is_uac: bool) -> String {
+        let refresher = match (self.role, is_uac) {
+            (RefreshRole::Local, true) => "uac",
+            (RefreshRole::Local, false) => "uas",
+            (RefreshRole::Remote, true) => "uas",
+            (RefreshRole::Remote, false) => "uac",
         };
         format!("{};refresher={}", self.session_expires, refresher)
     }
@@ -342,6 +342,17 @@ impl SessionTimer {
 
     // ── private helpers ──────────────────────────────────────────────
 
+    /// P2-TIMER-6: Compute the refresh interval.
+    /// Uses min(session_expires/2, session_expires - grace) where
+    /// grace = min(32, session_expires/3).
+    fn refresh_interval(&self) -> Duration {
+        let se = u64::from(self.session_expires);
+        let grace = grace_seconds(self.session_expires);
+        let half = se / 2;
+        let before_grace = se.saturating_sub(grace);
+        Duration::from_secs(std::cmp::min(half, before_grace))
+    }
+
     /// Extract the `RefreshRole` from a parameters string like `"refresher=uac"`.
     ///
     /// Bug #71: The mapping depends on whether *we* are the UAC or UAS:
@@ -418,33 +429,33 @@ mod tests {
 
     #[test]
     fn test_is_expired_after_full_interval() {
-        // session_expires = 1 second, grace = 32 seconds is too long for a test.
-        // We test the logic by using a 1-second interval and verifying that
-        // is_expired is false before the full interval and true after
-        // session_expires + grace.  Since the grace is 32s we cannot sleep that
-        // long in a unit test; instead we test that the session is NOT expired
-        // right after session_expires and rely on the arithmetic being correct
-        // via time_until_expiry.
+        // P1-TIMER-1: grace = min(32, session_expires/3).
+        // With session_expires=3, grace = min(32, 1) = 1. Total = 4s.
+        // Use session_expires=3 so we can test within a reasonable time.
         let config = SessionTimerConfig {
-            session_expires: 1,
+            session_expires: 3,
             min_se: 1,
             ..Default::default()
         };
         let mut timer = SessionTimer::new(config);
-        timer.start(1, RefreshRole::Local);
+        timer.start(3, RefreshRole::Local);
 
         // Immediately: not expired.
         assert!(!timer.is_expired());
 
-        // After 1 second (session_expires) but before grace period: not expired.
-        thread::sleep(Duration::from_millis(1100));
+        // After 3 seconds (session_expires) but before grace period: not expired.
+        thread::sleep(Duration::from_millis(3100));
         assert!(!timer.is_expired());
 
-        // Verify time_until_expiry is roughly 32 seconds minus the elapsed ~1s
+        // Verify time_until_expiry is roughly grace (1s) minus the small overshoot
         let remaining = timer.time_until_expiry();
-        // Should be around 31 seconds (33 total - ~1.1s elapsed)
-        assert!(remaining.as_secs() <= 32);
-        assert!(remaining.as_secs() >= 29);
+        // Total = 3 + 1 = 4s. Elapsed ~3.1s. Remaining ~0.9s.
+        assert!(remaining.as_millis() <= 1000);
+        assert!(remaining.as_millis() >= 700);
+
+        // After total interval (4s), should be expired.
+        thread::sleep(Duration::from_millis(1000));
+        assert!(timer.is_expired());
     }
 
     #[test]
@@ -520,17 +531,29 @@ mod tests {
         let mut timer = SessionTimer::new(SessionTimerConfig::default());
         timer.start(1800, RefreshRole::Local);
 
+        // P1-TIMER-4: As UAC, Local -> uac
         assert_eq!(
-            timer.build_session_expires_header(),
+            timer.build_session_expires_header(true),
             "1800;refresher=uac"
+        );
+        // P1-TIMER-4: As UAS, Local -> uas
+        assert_eq!(
+            timer.build_session_expires_header(false),
+            "1800;refresher=uas"
         );
         assert_eq!(timer.build_min_se_header(), "90");
 
         // Switch to remote role.
         timer.start(900, RefreshRole::Remote);
+        // P1-TIMER-4: As UAC, Remote -> uas
         assert_eq!(
-            timer.build_session_expires_header(),
+            timer.build_session_expires_header(true),
             "900;refresher=uas"
+        );
+        // P1-TIMER-4: As UAS, Remote -> uac
+        assert_eq!(
+            timer.build_session_expires_header(false),
+            "900;refresher=uac"
         );
     }
 
@@ -581,7 +604,7 @@ mod tests {
         // The session_expires should be clamped to min_se (90).
         assert_eq!(timer.session_expires, 90);
         assert_eq!(
-            timer.build_session_expires_header(),
+            timer.build_session_expires_header(true),
             "90;refresher=uac"
         );
     }

@@ -57,6 +57,24 @@ use std::net::{IpAddr, SocketAddr};
 /// Used for hold/resume and one-way media scenarios. Works identically for
 /// inbound and outbound calls.
 ///
+/// # Perspective (P2-SIP-1)
+///
+/// Direction attributes describe the media flow from the **sender's perspective**
+/// (the party that includes the attribute in their SDP):
+///
+/// - `sendonly`: The SDP sender will only send media, and expects the remote
+///   to not send (i.e., the sender is putting the remote on hold).
+/// - `recvonly`: The SDP sender will only receive media, and expects the remote
+///   to send. This is typically the **response** to a `sendonly` offer -- the
+///   remote acknowledges that it will receive-only.
+/// - `inactive`: Neither party sends media.
+/// - `sendrecv`: Both parties send and receive (default).
+///
+/// When **we** see `recvonly` in a **remote** SDP, it means the remote will
+/// only receive -- so from our perspective, we should only send. Conversely,
+/// when we see `sendonly` in remote SDP, the remote will only send -- so we
+/// should only receive.
+///
 /// # Hold/Resume Semantics (RFC 6337)
 ///
 /// When putting a call on hold:
@@ -77,11 +95,11 @@ pub enum MediaDirection {
     /// Bidirectional media (default)
     #[default]
     SendRecv,
-    /// Send-only (local on hold, remote can receive)
+    /// Send-only from SDP sender's perspective (sender holds, remote receives)
     SendOnly,
-    /// Receive-only (remote on hold, local can receive)
+    /// Receive-only from SDP sender's perspective (sender receives, remote sends)
     RecvOnly,
-    /// No media (both on hold)
+    /// No media in either direction (both on hold)
     Inactive,
 }
 
@@ -150,6 +168,8 @@ pub struct MediaDescription {
     pub attributes: Vec<String>,
     /// Media direction (sendrecv/sendonly/recvonly/inactive)
     pub direction: MediaDirection,
+    /// P2-SIP-9: Parsed ptime value from remote SDP (packetization time in ms)
+    pub ptime: Option<u32>,
 }
 
 impl MediaDescription {
@@ -249,6 +269,8 @@ impl Sdp {
         let mut has_version = false;
         let mut has_origin = false;
         let mut has_session_name = false;
+        // P2-SIP-8: Track whether t= line is present
+        let mut has_timing = false;
 
         for line in sdp_str.lines() {
             let line = line.trim();
@@ -331,8 +353,20 @@ impl Sdp {
                         session_attributes.push(value.to_string());
                     }
                 }
+                't' => {
+                    // P2-SIP-8: Track timing line presence
+                    has_timing = true;
+                }
                 _ => {}
             }
+        }
+
+        // P2-SIP-8: Warn if t= line is missing (mandatory per RFC 4566)
+        if !has_timing {
+            tracing::warn!(
+                "SDP missing mandatory t= (timing) line; \
+                 RFC 4566 requires at least one t= line"
+            );
         }
 
         // Save last media if exists
@@ -478,9 +512,19 @@ impl Sdp {
         }
         let port = port_u32 as u16;
         let protocol = parts[2].to_string();
+        // P2-SIP-16: Log debug when payload type parsing fails instead of silently ignoring
         let payload_types: Vec<u8> = parts[3..]
             .iter()
-            .filter_map(|s| s.parse().ok())
+            .filter_map(|s| match s.parse() {
+                Ok(pt) => Some(pt),
+                Err(_) => {
+                    tracing::debug!(
+                        "SDP: ignoring unparseable payload type '{}' in m= line",
+                        s
+                    );
+                    None
+                }
+            })
             .collect();
 
         Ok(MediaDescription {
@@ -493,6 +537,7 @@ impl Sdp {
             fmtp: Vec::new(),
             attributes: Vec::new(),
             direction: MediaDirection::SendRecv, // Default per RFC 3264
+            ptime: None,
         })
     }
 
@@ -615,16 +660,10 @@ impl Sdp {
             }
         }
 
-        // Check if 101 is in payload types (common default for telephone-event)
-        if audio.payload_types.contains(&101) {
-            // Verify it's not used for something else by checking rtpmap
-            let used_for_other = audio.rtpmap.iter().any(|e| {
-                e.payload_type == 101 && !e.encoding_name.eq_ignore_ascii_case("telephone-event")
-            });
-            if !used_for_other {
-                return Some(101);
-            }
-        }
+        // P2-SIP-14: Removed risky fallback that assumed PT 101 is telephone-event
+        // without an rtpmap declaration. Only use rtpmap-declared payload types.
+        // The old code assumed PT 101 = telephone-event if it was in payload_types
+        // but not mapped to something else, which could misidentify other codecs.
 
         None
     }
@@ -740,6 +779,12 @@ impl Sdp {
 }
 
 /// SDP Builder for generating SDP offers/answers
+///
+/// P2-SIP-7: SdpBuilder uses `&mut self` in `build()` because each call increments
+/// the session_version in the origin line (RFC 3264 Section 8 requires increasing
+/// o= version on re-INVITEs). This is intentional: the builder is meant to be
+/// reused across the lifetime of a call, with each build() producing a new SDP
+/// with a higher version number. Callers must declare the builder as `mut`.
 #[derive(Debug, Clone)]
 pub struct SdpBuilder {
     origin: SdpOrigin,
@@ -751,6 +796,12 @@ pub struct SdpBuilder {
     direction: String,
     /// Include telephone-event for RFC 2833 DTMF (payload type 101)
     include_telephone_event: bool,
+    /// Dynamically selected payload type for telephone-event
+    telephone_event_pt: u8,
+    /// SDP protocol (e.g., "RTP/AVP" or "RTP/SAVP")
+    protocol: String,
+    /// Optional SRTP crypto attribute (suite, base64-encoded key)
+    crypto: Option<(String, String)>,
 }
 
 impl SdpBuilder {
@@ -772,6 +823,9 @@ impl SdpBuilder {
             codecs: vec![CodecType::Pcmu, CodecType::Pcma],
             direction: "sendrecv".to_string(),
             include_telephone_event: true, // RFC 2833 DTMF by default
+            telephone_event_pt: 101,
+            protocol: "RTP/AVP".to_string(),
+            crypto: None,
         }
     }
 
@@ -800,6 +854,36 @@ impl SdpBuilder {
         self
     }
 
+    /// P1-SIP-8: Set media protocol (e.g., "RTP/AVP", "RTP/SAVP", "RTP/SAVPF")
+    pub fn with_protocol(mut self, proto: &str) -> Self {
+        self.protocol = proto.to_string();
+        self
+    }
+
+    /// P1-SIP-9: Set SRTP crypto attributes for a=crypto line generation
+    ///
+    /// Generates `a=crypto:1 {suite} inline:{key_base64}` in the SDP output.
+    /// Common suites: "AES_CM_128_HMAC_SHA1_80", "AES_CM_128_HMAC_SHA1_32"
+    pub fn with_crypto(mut self, suite: &str, key_base64: &str) -> Self {
+        self.crypto = Some((suite.to_string(), key_base64.to_string()));
+        self
+    }
+
+    /// P2-SIP-17: Select an available dynamic payload type for telephone-event.
+    ///
+    /// Finds the first dynamic PT (96-127) not already used by the configured codecs.
+    /// Call this after setting codecs if you need a non-default PT.
+    pub fn select_telephone_event_pt(mut self) -> Self {
+        let used_pts: Vec<u8> = self.codecs.iter().map(|c| c.payload_type()).collect();
+        for pt in 96..=127u8 {
+            if !used_pts.contains(&pt) {
+                self.telephone_event_pt = pt;
+                break;
+            }
+        }
+        self
+    }
+
     /// Build the SDP string
     ///
     /// Bug #20 fix: Each call to build() increments session_version so that
@@ -820,18 +904,20 @@ impl SdpBuilder {
             .map(|c| c.payload_type().to_string())
             .collect();
 
-        // Add telephone-event (PT 101) if enabled
+        // P2-SIP-17: Use dynamically selected telephone-event payload type
+        let te_pt = self.telephone_event_pt;
         if self.include_telephone_event {
-            payload_types.push("101".to_string());
+            payload_types.push(te_pt.to_string());
         }
 
+        // P1-SIP-8: Use configured protocol instead of hardcoded RTP/AVP
         let mut sdp = format!(
             "v=0\r\n\
              o={} {} {} {} {} {}\r\n\
              s={}\r\n\
              c=IN {} {}\r\n\
              t=0 0\r\n\
-             m=audio {} RTP/AVP {}\r\n",
+             m=audio {} {} {}\r\n",
             self.origin.username,
             self.origin.session_id,
             self.origin.session_version,
@@ -842,8 +928,17 @@ impl SdpBuilder {
             addr_type,
             self.connection,
             self.audio_port,
+            self.protocol,
             payload_types.join(" ")
         );
+
+        // P1-SIP-9: Add a=crypto line for SRTP if configured
+        if let Some((ref suite, ref key_base64)) = self.crypto {
+            sdp.push_str(&format!(
+                "a=crypto:1 {} inline:{}\r\n",
+                suite, key_base64
+            ));
+        }
 
         // Add rtpmap for each codec
         for codec in &self.codecs {
@@ -861,9 +956,10 @@ impl SdpBuilder {
 
         // Add telephone-event for RFC 2833 DTMF
         // Bug #57: Fix event range from 0-16 to 0-15 (16 DTMF digits, events 0-15)
+        // P2-SIP-17: Use dynamically selected PT instead of hardcoded 101
         if self.include_telephone_event {
-            sdp.push_str("a=rtpmap:101 telephone-event/8000\r\n");
-            sdp.push_str("a=fmtp:101 0-15\r\n");
+            sdp.push_str(&format!("a=rtpmap:{} telephone-event/8000\r\n", te_pt));
+            sdp.push_str(&format!("a=fmtp:{} 0-15\r\n", te_pt));
         }
 
         // Add ptime (20ms frames)

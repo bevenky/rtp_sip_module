@@ -131,13 +131,23 @@ impl ProviderConfig {
     }
 
     /// Get the SIP URI for this provider
+    ///
+    /// P2-PROVIDER-2: Includes port when non-default, uses sips: for TLS.
     pub fn sip_uri(&self) -> String {
-        format!("sip:{}", self.sip_server)
+        let scheme = if self.transport == Transport::Tls { "sips" } else { "sip" };
+        let default_port = self.transport.default_port();
+        if self.sip_port != default_port {
+            format!("{}:{}:{}", scheme, self.sip_server, self.sip_port)
+        } else {
+            format!("{}:{}", scheme, self.sip_server)
+        }
     }
 
     /// Get the registrar URI
+    ///
+    /// P2-PROVIDER-2: Includes port when non-default, uses sips: for TLS.
     pub fn registrar_uri(&self) -> String {
-        format!("sip:{}", self.sip_server)
+        self.sip_uri()
     }
 
     /// Check if this provider matches a destination number

@@ -93,27 +93,30 @@ impl G711Codec {
     }
 
     /// Check if a G.711 frame is silence or near-silence.
-    /// For mu-law, silence is 0xFF (positive zero) or 0x7F (negative zero).
-    /// For A-law, silence is 0xD5 (positive zero) or 0x55 (negative zero).
     /// Bug #65: Uses 95% threshold for better alignment with energy-based VAD.
-    /// Bug #109: Also includes near-silence byte values:
-    ///   - mu-law: 0xFE/0x7E (amplitude +/-4) and 0xFD/0x7D (amplitude +/-8)
-    ///   - A-law:  0xD4/0x54 (amplitude +/-4) and 0xD7/0x57 (amplitude +/-8)
-    ///   These represent signal levels below the noise floor for telephony.
+    /// Bug #109: Uses a threshold-based approach: decode each byte and check
+    /// if |amplitude| <= NEAR_SILENCE_THRESHOLD. This is more robust than
+    /// hardcoding specific byte values, which may be incorrect for A-law
+    /// due to the non-monotonic encoding table.
     pub fn is_silence_frame(&self, data: &[u8]) -> bool {
         if data.is_empty() {
             return true;
         }
-        let silence_count = match self.codec_type {
-            CodecType::Pcmu => data
-                .iter()
-                .filter(|&&b| matches!(b, 0xFF | 0x7F | 0xFE | 0x7E | 0xFD | 0x7D))
-                .count(),
-            CodecType::Pcma => data
-                .iter()
-                .filter(|&&b| matches!(b, 0xD5 | 0x55 | 0xD4 | 0x54 | 0xD7 | 0x57))
-                .count(),
-        };
+        /// Amplitude threshold for near-silence detection.
+        /// Samples with |decoded amplitude| <= this value are considered silent.
+        /// 8 covers the first few quantization steps in both mu-law and A-law.
+        const NEAR_SILENCE_THRESHOLD: i16 = 8;
+
+        let silence_count = data
+            .iter()
+            .filter(|&&b| {
+                let amplitude = match self.codec_type {
+                    CodecType::Pcmu => decode_ulaw(b),
+                    CodecType::Pcma => decode_alaw(b),
+                };
+                amplitude.abs() <= NEAR_SILENCE_THRESHOLD
+            })
+            .count();
         // Bug #26: Avoid integer division truncation by cross-multiplying
         silence_count * 100 >= data.len() * 95
     }

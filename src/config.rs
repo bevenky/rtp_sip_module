@@ -105,6 +105,20 @@ impl std::fmt::Display for Transport {
     }
 }
 
+/// P2-CONFIG-4: Conversion from provider::config::Transport to config::Transport.
+/// The provider module has its own Transport enum that includes WebSocket;
+/// this conversion maps it to the SIP-layer Transport enum.
+impl From<crate::provider::config::Transport> for Transport {
+    fn from(t: crate::provider::config::Transport) -> Self {
+        match t {
+            crate::provider::config::Transport::Udp => Transport::Udp,
+            crate::provider::config::Transport::Tcp => Transport::Tcp,
+            crate::provider::config::Transport::Tls => Transport::Tls,
+            crate::provider::config::Transport::WebSocket => Transport::Udp, // best-effort fallback
+        }
+    }
+}
+
 /// RTP configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RtpConfig {
@@ -246,6 +260,24 @@ impl Config {
             }
         }
 
+        // P2-CONFIG-2: Validate transaction timer ranges
+        if let Some(t1) = self.sip.timer_t1_ms {
+            if t1 < 100 || t1 > 5000 {
+                return Err(RtpSipError::Config(format!(
+                    "Timer T1 must be between 100 and 5000 ms, got {}",
+                    t1
+                )));
+            }
+        }
+        if let Some(t2) = self.sip.timer_t2_ms {
+            if t2 < 1000 || t2 > 16000 {
+                return Err(RtpSipError::Config(format!(
+                    "Timer T2 must be between 1000 and 16000 ms, got {}",
+                    t2
+                )));
+            }
+        }
+
         // Check RTP port range
         if self.rtp.port_start >= self.rtp.port_end {
             return Err(RtpSipError::Config(
@@ -258,6 +290,14 @@ impl Config {
             return Err(RtpSipError::Config(
                 "RTP port range must contain at least 2 ports (one RTP + one RTCP)".to_string(),
             ));
+        }
+
+        // P2-CONFIG-3: Warn if RTP port_start is odd (RTP ports should be even)
+        if self.rtp.port_start % 2 != 0 {
+            tracing::warn!(
+                port_start = self.rtp.port_start,
+                "RTP port_start is odd; RFC 3550 recommends even-numbered RTP ports"
+            );
         }
 
         Ok(())
@@ -305,13 +345,25 @@ impl Config {
     }
 
     /// Normalize destination (remove sip: prefix, extract user part)
+    ///
+    /// P2-CONFIG-5: Also strips URI parameters (;transport=udp, ;user=phone, etc.)
+    /// from the user part before prefix matching. Without this, a destination like
+    /// `sip:+14155551234;user=phone@example.com` would include `;user=phone` in
+    /// the normalized result, causing prefix matching to fail.
     fn normalize_destination(destination: &str) -> &str {
-        destination
+        let without_scheme = destination
             .strip_prefix("sip:")
-            .unwrap_or(destination)
+            .or_else(|| destination.strip_prefix("sips:"))
+            .unwrap_or(destination);
+        let user_part = without_scheme
             .split('@')
             .next()
-            .unwrap_or(destination)
+            .unwrap_or(without_scheme);
+        // Strip URI parameters from user part (e.g., ";user=phone")
+        user_part
+            .split(';')
+            .next()
+            .unwrap_or(user_part)
     }
 
     /// Get the user agent string

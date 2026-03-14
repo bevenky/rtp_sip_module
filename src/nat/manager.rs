@@ -66,7 +66,12 @@ impl NatManager {
         }
     }
 
-    /// Initialize: resolve STUN server, run NAT detection, start keepalive.
+    /// Initialize the NAT manager: resolve STUN server and run NAT detection.
+    ///
+    /// P2-NAT-11: Note that this method does NOT start keepalive automatically.
+    /// Call `start_keepalive()` separately with the RTP socket after the
+    /// session is established. The keepalive requires a specific socket to
+    /// keep its NAT binding alive, which is not available at init time.
     pub async fn init(self: &Arc<Self>) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
@@ -197,13 +202,22 @@ impl NatManager {
         self.state.lock().reflexive_addr
     }
 
-    /// Get the public IP for SDP/SIP usage, with port from the local socket.
-    /// This is used when the reflexive port differs from the local port
-    /// (which is common — the reflexive port includes the NAT's port mapping).
-    pub fn public_addr_with_port(&self, local_port: u16) -> Option<SocketAddr> {
-        self.state.lock().reflexive_addr.map(|addr| {
-            SocketAddr::new(addr.ip(), local_port)
-        })
+    /// Get the public address for SDP/SIP usage.
+    ///
+    /// Returns the full reflexive address (both IP and port) from STUN.
+    /// This is the correct address to advertise in SDP c= lines and SIP
+    /// Contact headers, as it reflects the actual NAT-mapped IP and port.
+    ///
+    /// Callers should prefer `public_addr()` which returns the same value.
+    /// This method is retained for backward compatibility but ignores
+    /// the `local_port` parameter -- the reflexive port from STUN is always
+    /// used because substituting the local port is incorrect for non-Full-Cone
+    /// NAT types.
+    #[deprecated(
+        note = "Use public_addr() instead, which returns the full reflexive address"
+    )]
+    pub fn public_addr_with_port(&self, _local_port: u16) -> Option<SocketAddr> {
+        self.state.lock().reflexive_addr
     }
 
     /// Create a SymmetricRtp instance with the configured threshold

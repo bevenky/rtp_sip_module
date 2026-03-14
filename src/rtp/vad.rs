@@ -350,8 +350,11 @@ impl VoiceActivityDetector {
                     })
                     .sum::<i64>()
                     / per_ch as i64;
-                // Bug #25: Use f64 intermediate for division to avoid precision loss
-                self.dc_estimate = ((self.dc_estimate as f64 * 255.0) / 256.0) as i64 + frame_avg;
+                // P2-DTMF-6: Use purely integer arithmetic for DC estimate EMA.
+                // dc_estimate is scaled by 256. The EMA formula is:
+                //   dc = dc * 255 / 256 + frame_avg
+                // Using integer division with rounding toward zero.
+                self.dc_estimate = (self.dc_estimate * 255) / 256 + frame_avg;
             }
         }
 

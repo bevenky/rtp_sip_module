@@ -60,6 +60,35 @@ pub enum CallEvent {
         samples: usize,
         timestamp: u32,
     },
+
+    /// P2-STATE-5: Transfer initiated (REFER sent)
+    TransferInitiated {
+        call_id: String,
+        target: String,
+    },
+
+    /// P2-STATE-5: Transfer progress update (NOTIFY received)
+    TransferProgress {
+        call_id: String,
+        status_code: u16,
+        completed: bool,
+    },
+
+    /// P2-STATE-5: Media timeout detected (no RTP received)
+    MediaTimeout {
+        call_id: String,
+    },
+
+    /// P2-STATE-5: Call was cancelled before answer
+    Cancelled {
+        call_id: String,
+    },
+
+    /// P2-STATE-5: Re-INVITE received (hold/resume/codec change)
+    ReInvite {
+        call_id: String,
+        sdp: Option<String>,
+    },
 }
 
 impl CallEvent {
@@ -76,6 +105,11 @@ impl CallEvent {
             CallEvent::Failed { call_id, .. } => call_id,
             CallEvent::DtmfReceived { call_id, .. } => call_id,
             CallEvent::AudioReceived { call_id, .. } => call_id,
+            CallEvent::TransferInitiated { call_id, .. } => call_id,
+            CallEvent::TransferProgress { call_id, .. } => call_id,
+            CallEvent::MediaTimeout { call_id } => call_id,
+            CallEvent::Cancelled { call_id } => call_id,
+            CallEvent::ReInvite { call_id, .. } => call_id,
         }
     }
 
@@ -92,6 +126,11 @@ impl CallEvent {
             CallEvent::Failed { .. } => "failed",
             CallEvent::DtmfReceived { .. } => "dtmf_received",
             CallEvent::AudioReceived { .. } => "audio_received",
+            CallEvent::TransferInitiated { .. } => "transfer_initiated",
+            CallEvent::TransferProgress { .. } => "transfer_progress",
+            CallEvent::MediaTimeout { .. } => "media_timeout",
+            CallEvent::Cancelled { .. } => "cancelled",
+            CallEvent::ReInvite { .. } => "reinvite",
         }
     }
 

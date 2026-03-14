@@ -63,6 +63,14 @@ impl NatConfig {
         if self.symmetric_rtp_threshold == 0 {
             return Err("symmetric_rtp_threshold must be > 0".to_string());
         }
+        // P2-NAT-14: Limit hole_punch_count to prevent excessive packet bursts.
+        // 20 packets is more than enough to open a NAT pinhole.
+        if self.hole_punch_count > 20 {
+            return Err(format!(
+                "hole_punch_count ({}) must be <= 20",
+                self.hole_punch_count
+            ));
+        }
         Ok(())
     }
 }
@@ -179,5 +187,21 @@ turn_password = "pass"
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_hole_punch_count_max() {
+        // P2-NAT-14: hole_punch_count must be <= 20
+        let config = NatConfig {
+            hole_punch_count: 21,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config_ok = NatConfig {
+            hole_punch_count: 20,
+            ..Default::default()
+        };
+        assert!(config_ok.validate().is_ok());
     }
 }

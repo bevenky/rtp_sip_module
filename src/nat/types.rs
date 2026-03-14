@@ -47,21 +47,18 @@ pub enum TraversalStrategy {
 impl TraversalStrategy {
     /// Select optimal strategy for a given NAT type.
     ///
-    /// Note: Symmetric NAT does NOT require TURN/Relay in the common Voice AI
-    /// case where one side has a public IP. The server uses symmetric RTP
-    /// (auto-adjust) to learn the client's NAT-mapped address from incoming
-    /// packets — this works for ALL NAT types. TURN is only needed when
-    /// BOTH sides are behind Symmetric NAT (rare in telephony).
-    ///
-    /// Symmetric RTP auto-adjust handles Symmetric NAT without TURN.
+    /// P1-NAT-10: Symmetric NAT uses a different port mapping for each
+    /// destination, so hole punching cannot work (the pinhole opened by
+    /// punching to the remote peer's address will have a different external
+    /// port than the one the peer sees). TURN relay is required.
     pub fn for_nat_type(nat_type: NatType) -> Self {
         match nat_type {
             NatType::Open | NatType::FullCone => TraversalStrategy::Direct,
-            // All other NAT types: use hole-punch + symmetric RTP auto-adjust.
-            // The server learns the real address from incoming packets.
             NatType::RestrictedCone
-            | NatType::PortRestrictedCone
-            | NatType::Symmetric => TraversalStrategy::HolePunch,
+            | NatType::PortRestrictedCone => TraversalStrategy::HolePunch,
+            // Symmetric NAT: different external mapping per destination,
+            // hole punching is unreliable — must use TURN relay.
+            NatType::Symmetric => TraversalStrategy::Relay,
             NatType::Unknown => TraversalStrategy::HolePunch,
         }
     }
@@ -105,11 +102,11 @@ mod tests {
             TraversalStrategy::for_nat_type(NatType::PortRestrictedCone),
             TraversalStrategy::HolePunch
         );
-        // Symmetric NAT uses HolePunch + symmetric RTP auto-adjust, NOT Relay
-        // (server learns real address from incoming packets — no TURN needed)
+        // P1-NAT-10: Symmetric NAT requires TURN relay because each
+        // destination gets a different port mapping.
         assert_eq!(
             TraversalStrategy::for_nat_type(NatType::Symmetric),
-            TraversalStrategy::HolePunch
+            TraversalStrategy::Relay
         );
         assert_eq!(TraversalStrategy::for_nat_type(NatType::Unknown), TraversalStrategy::HolePunch);
     }

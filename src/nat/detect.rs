@@ -62,18 +62,27 @@ impl NatDetector {
         let client = StunClient::new(self.primary_server);
 
         // === Test I: Basic binding request ===
-        let test1_response = match client
-            .binding_request_on(&socket, self.primary_server)
+        // We need the full response (not just the reflexive address) so we can
+        // extract CHANGED-ADDRESS for Test III.
+        let test1_full_response = match client
+            .binding_request_full(&socket, self.primary_server)
             .await
         {
-            Ok(addr) => addr,
+            Ok(resp) => resp,
             Err(_) => {
                 tracing::warn!("NAT detection: STUN server unreachable, UDP may be blocked");
                 return Ok((NatType::Unknown, local_addr));
             }
         };
 
-        let reflexive = test1_response;
+        let reflexive = match test1_full_response.reflexive_address() {
+            Some(addr) => addr,
+            None => {
+                tracing::warn!("NAT detection: STUN response missing reflexive address");
+                return Ok((NatType::Unknown, local_addr));
+            }
+        };
+        let test1_changed_addr = test1_full_response.changed_address();
         tracing::info!(
             local = %local_addr,
             reflexive = %reflexive,
@@ -81,11 +90,11 @@ impl NatDetector {
         );
 
         // Check if we're not behind NAT
-        // Bug #29: Only compare reflexive vs local IP. Having a public local IP
-        // does not guarantee there's no NAT (e.g., 1:1 NAT, cloud NAT, CGNAT).
-        if reflexive.ip() == local_addr.ip() {
-            // Local and reflexive IP match — likely no NAT
-            // But could still be behind a 1:1 NAT. Check with change request.
+        // P2-NAT-1: Compare both IP AND port. A matching IP but different port
+        // still indicates a NAT (port-preserving NAT where the IP happens to match,
+        // or a NAT with port translation only). Both must match for "Open".
+        if reflexive.ip() == local_addr.ip() && reflexive.port() == local_addr.port() {
+            // Local and reflexive address fully match -- no NAT
             return Ok((NatType::Open, reflexive));
         }
 
@@ -105,34 +114,29 @@ impl NatDetector {
         }
 
         // === Test III: Send to different server, compare reflexive ===
-        // We need the CHANGED-ADDRESS from Test I. If the server didn't provide one,
-        // we can't distinguish Symmetric from Restricted/PortRestricted.
-        // Many modern servers don't support this. In that case, we use a heuristic:
-        // send a binding request to a different well-known STUN server.
-
-        // Try to get CHANGED-ADDRESS from a second binding request
-        let test3_result = client
-            .binding_request_with_change(&socket, self.primary_server, false, false)
-            .await;
-
-        if let Ok(test3_response) = test3_result {
-            if let Some(changed_addr) = test3_response.changed_address() {
-                // We have an alternate server address. Send binding to it.
-                match client
-                    .binding_request_on(&socket, changed_addr)
-                    .await
-                {
-                    Ok(test3_reflexive) => {
-                        if test3_reflexive != reflexive {
-                            tracing::info!("NAT detection Test III: Symmetric NAT");
-                            return Ok((NatType::Symmetric, reflexive));
-                        }
-                    }
-                    Err(_) => {
-                        tracing::debug!("NAT detection Test III: secondary server unreachable");
+        // Per RFC 3489 Section 10.1, Test III sends a binding request to the
+        // *alternate* server address (CHANGED-ADDRESS) obtained from Test I.
+        // If the reflexive address differs from Test I, we have a Symmetric NAT.
+        if let Some(changed_addr) = test1_changed_addr {
+            match client
+                .binding_request_on(&socket, changed_addr)
+                .await
+            {
+                Ok(test3_reflexive) => {
+                    if test3_reflexive != reflexive {
+                        tracing::info!("NAT detection Test III: Symmetric NAT");
+                        return Ok((NatType::Symmetric, reflexive));
                     }
                 }
+                Err(_) => {
+                    tracing::debug!("NAT detection Test III: secondary server unreachable");
+                }
             }
+        } else {
+            tracing::debug!(
+                "NAT detection Test III: no CHANGED-ADDRESS in Test I response, \
+                 cannot distinguish Symmetric from Restricted"
+            );
         }
 
         // === Test IV: Change port only ===
@@ -159,7 +163,11 @@ impl NatDetector {
     }
 }
 
-/// Check if an IP address is a public (non-RFC1918) address
+/// Check if an IP address is a public (non-RFC1918) address.
+///
+/// Currently used only in tests, but retained as a utility for future
+/// NAT detection enhancements (e.g., distinguishing 1:1 NAT from no NAT).
+#[allow(dead_code)]
 fn is_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {

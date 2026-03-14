@@ -77,6 +77,16 @@ impl ProviderRouter {
                         }
                     }
                 }
+                // P2-PROVIDER-3: Skip providers that require registration but
+                // are not yet registered. Routing to an unregistered provider
+                // will fail at the SIP layer, so filter them out early.
+                if p.register {
+                    if let Some(s) = stats.get(&p.id) {
+                        if !s.registered {
+                            return false;
+                        }
+                    }
+                }
                 true
             })
             .cloned()
@@ -151,9 +161,12 @@ impl ProviderRouter {
     }
 
     /// Record a failed call
+    ///
+    /// P1-PROVIDER-1: Also decrements active_calls since the call is no longer active.
     pub fn call_failed(&self, provider_id: &str, error: &str) {
         if let Some(stats) = self.stats.write().get_mut(provider_id) {
             stats.failed_calls += 1;
+            stats.active_calls = stats.active_calls.saturating_sub(1);
             stats.last_error = Some(error.to_string());
         }
     }
@@ -296,7 +309,9 @@ mod tests {
         router.set_registered("test", true);
 
         let stats = router.get_stats("test").unwrap();
-        assert_eq!(stats.active_calls, 1);
+        // P1-PROVIDER-1: call_failed also decrements active_calls
+        // 2 started, 1 failed (decrement), 1 ended (decrement) = 0 active
+        assert_eq!(stats.active_calls, 0);
         assert_eq!(stats.total_calls, 2);
         assert_eq!(stats.failed_calls, 1);
         assert!(stats.registered);

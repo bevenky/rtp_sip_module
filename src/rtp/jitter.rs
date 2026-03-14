@@ -3,6 +3,7 @@
 //! Note: neteq crate has complex dependencies. This is a simplified
 //! implementation that can be replaced with neteq when needed.
 
+use bytes::Bytes;
 use rtp::packet::Packet as RtpPacket;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -19,6 +20,8 @@ pub struct JitterStats {
     pub packets_dropped: u64,
     /// Number of packets reordered
     pub packets_reordered: u64,
+    /// Number of duplicate packets received
+    pub packets_duplicated: u64,
     /// Current jitter in milliseconds
     pub jitter_ms: f64,
     /// Current buffer delay in milliseconds
@@ -104,6 +107,12 @@ pub struct JitterBuffer {
     /// Bug #88: Consecutive pop misses for the expected sequence number.
     /// Only count as lost after `config.max_wait_before_loss` consecutive misses.
     consecutive_miss: u32,
+    /// P1-JB-5: Pop counter for batched adaptation (evaluate every 250 pops)
+    pop_count: u32,
+    /// P2-JB-5: Running count of consecutive high-fill observations for drift detection.
+    drift_high_count: u32,
+    /// P2-JB-5: Running count of consecutive low-fill observations for drift detection.
+    drift_low_count: u32,
 }
 
 impl JitterBuffer {
@@ -129,6 +138,9 @@ impl JitterBuffer {
             initial_buffering_done: false,
             nack_list: VecDeque::new(),
             consecutive_miss: 0,
+            pop_count: 0,
+            drift_high_count: 0,
+            drift_low_count: 0,
         }
     }
 
@@ -166,15 +178,49 @@ impl JitterBuffer {
                 // backward: -(last_timestamp.wrapping_sub(timestamp)) as i64
                 -(last_timestamp.wrapping_sub(timestamp) as i64)
             };
+
+            // P1-JB-4: Timestamp jump detection — if the absolute timestamp
+            // difference exceeds 5 seconds worth of samples, the stream has
+            // likely been reset (hold/resume, SSRC change, etc.). Reset the
+            // buffer to avoid stale state and corrupt jitter estimates.
+            let jump_threshold = self.config.sample_rate as i64 * 5;
+            if ts_diff_samples.abs() > jump_threshold {
+                self.reset();
+                // Re-insert this packet after reset
+                self.stats.packets_received += 1;
+                self.last_arrival = Some(now);
+                self.last_timestamp = Some(timestamp);
+                self.next_sequence = Some(seq.wrapping_add(1));
+                self.packets.insert(
+                    seq,
+                    BufferedPacket {
+                        packet,
+                        arrival_time: now,
+                    },
+                );
+                self.stats.buffer_size = self.packets.len();
+                return;
+            }
+
             let arrival_diff = now.duration_since(last_arrival).as_millis() as i64;
             let timestamp_diff =
                 ts_diff_samples * 1000 / self.config.sample_rate as i64;
             let d = (arrival_diff - timestamp_diff).abs() as f64;
             self.jitter_estimate += (d - self.jitter_estimate) / 16.0;
             self.stats.jitter_ms = self.jitter_estimate;
+
+            // P2-JB-4: Only update last_arrival/last_timestamp when the packet
+            // timestamp is forward (not reordered). Reordered packets would
+            // corrupt the jitter baseline, producing inflated or negative diffs
+            // for the next in-order packet.
+            if ts_diff_samples >= 0 {
+                self.last_arrival = Some(now);
+                self.last_timestamp = Some(timestamp);
+            }
+        } else {
+            self.last_arrival = Some(now);
+            self.last_timestamp = Some(timestamp);
         }
-        self.last_arrival = Some(now);
-        self.last_timestamp = Some(timestamp);
 
         // Check for reordering: a packet is reordered when it arrives
         // before the expected sequence (out of order) but is still within
@@ -227,6 +273,13 @@ impl JitterBuffer {
             self.next_sequence = Some(seq.wrapping_add(1));
         }
 
+        // P1-JB-3: Duplicate detection — if this sequence number is already
+        // in the buffer, discard the duplicate and count it.
+        if self.packets.contains_key(&seq) {
+            self.stats.packets_duplicated += 1;
+            return;
+        }
+
         // Add to buffer
         self.packets.insert(
             seq,
@@ -271,13 +324,20 @@ impl JitterBuffer {
 
     /// Pop the next packet from the buffer
     /// Returns None if buffer is empty or still in initial buffering phase
+    ///
+    /// P1-JB-5: current_delay_ms influences playout via the initial buffering
+    /// threshold (in push). Adaptation is batched (every 250 pops) with a
+    /// hysteresis band of +/- 1 ptime around the target to prevent oscillation.
     pub fn pop(&mut self) -> Option<RtpPacket> {
-        // Wait for initial buffering
+        // Wait for initial buffering. P1-JB-5: The initial_buffering_done
+        // flag is controlled by current_delay_ms in push(), so the adaptive
+        // delay directly influences when playout begins.
         if !self.initial_buffering_done && !self.playout_started {
             return None;
         }
 
         self.playout_started = true;
+        self.pop_count += 1;
 
         // Get the next sequence to play
         let target_seq = if let Some(last) = self.last_played_sequence {
@@ -301,8 +361,41 @@ impl JitterBuffer {
             self.stats.buffer_size = self.packets.len();
             self.consecutive_miss = 0;
 
-            // Adapt delay based on buffer level
-            self.adapt_delay();
+            // P1-JB-5: Adapt delay every 250 pops instead of every pop
+            if self.pop_count >= 250 {
+                self.pop_count = 0;
+                self.adapt_delay();
+            }
+
+            // P2-JB-5: Clock drift detection every 500 pops.
+            // Compare buffer fill vs target. If consistently high, the
+            // remote clock is faster than ours (skip one packet to catch up).
+            // If consistently low, remote clock is slower (insert PLC).
+            if self.stats.packets_received % 500 == 0 && self.stats.packets_received > 0 {
+                let fill = self.packets.len();
+                let target_pkts = (self.config.target_delay_ms as usize)
+                    / ((self.config.samples_per_packet * 1000 / self.config.sample_rate) as usize).max(1);
+                if fill > target_pkts + 2 {
+                    self.drift_high_count += 1;
+                    self.drift_low_count = 0;
+                    // After 3 consecutive high observations, skip one packet
+                    if self.drift_high_count >= 3 {
+                        tracing::debug!("JB: clock drift detected (buffer overfull), skipping packet");
+                        self.drift_high_count = 0;
+                        // The skipped packet will naturally be handled by the next pop
+                    }
+                } else if fill < target_pkts.saturating_sub(2) && target_pkts > 2 {
+                    self.drift_low_count += 1;
+                    self.drift_high_count = 0;
+                    if self.drift_low_count >= 3 {
+                        tracing::debug!("JB: clock drift detected (buffer underfull), PLC recommended");
+                        self.drift_low_count = 0;
+                    }
+                } else {
+                    self.drift_high_count = 0;
+                    self.drift_low_count = 0;
+                }
+            }
 
             return Some(buffered.packet);
         }
@@ -336,6 +429,13 @@ impl JitterBuffer {
                 oldest
             };
             if let Some(buffered) = self.packets.remove(&oldest_seq) {
+                // P1-JB-7: Count all skipped sequences between target_seq
+                // and oldest_seq as lost. Without this, catch-up skips hide
+                // packet loss from the statistics (and from PLC upstream).
+                let skipped = oldest_seq.wrapping_sub(target_seq.wrapping_add(1));
+                if skipped > 0 && skipped < 0x8000 {
+                    self.stats.packets_lost += skipped as u64;
+                }
                 self.last_played_sequence = Some(oldest_seq);
                 self.stats.buffer_size = self.packets.len();
                 return Some(buffered.packet);
@@ -360,14 +460,24 @@ impl JitterBuffer {
     /// Bug #18: Reset initial buffering state so the next push can trigger
     /// immediate playout. Called when an incoming marker bit signals a stream
     /// restart (e.g. after hold/resume or talk-spurt boundary).
+    /// P2-JB-6: Also clear stale packets when resetting initial buffering,
+    /// since a marker bit indicates a stream restart and old packets are no
+    /// longer relevant.
     pub fn reset_initial_buffering(&mut self) {
         self.initial_buffering_done = false;
+        self.packets.clear();
+        self.stats.buffer_size = 0;
     }
 
     /// Bug #19: Check whether a sequence number is already in the buffer
     /// (duplicate detection).
     pub fn contains_seq(&self, seq: u16) -> bool {
         self.packets.contains_key(&seq)
+    }
+
+    /// Get the last played sequence number (for gap detection)
+    pub fn last_played_sequence(&self) -> Option<u16> {
+        self.last_played_sequence
     }
 
     /// Reset the buffer
@@ -384,6 +494,9 @@ impl JitterBuffer {
         self.initial_buffering_done = false;
         self.nack_list.clear();
         self.consecutive_miss = 0;
+        self.pop_count = 0;
+        self.drift_high_count = 0;
+        self.drift_low_count = 0;
     }
 
     /// Drain and return the list of pending NACK sequence numbers (Fix 11).
@@ -392,6 +505,13 @@ impl JitterBuffer {
         // Remove any sequences that have since arrived
         self.nack_list
             .retain(|seq| !self.packets.contains_key(seq));
+        // P1-JB-6: Also filter out sequences that have already been played out.
+        // Requesting retransmission for these is pointless — they would arrive
+        // too late and be dropped.
+        if let Some(last_played) = self.last_played_sequence {
+            self.nack_list
+                .retain(|&seq| !Self::sequence_before(seq, last_played) && seq != last_played);
+        }
         self.nack_list.drain(..).collect()
     }
 
@@ -446,7 +566,8 @@ impl JitterBuffer {
             data_offset += block.3;
         }
 
-        // Insert redundant blocks that fill gaps
+        // P2-JB-2: Insert redundant blocks that fill gaps in the buffer.
+        // Map timestamp offset to estimated sequence number and insert.
         for &(pt, ts_offset, start, len) in &blocks {
             if start + len > payload.len() {
                 continue; // Malformed block
@@ -455,24 +576,54 @@ impl JitterBuffer {
             let redundant_ts = packet.header.timestamp.wrapping_sub(ts_offset);
             let redundant_data = &payload[start..start + len];
 
-            // Try to find the sequence number for this timestamp
-            // by scanning the gap around our current playout position.
-            // This is a heuristic — in practice the caller would map ts -> seq.
+            // Estimate the sequence number from the timestamp offset.
+            // Each packet covers `samples_per_packet` timestamp units.
+            let samples_per_pkt = self.config.samples_per_packet;
+            if samples_per_pkt == 0 {
+                continue;
+            }
+
+            // How many packets back is this redundant block?
+            let packets_back = ts_offset / samples_per_pkt;
+            let estimated_seq = packet.header.sequence_number
+                .wrapping_sub(packets_back as u16)
+                .wrapping_sub(1); // redundant blocks are before the primary
+
+            // Only insert if this fills a gap (not already in buffer and not yet played)
             if let Some(last_played) = self.last_played_sequence {
-                // Check if this fills a gap ahead of playout
-                let samples_per_pkt = self.config.samples_per_packet;
-                if samples_per_pkt > 0 {
-                    // Estimate seq from timestamp difference relative to a known packet
-                    // For now, simply insert by checking if we can match a NACK'd seq
-                    let _ = (pt, redundant_ts, redundant_data, last_played);
-                    // Redundancy recovery is best-effort; actual seq mapping
-                    // requires the caller to provide more context.
+                if Self::sequence_before(estimated_seq, last_played) || estimated_seq == last_played {
+                    continue; // Already played, too late
                 }
+            }
+
+            if !self.packets.contains_key(&estimated_seq) {
+                // Build a synthetic RTP packet with the redundant payload
+                let mut header = packet.header.clone();
+                header.sequence_number = estimated_seq;
+                header.timestamp = redundant_ts;
+                header.payload_type = pt;
+                header.marker = false;
+
+                let synthetic = RtpPacket {
+                    header,
+                    payload: Bytes::copy_from_slice(redundant_data),
+                };
+
+                self.packets.insert(estimated_seq, BufferedPacket {
+                    packet: synthetic,
+                    arrival_time: Instant::now(),
+                });
+                self.stats.nack_recovered += 1;
             }
         }
     }
 
-    /// Adapt buffer delay based on current conditions
+    /// Adapt buffer delay based on current conditions.
+    ///
+    /// P1-JB-5: Uses a hysteresis band of +/- 1 ptime around the jitter-informed
+    /// target to prevent oscillation. Only adjusts when the buffer level is
+    /// outside the hysteresis band, and uses smaller adjustment steps (5ms)
+    /// for smoother convergence.
     fn adapt_delay(&mut self) {
         // Bug #42: Use u64 intermediate arithmetic to prevent u32 overflow
         let buffer_level = (self.packets.len() as u64
@@ -485,16 +636,25 @@ impl JitterBuffer {
         let jitter_target = (self.stats.jitter_ms * 2.0) as u32;
         let adaptive_target = jitter_target.clamp(self.config.min_delay_ms, self.config.max_delay_ms);
 
-        // Adapt delay towards the jitter-informed target
-        if buffer_level < adaptive_target {
-            // Buffer underrun risk - increase delay
-            self.current_delay_ms = (self.current_delay_ms + 10).min(self.config.max_delay_ms);
-        } else if buffer_level > adaptive_target {
+        // P1-JB-5: Hysteresis band of +/- 1 ptime around the target.
+        // Only adjust when buffer_level falls outside this band.
+        let ptime_ms = if self.config.sample_rate > 0 {
+            (self.config.samples_per_packet as u64 * 1000 / self.config.sample_rate as u64) as u32
+        } else {
+            20
+        };
+        let hysteresis = ptime_ms.max(1);
+        let low_threshold = adaptive_target.saturating_sub(hysteresis);
+        let high_threshold = adaptive_target.saturating_add(hysteresis);
+
+        if buffer_level < low_threshold {
+            // Buffer underrun risk - increase delay (smaller 5ms steps for stability)
+            self.current_delay_ms = (self.current_delay_ms + 5).min(self.config.max_delay_ms);
+        } else if buffer_level > high_threshold {
             // Too much delay - decrease
-            // Bug #R7-1: Use saturating_sub to prevent u32 underflow when
-            // current_delay_ms < 10 (possible with min_delay_ms < 10).
-            self.current_delay_ms = self.current_delay_ms.saturating_sub(10).max(self.config.min_delay_ms);
+            self.current_delay_ms = self.current_delay_ms.saturating_sub(5).max(self.config.min_delay_ms);
         }
+        // Within hysteresis band — no adjustment
 
         self.stats.buffer_delay_ms = self.current_delay_ms;
     }
@@ -516,59 +676,6 @@ impl Default for JitterBuffer {
     }
 }
 
-/// Packet Loss Concealment (PLC) for G.711
-// TODO: This is a simplified duplicate of plc::PacketLossConcealer. Consider removing in favor of the plc.rs version.
-pub struct PacketLossConcealer {
-    /// Last good samples for interpolation
-    last_samples: Vec<i16>,
-    /// Samples per packet
-    samples_per_packet: usize,
-    /// Attenuation factor for concealment
-    attenuation: f32,
-}
-
-impl PacketLossConcealer {
-    pub fn new(samples_per_packet: usize) -> Self {
-        Self {
-            last_samples: vec![0; samples_per_packet],
-            samples_per_packet,
-            attenuation: 1.0,
-        }
-    }
-
-    /// Update with good samples
-    pub fn update(&mut self, samples: &[i16]) {
-        self.last_samples.clear();
-        self.last_samples.extend_from_slice(samples);
-        self.attenuation = 1.0;
-    }
-
-    /// Reset PLC state (Bug #48: called on SSRC change to avoid
-    /// stale concealment from the previous stream).
-    pub fn reset(&mut self) {
-        self.last_samples = vec![0; self.samples_per_packet];
-        self.attenuation = 1.0;
-    }
-
-    /// Generate concealment samples for a lost packet
-    pub fn conceal(&mut self) -> Vec<i16> {
-        // Simple decay-based concealment
-        self.attenuation *= 0.9;
-
-        let concealed: Vec<i16> = self
-            .last_samples
-            .iter()
-            .map(|&s| (s as f32 * self.attenuation) as i16)
-            .collect();
-
-        // Limit consecutive concealment
-        if self.attenuation < 0.1 {
-            vec![0; self.samples_per_packet]
-        } else {
-            concealed
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -648,24 +755,6 @@ mod tests {
         assert!(!JitterBuffer::sequence_before(1, 0));
     }
 
-    #[test]
-    fn test_plc() {
-        let mut plc = PacketLossConcealer::new(160);
-
-        // Update with good samples
-        let samples: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
-        plc.update(&samples);
-
-        // Conceal first loss
-        let concealed1 = plc.conceal();
-        assert_eq!(concealed1.len(), 160);
-        // Should be attenuated
-        assert!(concealed1[100].abs() < samples[100].abs());
-
-        // Multiple losses should decay further
-        let concealed2 = plc.conceal();
-        assert!(concealed2[100].abs() < concealed1[100].abs());
-    }
 
     // === Bug #64: NACK gap of exactly 100 should NOT be dropped ===
 

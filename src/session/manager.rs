@@ -3,7 +3,7 @@
 //! Manages multiple concurrent call sessions.
 
 use super::events::CallEvent;
-use super::state::{CallDirection, CallState, CallTiming};
+use super::state::{CallDirection, CallState, CallTiming, StateValidator};
 use crate::provider::{ProviderConfig, ProviderRouter};
 use crate::rtp::RtpEngine;
 use dashmap::DashMap;
@@ -95,7 +95,7 @@ impl CallSession {
                     self.timing.answered_at = Some(Instant::now());
                 }
             }
-            CallState::Terminated | CallState::Failed => {
+            CallState::Terminated | CallState::Failed | CallState::Ended => {
                 self.timing.ended_at = Some(Instant::now());
             }
             _ => {}
@@ -117,8 +117,11 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Create a new session manager
+    ///
+    /// P2-STATE-4: Broadcast channel capacity increased to 4096 to prevent
+    /// dropped events under high call volume.
     pub fn new(router: Arc<ProviderRouter>) -> Self {
-        let (event_tx, _) = broadcast::channel(256);
+        let (event_tx, _) = broadcast::channel(4096);
         Self {
             sessions: DashMap::new(),
             router,
@@ -143,8 +146,21 @@ impl SessionManager {
     }
 
     /// Remove a session
+    ///
+    /// P2-STATE-6: Performs resource cleanup before removing the session.
+    /// Stops the RTP engine (if running) and releases any allocated ports.
     pub fn remove_session(&self, call_id: &str) -> Option<Arc<parking_lot::Mutex<CallSession>>> {
-        self.sessions.remove(call_id).map(|(_, v)| v)
+        if let Some((_, session)) = self.sessions.remove(call_id) {
+            // P2-STATE-6: Clean up RTP engine resources
+            let sess = session.lock();
+            if let Some(ref rtp) = sess.rtp_engine {
+                rtp.stop();
+            }
+            drop(sess);
+            Some(session)
+        } else {
+            None
+        }
     }
 
     /// Get all active call IDs
@@ -168,10 +184,24 @@ impl SessionManager {
     }
 
     /// Update session state and emit event
+    ///
+    /// P1-STATE-1: Validates the transition using `StateValidator::can_transition`
+    /// and logs a warning on invalid transitions.
     pub fn update_state(&self, call_id: &str, new_state: CallState) {
         if let Some(session) = self.get_session(call_id) {
             let mut sess = session.lock();
             let old_state = sess.state;
+
+            // P1-STATE-1: Validate transition
+            if !StateValidator::can_transition(old_state, new_state) {
+                tracing::warn!(
+                    call_id = call_id,
+                    from = old_state.as_str(),
+                    to = new_state.as_str(),
+                    "invalid state transition"
+                );
+            }
+
             sess.set_state(new_state);
 
             self.emit(CallEvent::state_changed(call_id, old_state, new_state));
