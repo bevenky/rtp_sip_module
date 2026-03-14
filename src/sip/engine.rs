@@ -393,6 +393,15 @@ impl CallSession {
         // Detect remote hold
         self.remote_hold = sdp.is_on_hold();
 
+        // R19-8: Propagate SDP ptime to RTP engine so packet timing matches
+        // the negotiated packetization interval.
+        if let Some(ptime) = sdp.ptime() {
+            if let Some(ref rtp) = self.rtp_engine {
+                rtp.set_ptime(ptime);
+                tracing::debug!("Call {}: applied ptime={}ms from remote SDP", self.call_id, ptime);
+            }
+        }
+
         // Update call state if hold changed
         if self.remote_hold && self.state == CallState::Active {
             self.state = CallState::Hold;
@@ -1359,6 +1368,13 @@ impl SipEngine {
                 }
                 remote_telephone_event_pt = sdp.telephone_event_pt();
                 remote_media_direction = sdp.audio_direction();
+                // R19-8: Apply ptime from initial INVITE SDP to RTP engine
+                if let Some(ptime) = sdp.ptime() {
+                    if let Some(ref rtp) = rtp_engine {
+                        rtp.set_ptime(ptime);
+                        tracing::debug!("Inbound call: applied ptime={}ms from remote SDP", ptime);
+                    }
+                }
             }
         }
 

@@ -1208,10 +1208,19 @@ impl RtpEngine {
             tokio::spawn(async move {
                 while engine_rtcp.running.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if engine_rtcp.rtcp_session.lock().should_send_rtcp() {
-                        let mut rtcp_buf = vec![0u8; 512];
-                        let rtcp_len = engine_rtcp.rtcp_session.lock().build_rtcp(&mut rtcp_buf);
-                        if rtcp_len > 0 {
+                    // R19-4: Combine should_send_rtcp() and build_rtcp() under a
+                    // single lock acquisition to avoid double-lock overhead.
+                    let (rtcp_len, rtcp_buf) = {
+                        let mut session = engine_rtcp.rtcp_session.lock();
+                        if session.should_send_rtcp() {
+                            let mut buf = vec![0u8; 512];
+                            let len = session.build_rtcp(&mut buf);
+                            (len, buf)
+                        } else {
+                            (0, vec![])
+                        }
+                    };
+                    if rtcp_len > 0 {
                             if let Some(remote) = engine_rtcp.remote_addr() {
                                 let send_data = &rtcp_buf[..rtcp_len];
                                 // P0-6: SRTP protect RTCP if SRTP is configured
@@ -1229,7 +1238,6 @@ impl RtpEngine {
                                 let _ = engine_rtcp.socket.send_to(&rtcp_data, remote).await;
                             }
                         }
-                    }
                 }
             });
         }
@@ -1249,11 +1257,21 @@ impl RtpEngine {
             if bye_len > 0 {
                 if let Some(remote) = self.remote_addr() {
                     let send_data = &bye_buf[..bye_len];
-                    // SRTP protect RTCP BYE if SRTP is configured
+                    // R19-6: SRTP protect RTCP BYE if SRTP is configured.
+                    // When SRTP is active and protect_rtcp fails, skip sending
+                    // rather than falling back to unprotected (security risk).
                     let bye_data = if let Some(ref srtp_send) = self.srtp_send {
                         match srtp_send.lock().protect_rtcp(send_data) {
                             Ok(protected) => protected,
-                            Err(_) => send_data.to_vec(),
+                            Err(e) => {
+                                tracing::debug!("SRTCP protect failed for BYE, skipping: {}", e);
+                                // Don't send unprotected BYE when SRTP is configured
+                                self.running.store(false, Ordering::SeqCst);
+                                if let Some(p) = self.allocated_port.lock().take() {
+                                    release_rtp_port(p);
+                                }
+                                return;
+                            }
                         }
                     } else {
                         send_data.to_vec()
@@ -1461,7 +1479,14 @@ impl RtpEngine {
         };
 
         let data = serialize_rtp_packet(&cn_packet)?;
-        self.socket.send_to(&data, remote).await?;
+
+        // R19-1: SRTP protect CN packets before sending (same pattern as send_audio)
+        let send_data: Vec<u8> = if let Some(ref srtp_send) = self.srtp_send {
+            srtp_send.lock().protect_rtp(&data)?
+        } else {
+            data.to_vec()
+        };
+        self.socket.send_to(&send_data, remote).await?;
 
         // Update CN pacing timestamp only after successful send
         *self.last_cn_timestamp.lock() = Some(Instant::now());
@@ -1541,11 +1566,10 @@ impl RtpEngine {
     }
 
     /// Reset jitter buffer
+    /// R19-5: Use PLC reset() instead of wasteful zero-vec allocation
     pub fn reset_jitter_buffer(&self) {
         self.jitter_buffer.lock().reset();
-        self.plc
-            .lock()
-            .update(&vec![0i16; self.config.codec.samples_per_frame(self.config.ptime_ms)]);
+        self.plc.lock().reset();
     }
 
     // ========== RFC 2833 DTMF Methods ==========
@@ -1592,7 +1616,13 @@ impl RtpEngine {
 
         for (i, packet) in packets.iter().enumerate() {
             let data = packet.to_rtp_bytes();
-            self.socket.send_to(&data, remote).await?;
+            // R19-2: SRTP protect DTMF packets before sending
+            let send_data: Vec<u8> = if let Some(ref srtp_send) = self.srtp_send {
+                srtp_send.lock().protect_rtp(&data)?
+            } else {
+                data.to_vec()
+            };
+            self.socket.send_to(&send_data, remote).await?;
 
             // Wait between packets:
             // - Normal (non-END) packets: wait one ptime interval

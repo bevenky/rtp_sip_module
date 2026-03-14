@@ -281,11 +281,19 @@ impl PySipRunner {
         .parse()
         .map_err(|e| PyValueError::new_err(format!("Invalid SIP address: {}", e)))?;
 
+        // R19-9: Propagate SIP timer/transport config from Config to SipEngineConfig
+        // instead of using defaults, so TOML-configured values actually take effect.
         let sip_config = SipEngineConfig {
             local_addr,
             user_agent: Config::user_agent(),
             rtp_port_start: self.config.rtp.port_start,
             rtp_port_end: self.config.rtp.port_end,
+            timer_t1_ms: self.config.sip.timer_t1_ms,
+            timer_t2_ms: self.config.sip.timer_t2_ms,
+            timer_t1x64_ms: self.config.sip.timer_t1x64_ms,
+            transport: crate::config::Transport::from_str_lossy(&self.config.sip.transport),
+            tls_verify: self.config.sip.tls_verify,
+            tls_ca_cert: self.config.sip.tls_ca_cert.clone(),
             ..Default::default()
         };
 

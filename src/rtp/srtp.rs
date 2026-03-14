@@ -1101,6 +1101,9 @@ fn prf_derive(
 
     // P2-SRTP-6: Use checked_add to prevent usize overflow on 32-bit platforms
     let blocks_needed = output.len().checked_add(15).map(|v| v / 16).unwrap_or(0);
+    // R19-7: AES-CM uses a 16-bit block counter; payloads requiring >65536 blocks
+    // (>1MB) exceed the counter space and would wrap, reusing keystream.
+    assert!(blocks_needed <= 65536, "payload exceeds AES-CM maximum (65536 blocks)");
     let mut generated = 0;
 
     for block_idx in 0..blocks_needed {
@@ -1159,6 +1162,9 @@ fn aes_cm_encrypt(
             return;
         }
     };
+    // R19-7: AES-CM uses a 16-bit block counter; payloads requiring >65536 blocks
+    // (>1MB) exceed the counter space and would wrap, reusing keystream.
+    assert!(blocks_needed <= 65536, "payload exceeds AES-CM maximum (65536 blocks)");
     let mut offset = 0;
 
     for block_idx in 0..blocks_needed {

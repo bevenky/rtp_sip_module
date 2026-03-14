@@ -586,6 +586,12 @@ impl Sdp {
         self.media.iter().find(|m| m.media_type == "audio")
     }
 
+    /// Get ptime (packetization time in ms) from the first audio media description.
+    /// Returns None if no audio media or no ptime attribute was present.
+    pub fn ptime(&self) -> Option<u32> {
+        self.audio().and_then(|a| a.ptime)
+    }
+
     /// Get RTP address from SDP
     pub fn rtp_addr(&self) -> Option<SocketAddr> {
         let audio = self.audio()?;
