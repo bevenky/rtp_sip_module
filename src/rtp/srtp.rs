@@ -819,7 +819,9 @@ impl SrtpContext {
         let computed_tag = &full_tag[..SRTCP_AUTH_TAG_LEN];
 
         if !constant_time_eq(computed_tag, received_tag) {
-            return Err(RtpSipError::Rtp("SRTCP authentication failed".to_string()));
+            // R18-MEDIUM: Use generic error message that doesn't distinguish
+            // auth failure from replay, preventing oracle attacks.
+            return Err(RtpSipError::Rtp("SRTCP packet rejected".to_string()));
         }
 
         // auth_data already excludes MKI, so it contains [rtcp_data | E||index]
@@ -840,7 +842,9 @@ impl SrtpContext {
         let srtcp_idx_u64 = srtcp_index as u64;
         if self.srtcp_replay_initialized {
             if !self.check_srtcp_replay(srtcp_idx_u64) {
-                return Err(RtpSipError::Rtp("SRTCP replay detected".to_string()));
+                // R18-MEDIUM: Use generic error message that doesn't distinguish
+                // auth failure from replay, preventing oracle attacks.
+                return Err(RtpSipError::Rtp("SRTCP packet rejected".to_string()));
             }
         }
 

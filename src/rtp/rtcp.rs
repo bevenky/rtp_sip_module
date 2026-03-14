@@ -806,7 +806,9 @@ pub struct RtcpSession {
     /// Highest extended sequence number received
     pub highest_ext_seq: u32,
     /// Sequence number cycles (wraparound counter)
-    pub seq_cycles: u32,
+    /// R18-P1: Changed from u32 to u64 to prevent overflow after 65536 wraparounds
+    /// (~4 billion packets at 50 pps = ~2.7 years, reachable in long-running sessions).
+    pub seq_cycles: u64,
     /// Highest sequence number received (16-bit)
     pub highest_seq: u16,
     /// Whether we've received our first packet
@@ -1078,6 +1080,10 @@ impl RtcpSession {
 
         self.packets_received += 1;
 
+        // R18-P1: Save previous highest_seq for loss event detection below
+        let prev_highest_seq = self.highest_seq;
+        let was_first_received = self.first_packet_received;
+
         // Sequence number tracking with wraparound (RFC 3550 Appendix A.1)
         if !self.first_packet_received {
             self.base_seq = seq as u32;
@@ -1107,6 +1113,31 @@ impl RtcpSession {
             }
             // else: udelta > 0xFFFF - MAX_MISORDER, i.e. small negative offset
             // -- this is a reordered/duplicate packet, ignore for seq tracking
+        }
+
+        // R18-P1: Detect gaps and call record_loss_event() for loss tracking.
+        // Previously record_loss_event was never called, so burst_density and
+        // gap_density in XR reports were always zero.
+        if was_first_received {
+            // was_first_received is true when this is NOT the first packet,
+            // meaning we have a previous highest_seq to compare against.
+            let expected_seq = prev_highest_seq.wrapping_add(1);
+            if seq == expected_seq {
+                // In-order packet — record as received
+                self.record_loss_event(true);
+            } else {
+                let gap = seq.wrapping_sub(expected_seq);
+                if gap > 0 && gap < MAX_DROPOUT {
+                    // Forward gap: mark missing packets as lost, then this one as received
+                    for _ in 0..gap {
+                        self.record_loss_event(false);
+                    }
+                    self.record_loss_event(true);
+                } else {
+                    // Reorder or duplicate — just record as received
+                    self.record_loss_event(true);
+                }
+            }
         }
 
         self.highest_ext_seq = ((self.seq_cycles as u32) << 16) | (self.highest_seq as u32);
@@ -1308,8 +1339,10 @@ impl RtcpSession {
         let metrics = VoipMetrics {
             loss_rate,
             discard_rate: 0,
-            burst_density: 0,
-            gap_density: 0,
+            // R18-P1: Use actual burst/gap density from loss window tracking
+            // instead of hardcoded 0.
+            burst_density: self.burst_density,
+            gap_density: self.gap_density,
             burst_duration: 0,
             gap_duration: 0,
             round_trip_delay: rtt_ms,

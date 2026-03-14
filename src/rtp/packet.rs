@@ -99,6 +99,9 @@ impl RtpPacketBuilder {
         };
 
         self.sequence = self.sequence.wrapping_add(1);
+        // R18-P1: Assert zero-samples guard, matching build() — zero-sample
+        // advances corrupt timestamps in release builds.
+        assert!(samples > 0, "timestamp advance with zero samples");
         self.timestamp = self.timestamp.wrapping_add(samples);
 
         packet

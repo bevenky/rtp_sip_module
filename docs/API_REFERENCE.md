@@ -162,8 +162,8 @@ port_end = 20000
 name = "plivo"
 server = "sip.plivo.com"
 port = 5060
-auth_username = "AUTH_ID"
-auth_password = "AUTH_TOKEN"
+username = "AUTH_ID"
+password = "AUTH_TOKEN"
 prefixes = ["+1"]
 default = true
 
@@ -172,8 +172,8 @@ default = true
 name = "plivo_eu"
 server = "sip.plivo.com"
 port = 5060
-auth_username = "AUTH_ID_EU"
-auth_password = "AUTH_TOKEN_EU"
+username = "AUTH_ID_EU"
+password = "AUTH_TOKEN_EU"
 prefixes = ["+44", "+49"]
 
 [routing]

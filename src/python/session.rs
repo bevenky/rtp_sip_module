@@ -288,3 +288,13 @@ impl PyRtpSession {
         Ok(())
     }
 }
+
+/// R18: Ensure RTP engine is stopped when PyRtpSession is dropped,
+/// preventing resource leaks if the user forgets to call stop().
+impl Drop for PyRtpSession {
+    fn drop(&mut self) {
+        if let Some(ref engine) = self.engine {
+            engine.stop();
+        }
+    }
+}

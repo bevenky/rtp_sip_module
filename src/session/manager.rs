@@ -138,17 +138,22 @@ impl SessionManager {
     ///
     /// R17: If a session with the same call_id already exists, stop its RTP
     /// engine before replacing to avoid resource leaks.
+    /// R18: Clone the RTP engine out of the DashMap guard and drop the guard
+    /// before calling stop(), to avoid holding the DashMap shard lock during
+    /// a potentially slow RTP teardown.
     pub fn add_session(&self, session: CallSession) {
         let call_id = session.call_id.clone();
-        if let Some(existing) = self.sessions.get(&call_id) {
+        let rtp_to_stop = self.sessions.get(&call_id).and_then(|existing| {
             let sess = existing.lock();
-            if let Some(ref rtp) = sess.rtp_engine {
-                tracing::warn!(
-                    call_id = %call_id,
-                    "add_session: replacing existing session, stopping its RTP engine"
-                );
-                rtp.stop();
-            }
+            sess.rtp_engine.clone()
+        });
+        // Guard is dropped here before we call stop()
+        if let Some(rtp) = rtp_to_stop {
+            tracing::warn!(
+                call_id = %call_id,
+                "add_session: replacing existing session, stopping its RTP engine"
+            );
+            rtp.stop();
         }
         self.sessions.insert(call_id, Arc::new(parking_lot::Mutex::new(session)));
     }

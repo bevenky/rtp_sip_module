@@ -14,15 +14,15 @@ Example - Mode A (SIP+RTP):
             ProviderConfig(
                 name="plivo_us",
                 server="sip.plivo.com",
-                auth_username="AUTH_ID",
-                auth_password="AUTH_TOKEN",
+                username="AUTH_ID",
+                password="AUTH_TOKEN",
                 prefixes=["+1", "+1415"],
             ),
             ProviderConfig(
                 name="plivo_eu",
                 server="sip.plivo.com",
-                auth_username="AUTH_ID_EU",
-                auth_password="AUTH_TOKEN_EU",
+                username="AUTH_ID_EU",
+                password="AUTH_TOKEN_EU",
                 prefixes=["+44", "+49"],
                 default=True,
             ),
@@ -83,8 +83,8 @@ class SipConfig:
 
     def validate(self) -> None:
         """Validate the configuration."""
-        if self.transport not in ("udp", "tls"):
-            raise ValueError(f"Invalid transport '{self.transport}'. Must be 'udp' or 'tls'")
+        if self.transport not in ("udp", "tcp", "tls"):
+            raise ValueError(f"Invalid transport '{self.transport}'. Must be 'udp', 'tcp', or 'tls'")
         if self.transport == "tls":
             if not self.tls_cert or not self.tls_key:
                 raise ValueError("TLS transport requires tls_cert and tls_key")
@@ -144,8 +144,8 @@ class ProviderConfig:
         name: Provider name for identification and logging
         server: SIP server hostname (e.g., "sip.plivo.com")
         port: SIP server port (default: 5060)
-        auth_username: Authentication username (e.g., Plivo AUTH_ID)
-        auth_password: Authentication password (e.g., Plivo AUTH_TOKEN)
+        username: Authentication username (e.g., Plivo AUTH_ID)
+        password: Authentication password (e.g., Plivo AUTH_TOKEN)
         realm: Authentication realm (optional, defaults to server)
         prefixes: List of phone number prefixes this provider handles
                   (longest prefix match wins)
@@ -154,8 +154,8 @@ class ProviderConfig:
     name: str
     server: str
     port: int = 5060
-    auth_username: str = ""
-    auth_password: str = ""
+    username: str = ""
+    password: str = ""
     realm: Optional[str] = None
     prefixes: List[str] = field(default_factory=list)
     default: bool = False
@@ -174,10 +174,10 @@ class ProviderConfig:
             "server": self.server,
             "port": self.port,
         }
-        if self.auth_username:
-            d["auth_username"] = self.auth_username
-        if self.auth_password:
-            d["auth_password"] = self.auth_password
+        if self.username:
+            d["username"] = self.username
+        if self.password:
+            d["password"] = self.password
         if self.realm:
             d["realm"] = self.realm
         if self.prefixes:
@@ -233,6 +233,21 @@ class Config:
                 return p
         return None
 
+    @staticmethod
+    def _normalize_destination(destination: str) -> str:
+        """Normalize destination: strip sip:/sips: prefix, user part, and URI params."""
+        dest = destination
+        if dest.startswith("sips:"):
+            dest = dest[5:]
+        elif dest.startswith("sip:"):
+            dest = dest[4:]
+        if "@" in dest:
+            dest = dest.split("@")[0]
+        # Strip URI parameters (e.g., ";user=phone", ";transport=udp")
+        if ";" in dest:
+            dest = dest.split(";")[0]
+        return dest
+
     def route(self, destination: str) -> Optional[ProviderConfig]:
         """
         Route a destination to the best provider (longest prefix match).
@@ -243,12 +258,7 @@ class Config:
         Returns:
             Best matching provider, or None if no match and no default
         """
-        # Normalize destination
-        dest = destination
-        if dest.startswith("sip:"):
-            dest = dest[4:]
-        if "@" in dest:
-            dest = dest.split("@")[0]
+        dest = self._normalize_destination(destination)
 
         # Find best match
         best_match = None
@@ -272,11 +282,7 @@ class Config:
 
     def is_blocked(self, destination: str) -> bool:
         """Check if a destination is blocked."""
-        dest = destination
-        if dest.startswith("sip:"):
-            dest = dest[4:]
-        if "@" in dest:
-            dest = dest.split("@")[0]
+        dest = self._normalize_destination(destination)
 
         return any(dest.startswith(prefix) for prefix in self.blocked_prefixes)
 
@@ -316,10 +322,10 @@ class Config:
             lines.append(f'name = "{provider.name}"')
             lines.append(f'server = "{provider.server}"')
             lines.append(f"port = {provider.port}")
-            if provider.auth_username:
-                lines.append(f'auth_username = "{provider.auth_username}"')
-            if provider.auth_password:
-                lines.append(f'auth_password = "{provider.auth_password}"')
+            if provider.username:
+                lines.append(f'username = "{provider.username}"')
+            if provider.password:
+                lines.append(f'password = "{provider.password}"')
             if provider.realm:
                 lines.append(f'realm = "{provider.realm}"')
             if provider.prefixes:
@@ -477,8 +483,8 @@ class RtpSessionConfig:
 def create_single_provider_config(
     provider_name: str,
     server: str,
-    auth_username: str,
-    auth_password: str,
+    username: str,
+    password: str,
     *,
     local_sip_port: int = 5060,
     rtp_port_start: int = 10000,
@@ -490,8 +496,8 @@ def create_single_provider_config(
     Args:
         provider_name: Provider name
         server: SIP server hostname
-        auth_username: Authentication username
-        auth_password: Authentication password
+        username: Authentication username
+        password: Authentication password
         local_sip_port: Local SIP port (default: 5060)
         rtp_port_start: RTP port range start (default: 10000)
         rtp_port_end: RTP port range end (default: 20000)
@@ -514,8 +520,8 @@ def create_single_provider_config(
             ProviderConfig(
                 name=provider_name,
                 server=server,
-                auth_username=auth_username,
-                auth_password=auth_password,
+                username=username,
+                password=password,
                 default=True,
             )
         ],
@@ -534,8 +540,8 @@ def create_multi_provider_config(
         providers: List of provider dictionaries with keys:
             - name: Provider name
             - server: SIP server hostname
-            - auth_username: Authentication username
-            - auth_password: Authentication password
+            - username: Authentication username
+            - password: Authentication password
             - prefixes: List of phone prefixes (optional)
             - default: Is default provider (optional)
         blocked_prefixes: List of phone prefixes to block
@@ -550,15 +556,15 @@ def create_multi_provider_config(
                 {
                     "name": "plivo_us",
                     "server": "sip.plivo.com",
-                    "auth_username": "AUTH_ID",
-                    "auth_password": "AUTH_TOKEN",
+                    "username": "AUTH_ID",
+                    "password": "AUTH_TOKEN",
                     "prefixes": ["+1"],
                 },
                 {
                     "name": "plivo_eu",
                     "server": "sip.plivo.com",
-                    "auth_username": "AUTH_ID_EU",
-                    "auth_password": "AUTH_TOKEN_EU",
+                    "username": "AUTH_ID_EU",
+                    "password": "AUTH_TOKEN_EU",
                     "prefixes": ["+44"],
                     "default": True,
                 },

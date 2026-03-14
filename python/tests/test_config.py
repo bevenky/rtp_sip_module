@@ -15,8 +15,8 @@ class TestProviderConfig:
         provider = ProviderConfig(
             name="plivo",
             server="sip.plivo.com",
-            auth_username="AUTH_ID",
-            auth_password="AUTH_TOKEN",
+            username="AUTH_ID",
+            password="AUTH_TOKEN",
             prefixes=["+1"],
         )
 
@@ -33,8 +33,8 @@ class TestProviderConfig:
         provider = ProviderConfig(name="test", server="sip.test.com")
 
         assert provider.port == 5060
-        assert provider.auth_username == ""
-        assert provider.auth_password == ""
+        assert provider.username == ""
+        assert provider.password == ""
         assert provider.prefixes == []
         assert provider.default is False
 
@@ -133,8 +133,8 @@ class TestConfig:
                 ProviderConfig(
                     name="plivo",
                     server="sip.plivo.com",
-                    auth_username="AUTH_ID",
-                    auth_password="AUTH_TOKEN",
+                    username="AUTH_ID",
+                    password="AUTH_TOKEN",
                     prefixes=["+1"],
                 )
             ],
@@ -227,8 +227,8 @@ class TestConfig:
                 ProviderConfig(
                     name="plivo",
                     server="sip.plivo.com",
-                    auth_username="AUTH_ID",
-                    auth_password="AUTH_TOKEN",
+                    username="AUTH_ID",
+                    password="AUTH_TOKEN",
                     prefixes=["+1"],
                     default=True,
                 )
@@ -243,8 +243,9 @@ class TestConfig:
         assert "[[providers]]" in toml_str
         assert 'name = "plivo"' in toml_str
         assert 'server = "sip.plivo.com"' in toml_str
-        assert 'auth_username = "AUTH_ID"' in toml_str
-        assert 'auth_password = "AUTH_TOKEN"' in toml_str
+        assert 'username = "AUTH_ID"' in toml_str
+        assert 'password = "AUTH_TOKEN"' in toml_str
+
         assert "[routing]" in toml_str
         assert '"+1900"' in toml_str
 
@@ -339,13 +340,13 @@ class TestConvenienceFunctions:
         config = create_single_provider_config(
             provider_name="plivo",
             server="sip.plivo.com",
-            auth_username="AUTH_ID",
-            auth_password="AUTH_TOKEN",
+            username="AUTH_ID",
+            password="AUTH_TOKEN",
         )
 
         assert len(config.providers) == 1
         assert config.providers[0].name == "plivo"
-        assert config.providers[0].auth_username == "AUTH_ID"
+        assert config.providers[0].username == "AUTH_ID"
         assert config.providers[0].default is True
 
     def test_create_multi_provider_config(self):
@@ -357,15 +358,15 @@ class TestConvenienceFunctions:
                 {
                     "name": "plivo_us",
                     "server": "sip.plivo.com",
-                    "auth_username": "AUTH_ID",
-                    "auth_password": "AUTH_TOKEN",
+                    "username": "AUTH_ID",
+                    "password": "AUTH_TOKEN",
                     "prefixes": ["+1"],
                 },
                 {
                     "name": "plivo_eu",
                     "server": "sip.plivo.com",
-                    "auth_username": "AUTH_ID_EU",
-                    "auth_password": "AUTH_TOKEN_EU",
+                    "username": "AUTH_ID_EU",
+                    "password": "AUTH_TOKEN_EU",
                     "prefixes": ["+44"],
                     "default": True,
                 },

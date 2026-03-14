@@ -25,7 +25,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
@@ -433,12 +433,6 @@ pub struct RtpEngine {
     /// SRTP context for receive direction (decrypt incoming)
     srtp_recv: Option<Mutex<crate::rtp::srtp::SrtpContext>>,
 
-    // === P0-8: ROC tracking ===
-    /// Rollover counter for sequence number wraparound detection
-    roc: AtomicU32,
-    /// Highest sequence number seen (for ROC wraparound detection)
-    highest_seq: AtomicU16,
-
     // === P0-9: RTCP session ===
     /// RTCP session for SR/RR/SDES/BYE/XR handling
     rtcp_session: Arc<Mutex<crate::rtp::rtcp::RtcpSession>>,
@@ -522,10 +516,6 @@ impl RtpEngine {
             // P0-6: SRTP contexts (None until configured via set_srtp)
             srtp_send: None,
             srtp_recv: None,
-
-            // P0-8: ROC tracking
-            roc: AtomicU32::new(0),
-            highest_seq: AtomicU16::new(0),
 
             // P0-9: RTCP session
             rtcp_session: Arc::new(Mutex::new(crate::rtp::rtcp::RtcpSession::new(
@@ -830,10 +820,13 @@ impl RtpEngine {
                         // P0-5: Symmetric RTP — feed source address to learn remote
                         // endpoint from incoming packets. If address changed, update
                         // remote_addr so subsequent sends go to the right place.
+                        // R18-P1: Combine two lock acquisitions into one to avoid
+                        // double-lock overhead and potential inconsistency.
                         if let Some(ref sym_rtp) = engine.symmetric_rtp {
-                            let changed = sym_rtp.lock().process_incoming(src_addr);
+                            let mut sym = sym_rtp.lock();
+                            let changed = sym.process_incoming(src_addr);
                             if changed {
-                                if let Some(learned) = sym_rtp.lock().effective_remote() {
+                                if let Some(learned) = sym.effective_remote() {
                                     *engine.remote_addr.lock() = Some(learned);
                                     tracing::info!(
                                         new_remote = %learned,
@@ -870,8 +863,22 @@ impl RtpEngine {
                                 len = data.len(),
                                 "Received RTCP packet on muxed port"
                             );
+                            // R18-P0: Decrypt SRTCP before processing when SRTP is configured.
+                            // Without this, encrypted RTCP packets were passed to
+                            // process_incoming_rtcp() as ciphertext, causing parse failures.
+                            let rtcp_data = if let Some(ref srtp_recv) = engine.srtp_recv {
+                                match srtp_recv.lock().unprotect_rtcp(data) {
+                                    Ok(decrypted) => decrypted,
+                                    Err(e) => {
+                                        tracing::debug!("SRTCP unprotect failed: {}", e);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                data.to_vec()
+                            };
                             // P0-9: Forward RTCP to RtcpSession for SR/RR/BYE processing
-                            engine.rtcp_session.lock().process_incoming_rtcp(data);
+                            engine.rtcp_session.lock().process_incoming_rtcp(&rtcp_data);
                             continue;
                         }
 
@@ -945,19 +952,6 @@ impl RtpEngine {
                                     }
                                 } else {
                                     *remote = Some(pkt_ssrc);
-                                }
-                            }
-
-                            // P0-8: ROC tracking — detect sequence wraparound
-                            {
-                                let seq = packet.header.sequence_number;
-                                let prev_highest = engine.highest_seq.load(Ordering::Relaxed);
-                                if seq < prev_highest && (prev_highest - seq) > 0x8000 {
-                                    // Forward wraparound detected
-                                    engine.roc.fetch_add(1, Ordering::Relaxed);
-                                }
-                                if seq > prev_highest || (prev_highest > 0x8000 && seq < 0x8000 && (prev_highest - seq) > 0x8000) {
-                                    engine.highest_seq.store(seq, Ordering::Relaxed);
                                 }
                             }
 
@@ -1245,20 +1239,41 @@ impl RtpEngine {
 
     /// Stop the engine
     pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-
-        // P0-9: Build RTCP BYE packet for graceful session teardown.
-        // Note: This is a sync context so we can't send it here. The BYE
-        // is built and logged; callers who need to send it should use
-        // stop_async() instead, or the RTCP task will detect running=false
-        // and stop sending.
+        // R18-P2: Send RTCP BYE synchronously before setting running=false,
+        // so the remote receives a graceful teardown notification.
+        // Use std::thread::scope + a short-lived tokio runtime to send the
+        // BYE packet from this sync context.
         {
             let mut bye_buf = vec![0u8; 128];
             let bye_len = self.rtcp_session.lock().build_bye(&mut bye_buf, Some("session ended"));
             if bye_len > 0 {
-                tracing::debug!("RTCP BYE prepared ({} bytes)", bye_len);
+                if let Some(remote) = self.remote_addr() {
+                    let send_data = &bye_buf[..bye_len];
+                    // SRTP protect RTCP BYE if SRTP is configured
+                    let bye_data = if let Some(ref srtp_send) = self.srtp_send {
+                        match srtp_send.lock().protect_rtcp(send_data) {
+                            Ok(protected) => protected,
+                            Err(_) => send_data.to_vec(),
+                        }
+                    } else {
+                        send_data.to_vec()
+                    };
+                    let socket = self.socket.clone();
+                    std::thread::scope(|s| {
+                        s.spawn(|| {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_io()
+                                .build()
+                                .expect("Failed to build tokio runtime for RTCP BYE");
+                            let _ = rt.block_on(socket.send_to(&bye_data, remote));
+                        });
+                    });
+                    tracing::debug!("RTCP BYE sent ({} bytes)", bye_len);
+                }
             }
         }
+
+        self.running.store(false, Ordering::SeqCst);
 
         // === Fix 27: Release allocated port back to the pool ===
         // Bug #95: parking_lot::Mutex never poisons, so just .lock()

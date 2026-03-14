@@ -239,6 +239,19 @@ impl Config {
             ));
         }
 
+        // R18: Check for duplicate provider names
+        {
+            let mut seen_names = std::collections::HashSet::new();
+            for provider in &self.providers {
+                if !seen_names.insert(&provider.name) {
+                    return Err(RtpSipError::Config(format!(
+                        "Duplicate provider name '{}'",
+                        provider.name
+                    )));
+                }
+            }
+        }
+
         // Check provider servers
         for provider in &self.providers {
             if provider.server.is_empty() {
@@ -274,6 +287,15 @@ impl Config {
                 return Err(RtpSipError::Config(format!(
                     "Timer T2 must be between 1000 and 16000 ms, got {}",
                     t2
+                )));
+            }
+        }
+        // R18: Validate timer_t1x64_ms range (1000-128000ms)
+        if let Some(t1x64) = self.sip.timer_t1x64_ms {
+            if t1x64 < 1000 || t1x64 > 128000 {
+                return Err(RtpSipError::Config(format!(
+                    "Timer T1x64 must be between 1000 and 128000 ms, got {}",
+                    t1x64
                 )));
             }
         }

@@ -50,7 +50,7 @@ impl StunClient {
         server: SocketAddr,
     ) -> Result<StunMessage> {
         let request = StunMessage::new_binding_request();
-        self.execute_transaction(socket, server, request, None).await
+        self.execute_transaction(socket, server, request, None, false).await
     }
 
     /// Perform a STUN Binding Request on a specific socket to a specific server.
@@ -60,7 +60,7 @@ impl StunClient {
         server: SocketAddr,
     ) -> Result<SocketAddr> {
         let request = StunMessage::new_binding_request();
-        self.execute_transaction(socket, server, request, None).await?
+        self.execute_transaction(socket, server, request, None, false).await?
             .reflexive_address()
             .ok_or_else(|| {
                 RtpSipError::Sip("STUN response missing mapped address".to_string())
@@ -81,7 +81,11 @@ impl StunClient {
             change_ip,
             change_port,
         });
-        self.execute_transaction(socket, server, request, None).await
+        // R18: When CHANGE-REQUEST flags are set, the server responds from a
+        // different IP/port. Skip source validation so the response isn't
+        // discarded (transaction ID is still checked).
+        let skip_source = change_ip || change_port;
+        self.execute_transaction(socket, server, request, None, skip_source).await
     }
 
     /// Execute a STUN transaction with retransmits.
@@ -91,12 +95,18 @@ impl StunClient {
     /// socket during the transaction are forwarded to that channel instead of
     /// being silently discarded. This enables shared RTP/STUN socket usage
     /// without losing media packets.
+    ///
+    /// When `skip_source_check` is true, responses from any address are accepted
+    /// (transaction ID is still validated). This is required for CHANGE-REQUEST
+    /// transactions (NAT detection Tests II/IV) where the STUN server deliberately
+    /// responds from a different IP and/or port.
     async fn execute_transaction(
         &self,
         socket: &UdpSocket,
         server: SocketAddr,
         request: StunMessage,
         non_stun_buffer: Option<&tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>>,
+        skip_source_check: bool,
     ) -> Result<StunMessage> {
         let now = std::time::Instant::now();
         let mut txn = StunTransaction::new(&request, now);
@@ -129,7 +139,11 @@ impl StunClient {
                     // P1-NAT-3: Validate that the response came from the expected
                     // STUN server. Responses from unexpected sources could be
                     // spoofed and must be discarded.
-                    if from != server {
+                    // R18: When skip_source_check is true (CHANGE-REQUEST transactions),
+                    // accept responses from any address since the server deliberately
+                    // responds from a different IP/port. Transaction ID validation
+                    // in receive_response() still guards against spoofing.
+                    if !skip_source_check && from != server {
                         // Forward non-server packets if buffer is available
                         if let Some(buf_tx) = non_stun_buffer {
                             let _ = buf_tx.try_send((recv_buf[..len].to_vec(), from));
@@ -192,7 +206,7 @@ impl StunClient {
         let client = StunClient::new(server);
         let request = StunMessage::new_binding_request();
         client
-            .execute_transaction(socket, server, request, non_stun_buffer)
+            .execute_transaction(socket, server, request, non_stun_buffer, false)
             .await?
             .reflexive_address()
             .ok_or_else(|| {

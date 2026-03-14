@@ -1308,6 +1308,7 @@ impl SipEngine {
             Ok(addr) => addr,
             Err(e) => {
                 tracing::error!("Invalid RTP bind address for port {}: {}", rtp_port, e);
+                self.release_rtp_port(rtp_port);
                 return;
             }
         };
@@ -1327,6 +1328,7 @@ impl SipEngine {
             }
             Err(e) => {
                 tracing::error!("Failed to create RTP engine for incoming call: {}", e);
+                self.release_rtp_port(rtp_port);
                 None
             }
         };
@@ -1335,6 +1337,7 @@ impl SipEngine {
         // we cannot handle the call - reject with 500 Server Internal Error.
         if rtp_engine.is_none() && remote_sdp.is_some() {
             tracing::error!("Cannot accept call with SDP offer: RTP engine creation failed");
+            // R18: rtp_port already released in the Err branch above
             if let Err(e) = transaction.reply(rsip::StatusCode::ServerInternalError).await {
                 tracing::error!("Failed to send 500 for RTP failure: {}", e);
             }
@@ -2538,14 +2541,20 @@ impl SipEngine {
                 }
             };
 
-            // If cancelled, stop RTP and mark ended
+            // If cancelled, stop RTP, release port, and mark ended
             let Some(invite_result) = invite_result else {
-                if let Some(sess) = engine.calls.lock().get(&call_id_clone) {
-                    let mut sess = sess.lock();
-                    if let Some(ref rtp) = sess.rtp_engine {
-                        rtp.stop();
+                {
+                    let mut calls = engine.calls.lock();
+                    if let Some(sess) = calls.get(&call_id_clone) {
+                        let mut sess = sess.lock();
+                        if let Some(ref rtp) = sess.rtp_engine {
+                            let port = rtp.local_addr().port();
+                            rtp.stop();
+                            engine.release_rtp_port(port);
+                        }
+                        sess.state = CallState::Ended;
                     }
-                    sess.state = CallState::Ended;
+                    calls.remove(&call_id_clone);
                 }
                 let _ = engine.event_tx.send(CallEvent::Cancelled {
                     call_id: call_id_clone,
@@ -2599,13 +2608,15 @@ impl SipEngine {
                                         ),
                                     });
 
-                                    // Clean up
+                                    // Clean up: stop RTP, release port, remove session
                                     {
                                         let mut calls = engine.calls.lock();
                                         if let Some(sess) = calls.get(&call_id_clone) {
                                             let sess = sess.lock();
                                             if let Some(ref rtp) = sess.rtp_engine {
+                                                let port = rtp.local_addr().port();
                                                 rtp.stop();
+                                                engine.release_rtp_port(port);
                                             }
                                         }
                                         calls.remove(&call_id_clone);
@@ -2660,13 +2671,15 @@ impl SipEngine {
                                 });
                             }
 
-                            // Clean up RTP and remove session
+                            // Clean up RTP, release port, and remove session
                             {
                                 let mut calls = engine.calls.lock();
                                 if let Some(sess) = calls.get(&call_id_clone) {
                                     let sess = sess.lock();
                                     if let Some(ref rtp) = sess.rtp_engine {
+                                        let port = rtp.local_addr().port();
                                         rtp.stop();
+                                        engine.release_rtp_port(port);
                                     }
                                 }
                                 calls.remove(&call_id_clone);
@@ -2928,12 +2941,15 @@ impl SipEngine {
                     // Bug #62 + Bug #6 fix: Hold the calls lock across both stop and remove
                     // to prevent a race where another task could observe the session between
                     // stop and remove.
+                    // R18: Also release the RTP port to avoid port leak.
                     {
                         let mut calls = engine.calls.lock();
                         if let Some(sess) = calls.get(&call_id_clone) {
                             let sess = sess.lock();
                             if let Some(ref rtp) = sess.rtp_engine {
+                                let port = rtp.local_addr().port();
                                 rtp.stop();
+                                engine.release_rtp_port(port);
                             }
                         }
                         calls.remove(&call_id_clone);
@@ -3425,6 +3441,7 @@ impl SipEngine {
                 // Bug #64 fix: Set call state to Ended after successful CANCEL
                 // so subsequent hangup() calls don't send duplicate CANCEL.
                 // Stop RTP if started (early media case)
+                // R18: Also release the RTP port to avoid port leak.
                 {
                     let mut sess = session.lock();
                     sess.state = CallState::Ended;
@@ -3434,7 +3451,9 @@ impl SipEngine {
                     sess.local_hold = false;
                     sess.remote_hold = false;
                     if let Some(ref rtp) = sess.rtp_engine {
+                        let port = rtp.local_addr().port();
                         rtp.stop();
+                        self.release_rtp_port(port);
                     }
                 }
 

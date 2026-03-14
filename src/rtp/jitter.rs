@@ -113,6 +113,10 @@ pub struct JitterBuffer {
     drift_high_count: u32,
     /// P2-JB-5: Running count of consecutive low-fill observations for drift detection.
     drift_low_count: u32,
+    /// R18: Separate counter for drift detection that is NOT reset with pop_count.
+    /// pop_count resets at 250 for adapt_delay batching, so using pop_count % 500
+    /// for drift checks was dead code.
+    drift_check_count: u32,
 }
 
 impl JitterBuffer {
@@ -141,6 +145,7 @@ impl JitterBuffer {
             pop_count: 0,
             drift_high_count: 0,
             drift_low_count: 0,
+            drift_check_count: 0,
         }
     }
 
@@ -340,6 +345,47 @@ impl JitterBuffer {
 
         self.playout_started = true;
         self.pop_count += 1;
+        self.drift_check_count += 1;
+
+        // R18: Make adaptive delay influence steady-state playout.
+        // If the buffer has grown beyond twice the adaptive delay, skip one
+        // packet to reduce latency. The hold-off check (buffer too low) is
+        // applied below only when the target packet is missing, to avoid
+        // starving the consumer when packets are available.
+        if self.initial_buffering_done {
+            let buffer_duration_ms = if self.config.sample_rate > 0 {
+                (self.packets.len() as u64
+                    * self.config.samples_per_packet as u64
+                    * 1000
+                    / self.config.sample_rate as u64) as u32
+            } else {
+                0
+            };
+
+            if buffer_duration_ms > self.current_delay_ms * 2 && self.current_delay_ms > 0 {
+                // Buffer is overfull — skip one packet to reduce latency.
+                // Find and remove the oldest packet.
+                let oldest_seq = {
+                    let mut keys = self.packets.keys();
+                    if let Some(first) = keys.next() {
+                        let mut oldest = *first;
+                        for &k in keys {
+                            if Self::sequence_before(k, oldest) {
+                                oldest = k;
+                            }
+                        }
+                        Some(oldest)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(seq) = oldest_seq {
+                    self.packets.remove(&seq);
+                    self.stats.packets_dropped += 1;
+                    self.stats.buffer_size = self.packets.len();
+                }
+            }
+        }
 
         // Get the next sequence to play
         let target_seq = if let Some(last) = self.last_played_sequence {
@@ -373,9 +419,11 @@ impl JitterBuffer {
             // Compare buffer fill vs target. If consistently high, the
             // remote clock is faster than ours (skip one packet to catch up).
             // If consistently low, remote clock is slower (insert PLC).
-            // R17: Use pop_count (playout cadence) instead of packets_received
-            // (arrival cadence) to detect drift relative to our own clock.
-            if self.pop_count % 500 == 0 && self.pop_count > 0 {
+            // R17: Use playout cadence instead of packets_received (arrival
+            // cadence) to detect drift relative to our own clock.
+            // R18: Use drift_check_count (never reset) instead of pop_count
+            // (reset at 250 for adapt_delay batching) so this check actually fires.
+            if self.drift_check_count % 500 == 0 && self.drift_check_count > 0 {
                 let fill = self.packets.len();
                 let target_pkts = (self.config.target_delay_ms as usize)
                     / ((self.config.samples_per_packet * 1000 / self.config.sample_rate) as usize).max(1);
@@ -389,8 +437,16 @@ impl JitterBuffer {
                         // R17: Actually skip one packet by advancing last_played_sequence.
                         // This causes the next pop() to target seq+2 instead of seq+1,
                         // allowing playout to catch up with the remote clock.
+                        // R18: Remove the skipped packet from the buffer and count it
+                        // in stats. Without this, the packet remains orphaned in the
+                        // HashMap, wasting memory and skewing buffer_size.
                         if let Some(lps) = self.last_played_sequence {
-                            self.last_played_sequence = Some(lps.wrapping_add(1));
+                            let skipped_seq = lps.wrapping_add(1);
+                            if self.packets.remove(&skipped_seq).is_some() {
+                                self.stats.packets_dropped += 1;
+                                self.stats.buffer_size = self.packets.len();
+                            }
+                            self.last_played_sequence = Some(skipped_seq);
                         }
                     }
                 } else if fill < target_pkts.saturating_sub(2) && target_pkts > 2 {
@@ -407,6 +463,20 @@ impl JitterBuffer {
             }
 
             return Some(buffered.packet);
+        }
+
+        // R18: When the target packet is missing and the buffer is below
+        // half the adaptive delay, hold off playout to give the packet more
+        // time to arrive. This makes current_delay_ms influence steady-state
+        // playout without starving consumers when packets are available.
+        if self.initial_buffering_done && self.config.sample_rate > 0 {
+            let buffer_duration_ms = (self.packets.len() as u64
+                * self.config.samples_per_packet as u64
+                * 1000
+                / self.config.sample_rate as u64) as u32;
+            if buffer_duration_ms < self.current_delay_ms / 2 {
+                return None;
+            }
         }
 
         // Bug #88: Only count as lost after max_wait_before_loss consecutive
@@ -476,6 +546,12 @@ impl JitterBuffer {
         self.initial_buffering_done = false;
         self.packets.clear();
         self.stats.buffer_size = 0;
+        // R18-P2: Also reset sequence tracking so the next push doesn't
+        // try to play from a stale sequence position. Without this, the
+        // jitter buffer would skip packets or report false losses after
+        // a marker-bit triggered reset.
+        self.last_played_sequence = None;
+        self.next_sequence = None;
     }
 
     /// Bug #19: Check whether a sequence number is already in the buffer
@@ -506,6 +582,7 @@ impl JitterBuffer {
         self.pop_count = 0;
         self.drift_high_count = 0;
         self.drift_low_count = 0;
+        self.drift_check_count = 0;
     }
 
     /// Drain and return the list of pending NACK sequence numbers (Fix 11).

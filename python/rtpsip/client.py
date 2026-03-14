@@ -171,8 +171,8 @@ class Client:
                     "name": provider,
                     "server": os.environ.get("RTPSIP_SERVER", f"sip.{provider}.com"),
                     "port": int(os.environ.get("RTPSIP_PORT", "5060")),
-                    "auth_username": os.environ.get("RTPSIP_AUTH_USERNAME", ""),
-                    "auth_password": os.environ.get("RTPSIP_AUTH_PASSWORD", ""),
+                    "username": os.environ.get("RTPSIP_AUTH_USERNAME", ""),
+                    "password": os.environ.get("RTPSIP_AUTH_PASSWORD", ""),
                     "default": True,
                 }
             ]
@@ -284,8 +284,8 @@ class Client:
         self._runner = SipRunner(
             provider_name=provider.get("name", "default"),
             provider_server=provider.get("server", ""),
-            username=provider.get("auth_username", ""),
-            password=provider.get("auth_password", ""),
+            username=provider.get("username", ""),
+            password=provider.get("password", ""),
         )
         self._runner.start()
 
