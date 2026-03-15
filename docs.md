@@ -881,10 +881,12 @@ Supported cipher suites:
 - `AES_CM_128_HMAC_SHA1_32` (reduced overhead, 32-bit auth tag)
 
 Features:
-- Replay protection (64-packet sliding window)
+- Replay protection (128-packet sliding window)
 - ROC tracking for long calls
-- Error recovery (re-derive keys after 100 consecutive failures)
-- SSRC change handling
+- SSRC change detection (resets replay state on authenticated SSRC change)
+- Key lifetime enforcement (warns at 2^47, errors at 2^48 packets)
+- Non-monotonic send rejection (prevents keystream reuse)
+- Secure key zeroization on context drop (write_volatile + compiler_fence)
 
 ---
 
@@ -1086,6 +1088,11 @@ RUST_LOG=rtpsip=trace python myapp.py
 | `enable_rtcp_mux` | bool | `false` | RFC 5761 RTCP-mux |
 | `enable_nack` | bool | `false` | NACK retransmission |
 | `recv_codec` | CodecType? | None | Receive codec (asymmetric) |
+| `send_silence_when_idle` | bool | `false` | Send silence frames when no audio |
+| `flush_jb_on_dtmf` | bool | `false` | Reset jitter buffer on DTMF |
+| `dtmf_buffer_size` | usize | `32` | Max queued DTMF events |
+| `vad_threshold` | f64 | `250.0` | VAD energy threshold |
+| `vad_hangover_frames` | u32 | `10` | Frames before silence transition |
 
 ### JitterConfig
 

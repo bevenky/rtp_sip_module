@@ -99,9 +99,6 @@ rtp_sip_module/
     │   ├── __init__.py     # Main exports
     │   ├── config.py       # Python config classes
     │   └── _rtpsip.pyi     # Type stubs
-    ├── pipecat/            # Pipecat integration
-    │   ├── sip_rtp_serializer.py   # SIP trunking transport
-    │   └── plivo_serializer.py     # Plivo WebSocket + RTP
     └── tests/
         ├── test_rtp.py     # RTP-only tests
         ├── test_sip.py     # SIP+RTP tests
@@ -175,7 +172,6 @@ rtp_sip_module/
 - CallEvent with typed convenience methods
 - CallState enum (Ringing, EarlyMedia, Active, Hold, Ended)
 - DtmfMode enum (Auto, Rfc2833, Info)
-- Pipecat transport integration (SipRtpTransport, PlivoRtpTransport)
 
 ### Device Compatibility
 - RtpBugFlags auto-detection from User-Agent header
